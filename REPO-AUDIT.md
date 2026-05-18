@@ -1,6 +1,7 @@
 # REPO-AUDIT.md
 
 Read-only audit of `agent-comms` (a.k.a. `hive-protocol`).
+Audit report version: 1.0.0.
 Auditor: Claude Code. Date: 2026-05-18. Branch: `claude/audit-repo-sources-NFxqp`.
 Tags: [VERIFIED] ran/read exact code · [INFERRED] reasoned from indirect evidence · [UNKNOWN] could not determine.
 
