@@ -10,25 +10,76 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from hive.config import (
+    ConfigError,
+    channel_file_path,
+    default_channels_dir,
+    default_db_path,
+    validate_channel_name,
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-CHANNELS_DIR = Path("C:/Users/Brady.EAGLE/.ai/channels")
-DB_PATH = Path("C:/tools/agent-comms/hive.db")
+CHANNELS_DIR = Path(default_channels_dir())
+DB_PATH = Path(default_db_path())
+DASHBOARD_HOST = os.environ.get("HIVE_DASHBOARD_HOST", "127.0.0.1")
+
+
+def _dashboard_port() -> int:
+    raw = os.environ.get("HIVE_DASHBOARD_PORT", "7842")
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ConfigError("HIVE_DASHBOARD_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ConfigError("HIVE_DASHBOARD_PORT must be between 1 and 65535")
+    return port
+
+
+DASHBOARD_PORT = _dashboard_port()
+DASHBOARD_TOKEN = os.environ.get("HIVE_DASHBOARD_TOKEN")
+DEFAULT_ORIGINS = [f"http://127.0.0.1:{DASHBOARD_PORT}", f"http://localhost:{DASHBOARD_PORT}"]
+
+
+def _configured_origins() -> list[str]:
+    raw = os.environ.get("HIVE_DASHBOARD_ALLOW_ORIGINS")
+    if not raw:
+        return DEFAULT_ORIGINS
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+if DASHBOARD_HOST not in {"127.0.0.1", "localhost", "::1"} and not DASHBOARD_TOKEN:
+    raise ConfigError("HIVE_DASHBOARD_TOKEN is required when binding dashboard to a non-loopback host")
 
 app = FastAPI(title="HIVE Dashboard", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_configured_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _require_dashboard_token(request: Request, call_next):
+    client_host = request.client.host if request.client else "127.0.0.1"
+    client_is_loopback = client_host in {"127.0.0.1", "localhost", "::1"}
+    if not DASHBOARD_TOKEN and not client_is_loopback:
+        return JSONResponse(status_code=401, content={"error": "dashboard token required"})
+    if DASHBOARD_TOKEN:
+        auth_header = request.headers.get("authorization", "")
+        bearer = f"Bearer {DASHBOARD_TOKEN}"
+        header_token = request.headers.get("x-hive-dashboard-token")
+        if auth_header != bearer and header_token != DASHBOARD_TOKEN:
+            return JSONResponse(status_code=401, content={"error": "dashboard token required"})
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +104,26 @@ def _read_jsonl(path: Path) -> list[dict]:
     except OSError:
         pass
     return cells
+
+
+def _channel_path(channel: str) -> Path:
+    return Path(channel_file_path(str(CHANNELS_DIR), channel))
+
+
+def _channel_files() -> list[Path]:
+    if not CHANNELS_DIR.exists():
+        return []
+    files = []
+    for path in CHANNELS_DIR.glob("*.jsonl"):
+        if path.is_symlink():
+            continue
+        try:
+            validate_channel_name(path.stem)
+            channel_file_path(str(CHANNELS_DIR), path.stem)
+        except ConfigError:
+            continue
+        files.append(path)
+    return files
 
 
 def _parse_ts(ts_str: str | None) -> datetime | None:
@@ -117,7 +188,7 @@ def _build_roster() -> dict[str, dict]:
         online, current_task, tasks_completed, cells_sent
     }
     """
-    roster_cells = _read_jsonl(CHANNELS_DIR / "roster.jsonl")
+    roster_cells = _read_jsonl(_channel_path("roster"))
 
     agents: dict[str, dict] = {}
 
@@ -182,7 +253,7 @@ def _build_roster() -> dict[str, dict]:
             a["online"] = False
 
     # Second pass: scan all channel files for per-agent activity
-    all_channels = list(CHANNELS_DIR.glob("*.jsonl")) if CHANNELS_DIR.exists() else []
+    all_channels = _channel_files()
 
     agent_channel_last: dict[str, str | None] = {}  # agent -> most recent ts across channels
     agent_cell_count: dict[str, int] = {}
@@ -257,7 +328,7 @@ def _build_tasks(channel: str = "signx-intel") -> list[dict]:
     'result'/'error' type means complete.
     Uses simple heuristic: parse TASK-N from msg text to correlate.
     """
-    ch_path = CHANNELS_DIR / f"{channel}.jsonl"
+    ch_path = _channel_path(channel)
     cells = _read_jsonl(ch_path)
 
     # Collect task cells
@@ -400,7 +471,10 @@ def get_agents() -> Any:
 
 @app.get("/api/tasks")
 def get_tasks(channel: str = Query(default="signx-intel")) -> Any:
-    tasks = _build_tasks(channel)
+    try:
+        tasks = _build_tasks(channel)
+    except ConfigError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     return JSONResponse(content={
         "channel": channel,
         "tasks": tasks,
@@ -418,7 +492,10 @@ def get_feed(
     channel: str = Query(default="signx-intel"),
     limit: int = Query(default=50, le=200),
 ) -> Any:
-    ch_path = CHANNELS_DIR / f"{channel}.jsonl"
+    try:
+        ch_path = _channel_path(channel)
+    except ConfigError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     cells = _read_jsonl(ch_path)
 
     # Newest first
@@ -448,7 +525,7 @@ def get_stats() -> Any:
     if not CHANNELS_DIR.exists():
         return JSONResponse(content={"error": "channels dir not found"})
 
-    all_channels = list(CHANNELS_DIR.glob("*.jsonl"))
+    all_channels = _channel_files()
     agent_counts: dict[str, int] = {}
     agent_results: dict[str, int] = {}
     channel_counts: dict[str, int] = {}
@@ -506,7 +583,7 @@ def get_channels() -> Any:
         return JSONResponse(content={"channels": [], "error": "channels dir not found"})
 
     channels = []
-    for ch_path in sorted(CHANNELS_DIR.glob("*.jsonl")):
+    for ch_path in sorted(_channel_files()):
         cells = _read_jsonl(ch_path)
         last_ts = None
         if cells:
@@ -542,4 +619,4 @@ def root() -> Any:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7842, log_level="info")
+    uvicorn.run(app, host=DASHBOARD_HOST, port=DASHBOARD_PORT, log_level="info")

@@ -38,7 +38,7 @@ convenience.
 | Directory | Purpose |
 |-----------|---------|
 | `hive/` | HIVE Python protocol library (see `hive/AGENTS.md`) |
-| `tests/` | Full test suite — 98 tests (see `tests/AGENTS.md`) |
+| `tests/` | Full test suite — 126 tests (see `tests/AGENTS.md`) |
 | `channels/` | JSONL channel files — shared message bus (see `channels/AGENTS.md`) |
 | `dashboard/` | Factory floor web UI + FastAPI server (see `dashboard/AGENTS.md`) |
 | `docs/` | Design documents and implementation plans (see `docs/AGENTS.md`) |

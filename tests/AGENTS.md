@@ -4,7 +4,7 @@
 # tests/ — HIVE Test Suite
 
 ## Purpose
-98-test suite covering all HIVE protocol layers. Zero external APIs — all tests use
+126-test suite covering all HIVE protocol layers. Zero external APIs — all tests use
 temp SQLite databases and temp dirs. Run with: python -m pytest tests/ --timeout=30 -q
 
 ## Key Files
@@ -25,13 +25,14 @@ temp SQLite databases and temp dirs. Run with: python -m pytest tests/ --timeout
 | `test_stall_detector.py` | ~3 | Heartbeat monitoring, signal emission |
 | `test_jsonl_transport.py` | ~8 | Append-only JSONL, channel file creation |
 | `test_mcp_tools.py` | ~6 | MCP tool definitions and execute_tool dispatch |
+| `test_runtime_hardening.py` | ~28 | Runtime config, channel validation, dashboard auth, shell safety |
 
 ## For AI Agents
 
 ### Running Tests
 ```bash
 cd C:/tools/agent-comms
-python -m pytest tests/ --timeout=30 -q          # all 98
+python -m pytest tests/ --timeout=30 -q          # all 126
 python -m pytest tests/test_lifecycle.py -v       # specific file
 python -m pytest tests/ --timeout=30 -q --tb=short  # with short tracebacks
 ```

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-cd "$(dirname "$0")"
-pip install -r requirements.txt -q
-python server.py
+cd "$(dirname "$0")/.."
+PYTHON="${PYTHON:-python3}"
+"$PYTHON" -m pip install -r dashboard/requirements.txt -q
+"$PYTHON" -m dashboard.server

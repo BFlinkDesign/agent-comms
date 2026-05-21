@@ -6,10 +6,17 @@
 # Identity: COMMS_AGENT = "agent/session" e.g. "claude/1", "gemini/signx", "gemini/warehouse"
 # Channels: project-scoped e.g. "signx-intel", "signx-warehouse", "keyedin", "general"
 
-COMMS_DIR="C:/tools/agent-comms"
+COMMS_DIR="${HIVE_COMMS_DIR:-C:/tools/agent-comms}"
 # Canonical shared channel dir — symlinked from ~/.claude/channels, ~/.gemini/channels, ~/.codex/channels
-# Use COMMS_CHANNELS env override, or fall back to known Windows path
-CHANNELS_DIR="${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}"
+# Prefer HIVE_CHANNELS_DIR, keep COMMS_CHANNELS as a compatibility alias, or fall back to known Windows path
+CHANNELS_DIR="${HIVE_CHANNELS_DIR:-${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}}"
+if [[ -z "${HIVE_DB_PATH:-}" ]]; then
+  if [[ -d "$COMMS_DIR" ]]; then
+    HIVE_DB_PATH="${COMMS_DIR}/hive.db"
+  else
+    HIVE_DB_PATH="hive.db"
+  fi
+fi
 COMMS_AGENT="${COMMS_AGENT:-unknown}"
 
 _comms_uuid() {
@@ -22,17 +29,35 @@ _comms_ts() {
 
 _comms_ensure_channel() {
   local ch="$1"
+  if ! _comms_validate_channel "$ch"; then
+    return 1
+  fi
+  mkdir -p "${CHANNELS_DIR}"
   if [[ ! -f "${CHANNELS_DIR}/${ch}.jsonl" ]]; then
     touch "${CHANNELS_DIR}/${ch}.jsonl"
   fi
 }
 
+_comms_validate_channel() {
+  local ch="$1"
+  if [[ ! "$ch" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+    echo "invalid channel '${ch}' — use lowercase letters, numbers, underscores, or hyphens" >&2
+    return 1
+  fi
+}
+
 _comms_write() {
   local channel="$1" type="$2" msg="$3" data="${4:-"{}"}"
-  _comms_ensure_channel "$channel"
+  _comms_validate_channel "$channel" || return 1
   if printf '%s' "$data" | python -c "
-import json, uuid, datetime, sys
+import json, os, uuid, datetime, sys
 data_raw = sys.stdin.read()
+data = json.loads(data_raw)
+path = sys.argv[5]
+base = os.path.realpath(os.path.dirname(path))
+real_path = os.path.realpath(path)
+if os.path.commonpath([base, real_path]) != base or os.path.islink(path):
+    raise RuntimeError('channel file must stay under channels directory and must not be a symlink')
 obj = {
     'id': str(uuid.uuid4()),
     'from': sys.argv[1],
@@ -40,9 +65,14 @@ obj = {
     'channel': sys.argv[2],
     'type': sys.argv[3],
     'msg': sys.argv[4],
-    'data': json.loads(data_raw)
+    'data': data
 }
-with open(sys.argv[5], 'a', encoding='utf-8') as f:
+os.makedirs(os.path.dirname(path), exist_ok=True)
+flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(path, flags, 0o666)
+with os.fdopen(fd, 'a', encoding='utf-8') as f:
     f.write(json.dumps(obj, ensure_ascii=False) + '\n')
 " "$COMMS_AGENT" "$channel" "$type" "$msg" "${CHANNELS_DIR}/${channel}.jsonl" 2>/dev/null; then
     echo "sent to ${channel} [${type}]"
@@ -97,6 +127,7 @@ comms() {
         echo "usage: comms read <channel> [--last N] [--from agent] [--type type]"
         return 1
       fi
+      _comms_validate_channel "$channel" || return 1
       local f="${CHANNELS_DIR}/${channel}.jsonl"
       if [[ ! -f "$f" ]]; then
         echo "channel '${channel}' does not exist"
@@ -293,6 +324,7 @@ if line:
         echo "usage: comms watch <channel>"
         return 1
       fi
+      _comms_validate_channel "$channel" || return 1
       local f="${CHANNELS_DIR}/${channel}.jsonl"
       if [[ ! -f "$f" ]]; then
         echo "channel '${channel}' does not exist"
@@ -796,7 +828,7 @@ for name, info in org.get('agents', {}).items():
 import sys, json
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell_id = board.put(type=sys.argv[1], from_agent=sys.argv[2], channel=sys.argv[3], data=json.loads(sys.argv[4]))
 print(cell_id)
 " "$cell_type" "$COMMS_AGENT" "$channel" "$data"
@@ -807,7 +839,7 @@ print(cell_id)
 import sys, json
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard, cell_to_dict
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell = board.get(sys.argv[1])
 if cell is None:
     print('not found')
@@ -821,7 +853,7 @@ print(json.dumps(cell_to_dict(cell), indent=2))
 import sys, json
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard, cell_to_dict
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 args = sys.argv[1:]
 kwargs = {}
 i = 0
@@ -845,7 +877,7 @@ for c in cells:
 import sys
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell_id = board.task(from_agent=sys.argv[1], channel=sys.argv[2], title=sys.argv[3], spec=sys.argv[4])
 print(cell_id)
 " "$COMMS_AGENT" "$channel" "$title" "$spec"
@@ -856,7 +888,7 @@ print(cell_id)
 import sys, json
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard, cell_to_dict
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cells = board.refs(sys.argv[1])
 for c in cells:
     print(json.dumps(cell_to_dict(c), ensure_ascii=False))
@@ -867,7 +899,7 @@ for c in cells:
 import sys
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 count = board.expire()
 print(f'Expired {count} cells')
 "
@@ -880,7 +912,7 @@ import sys, json
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
 from hive.coordination.memory import record_trace
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell_id = record_trace(board, from_agent=sys.argv[1], contract_id=sys.argv[2], channel=sys.argv[3], steps=json.loads(sys.argv[4]), outcome=sys.argv[5])
 print(cell_id)
 " "$COMMS_AGENT" "$contract_id" "$channel" "$steps" "$outcome"
@@ -893,7 +925,7 @@ import sys
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
 from hive.coordination.beliefs import assert_belief
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell_id = assert_belief(board, from_agent=sys.argv[1], channel=sys.argv[2], claim=sys.argv[3], confidence=float(sys.argv[4]))
 print(cell_id)
 " "$COMMS_AGENT" "$channel" "$claim" "$confidence"
@@ -906,7 +938,7 @@ import sys
 sys.path.insert(0, '${COMMS_DIR}')
 from hive import HiveBoard
 from hive.coordination.beliefs import refute_belief
-board = HiveBoard(db_path='${COMMS_DIR}/hive.db', channels_dir='${CHANNELS_DIR}')
+board = HiveBoard(db_path='${HIVE_DB_PATH}', channels_dir='${CHANNELS_DIR}')
 cell_id = refute_belief(board, belief_id=sys.argv[1], from_agent=sys.argv[2], channel=sys.argv[3], reason=sys.argv[4], correction=sys.argv[5])
 print(cell_id)
 " "$belief_id" "$COMMS_AGENT" "$channel" "$reason" "$correction"

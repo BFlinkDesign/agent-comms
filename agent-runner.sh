@@ -14,7 +14,7 @@
 #   COMMS_AGENT  -- agent identity string, e.g. "gemini/researcher"
 #   AGENT_CMD    -- CLI binary to invoke: "gemini" | "codex" | "claude"
 #   POLL_SECS    -- poll interval in seconds (default: 5)
-#   CHANNELS_DIR -- override channel directory (default: ~/.ai/channels)
+#   HIVE_CHANNELS_DIR / COMMS_CHANNELS -- override channel directory (default: canonical fleet path)
 # =============================================================================
 
 set -euo pipefail
@@ -23,11 +23,11 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-CHANNELS_DIR="${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}"
+CHANNELS_DIR="${HIVE_CHANNELS_DIR:-${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}}"
 COMMS_AGENT="${COMMS_AGENT:-unknown/runner}"
 AGENT_CMD="${AGENT_CMD:-gemini}"
 POLL_SECS="${POLL_SECS:-5}"
-COMMS_DIR="C:/tools/agent-comms"
+COMMS_DIR="${HIVE_COMMS_DIR:-C:/tools/agent-comms}"
 
 CHANNEL="${1:-}"
 if [[ -z "$CHANNEL" ]]; then
@@ -35,6 +35,16 @@ if [[ -z "$CHANNEL" ]]; then
   echo "[RUNNER] Usage: COMMS_AGENT=gemini/researcher AGENT_CMD=gemini ./agent-runner.sh <channel>"
   exit 1
 fi
+
+validate_channel() {
+  local ch="$1"
+  if [[ ! "$ch" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+    echo "[RUNNER] ERROR: invalid channel '${ch}' — use lowercase letters, numbers, underscores, or hyphens" >&2
+    exit 1
+  fi
+}
+
+validate_channel "$CHANNEL"
 
 CHANNEL_FILE="${CHANNELS_DIR}/${CHANNEL}.jsonl"
 
@@ -69,20 +79,48 @@ ensure_dirs() {
   mkdir -p "${CHANNELS_DIR}"
   mkdir -p "${HOME}/.ai"
   if [[ ! -f "$CHANNEL_FILE" ]]; then
-    touch "$CHANNEL_FILE"
+    safe_ensure_file "$CHANNEL_FILE"
+  elif [[ -L "$CHANNEL_FILE" ]]; then
+    echo "[RUNNER] ERROR: refusing symlinked channel file ${CHANNEL_FILE}" >&2
+    exit 1
   fi
   if [[ ! -f "$STATE_FILE" ]]; then
-    touch "$STATE_FILE"
+    safe_ensure_file "$STATE_FILE"
+  elif [[ -L "$STATE_FILE" ]]; then
+    echo "[RUNNER] ERROR: refusing symlinked state file ${STATE_FILE}" >&2
+    exit 1
   fi
+}
+
+safe_ensure_file() {
+  local path="$1"
+  python -c "
+import os, sys
+path = sys.argv[1]
+if os.path.islink(path):
+    print(f'[RUNNER] ERROR: refusing symlinked file {path}', file=sys.stderr)
+    sys.exit(1)
+if os.path.exists(path):
+    if not os.path.isfile(path):
+        print(f'[RUNNER] ERROR: refusing non-file path {path}', file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(path, flags, 0o666)
+os.close(fd)
+" "$path"
 }
 
 # Write a JSONL cell to the channel using Python (mirrors comms.sh _comms_write).
 # Args: channel type msg data_json
 write_cell() {
   local channel="$1" type_="$2" msg="$3" data="${4:-"{}"}"
+  validate_channel "$channel"
   local out_file="${CHANNELS_DIR}/${channel}.jsonl"
   python -c "
-import json, uuid, datetime, sys
+import json, os, uuid, datetime, sys
 
 agent  = sys.argv[1]
 ch     = sys.argv[2]
@@ -94,7 +132,14 @@ path   = sys.argv[6]
 try:
     data = json.loads(data_s)
 except json.JSONDecodeError as e:
-    data = {'_parse_error': str(e), '_raw': data_s}
+    print(f'[RUNNER] ERROR: invalid JSON payload: {e}', file=sys.stderr)
+    sys.exit(1)
+
+base = os.path.realpath(os.path.dirname(path))
+real_path = os.path.realpath(path)
+if os.path.commonpath([base, real_path]) != base or os.path.islink(path):
+    print('[RUNNER] ERROR: channel file must stay under channels directory and must not be a symlink', file=sys.stderr)
+    sys.exit(1)
 
 obj = {
     'id':      str(uuid.uuid4()),
@@ -105,7 +150,11 @@ obj = {
     'msg':     msg,
     'data':    data,
 }
-with open(path, 'a', encoding='utf-8') as f:
+flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(path, flags, 0o666)
+with os.fdopen(fd, 'a', encoding='utf-8') as f:
     f.write(json.dumps(obj, ensure_ascii=False) + '\n')
 
 # Echo the generated cell ID to stdout so bash can capture it
@@ -301,33 +350,11 @@ echo ""
 ensure_dirs
 
 # Clock in to the roster
-python -c "
-import json, uuid, datetime, sys
+clock_in_data=$(python -c "import json,sys;print(json.dumps({'role':sys.argv[1]}))" "${CHANNEL}-runner")
+write_cell "roster" "clock-in" "${COMMS_AGENT} online -- agent-runner.sh" "$clock_in_data" > /dev/null
+echo "[RUNNER] Clocked in to roster"
 
-agent   = sys.argv[1]
-channel = 'roster'
-path    = sys.argv[2] + '/roster.jsonl'
-
-obj = {
-    'id':      str(uuid.uuid4()),
-    'from':    agent,
-    'ts':      datetime.datetime.now().astimezone().isoformat(),
-    'channel': channel,
-    'type':    'clock-in',
-    'msg':     agent + ' online -- agent-runner.sh',
-    'data':    {'role': sys.argv[3]},
-}
-with open(path, 'a', encoding='utf-8') as f:
-    f.write(json.dumps(obj, ensure_ascii=False) + '\n')
-print('[RUNNER] Clocked in to roster')
-" "$COMMS_AGENT" "$CHANNELS_DIR" "${CHANNEL}-runner"
-
-trap 'log "Shutting down — clocking out"; \
-      python -c "
-import json,uuid,datetime,sys
-obj={\"id\":str(uuid.uuid4()),\"from\":\"$COMMS_AGENT\",\"ts\":datetime.datetime.now().astimezone().isoformat(),\"channel\":\"roster\",\"type\":\"clock-out\",\"msg\":\"$COMMS_AGENT offline -- agent-runner.sh\",\"data\":{}}
-with open(\"$CHANNELS_DIR/roster.jsonl\",\"a\",encoding=\"utf-8\") as f: f.write(json.dumps(obj)+chr(10))
-"; exit 0' INT TERM
+trap 'log "Shutting down — clocking out"; write_cell "roster" "clock-out" "${COMMS_AGENT} offline -- agent-runner.sh" "{}" > /dev/null || true; exit 0' INT TERM
 
 while true; do
   log "Checking ${CHANNEL} for tasks..."

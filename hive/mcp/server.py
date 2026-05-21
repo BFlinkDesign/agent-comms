@@ -17,6 +17,7 @@ import sys
 from typing import Any
 
 from hive.board import HiveBoard
+from hive.config import default_channels_dir, default_db_path
 from hive.mcp.tools import get_tool_definitions, execute_tool
 
 
@@ -58,9 +59,12 @@ def _make_error(request_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def run_server(db_path: str = "hive.db", channels_dir: str = "channels"):
+def run_server(db_path: str | None = None, channels_dir: str | None = None):
     """Run the HIVE MCP server (stdio transport)."""
-    board = HiveBoard(db_path=db_path, channels_dir=channels_dir)
+    board = HiveBoard(
+        db_path=db_path or default_db_path(),
+        channels_dir=channels_dir or default_channels_dir(),
+    )
     tools = get_tool_definitions()
 
     while True:
@@ -115,7 +119,7 @@ def run_server(db_path: str = "hive.db", channels_dir: str = "channels"):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="HIVE MCP Server")
-    parser.add_argument("--db", default="C:/tools/agent-comms/hive.db")
-    parser.add_argument("--channels", default="C:/tools/agent-comms/channels")
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--channels", default=None)
     args = parser.parse_args()
     run_server(db_path=args.db, channels_dir=args.channels)
