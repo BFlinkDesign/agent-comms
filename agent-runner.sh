@@ -202,7 +202,7 @@ import json, sys
 
 channel_file = sys.argv[1]
 
-tasks   = {}   # task_id -> msg
+tasks   = {}   # task_id -> {msg, depends_on}
 claimed = set()
 done    = set()
 
@@ -221,7 +221,13 @@ with open(channel_file, encoding='utf-8') as f:
         data  = cell.get('data', {})
 
         if ctype == 'task':
-            tasks[cid] = cell.get('msg', '')
+            depends_on = data.get('depends_on', [])
+            if not isinstance(depends_on, list):
+                depends_on = []
+            tasks[cid] = {
+                'msg': cell.get('msg', ''),
+                'depends_on': [d for d in depends_on if isinstance(d, str)],
+            }
 
         elif ctype == 'claim':
             tid = data.get('task_id', '')
@@ -238,12 +244,19 @@ with open(channel_file, encoding='utf-8') as f:
             if tid:
                 done.add(tid)
 
-# Emit open tasks: not yet claimed AND not yet done
-for tid, msg in tasks.items():
-    if tid not in claimed and tid not in done:
-        # Output as pipe-delimited: id|msg (msg has | replaced)
-        safe_msg = msg.replace('|', '[pipe]')
-        print(f'{tid}|{safe_msg}')
+def deps_satisfied(depends_on):
+    if not depends_on:
+        return True
+    return all(dep in done for dep in depends_on)
+
+# Emit open tasks: not yet claimed, not done, dependencies satisfied
+for tid, info in tasks.items():
+    if tid in claimed or tid in done:
+        continue
+    if not deps_satisfied(info.get('depends_on', [])):
+        continue
+    safe_msg = info['msg'].replace('|', '[pipe]')
+    print(f'{tid}|{safe_msg}')
 " "$CHANNEL_FILE"
 }
 

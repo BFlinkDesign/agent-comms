@@ -195,6 +195,7 @@ class SQLiteTransport:
         tags: list[str] | tuple[str, ...] | None = None,
         refs: str | None = None,
         limit: int = 100,
+        unlimited: bool = False,
         order: str = "asc",
     ) -> list[Cell]:
         """Return cells matching the given filters.
@@ -237,8 +238,11 @@ class SQLiteTransport:
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         direction = "ASC" if order.lower() == "asc" else "DESC"
-        sql = f'SELECT * FROM cells {where} ORDER BY ts {direction} LIMIT ?'
-        params.append(limit)
+        if unlimited:
+            sql = f'SELECT * FROM cells {where} ORDER BY ts {direction}'
+        else:
+            sql = f'SELECT * FROM cells {where} ORDER BY ts {direction} LIMIT ?'
+            params.append(limit)
 
         conn = self._conn()
         cur = conn.execute(sql, params)
