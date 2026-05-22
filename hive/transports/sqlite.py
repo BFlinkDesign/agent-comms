@@ -109,6 +109,9 @@ class SQLiteTransport:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
+        parent = Path(self._db_path).parent
+        if str(parent) not in {"", "."}:
+            parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._watch_lock = threading.Lock()
         # channel -> list of callbacks
@@ -192,6 +195,7 @@ class SQLiteTransport:
         tags: list[str] | tuple[str, ...] | None = None,
         refs: str | None = None,
         limit: int = 100,
+        unlimited: bool = False,
         order: str = "asc",
     ) -> list[Cell]:
         """Return cells matching the given filters.
@@ -234,8 +238,11 @@ class SQLiteTransport:
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         direction = "ASC" if order.lower() == "asc" else "DESC"
-        sql = f'SELECT * FROM cells {where} ORDER BY ts {direction} LIMIT ?'
-        params.append(limit)
+        if unlimited:
+            sql = f'SELECT * FROM cells {where} ORDER BY ts {direction}'
+        else:
+            sql = f'SELECT * FROM cells {where} ORDER BY ts {direction} LIMIT ?'
+            params.append(limit)
 
         conn = self._conn()
         cur = conn.execute(sql, params)

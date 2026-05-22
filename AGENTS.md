@@ -29,6 +29,7 @@ convenience.
 | `pyproject.toml` | Python package config for `hive-protocol` v1.0.0; pytest timeout set to 30s |
 | `org.json` | Organizational config (agent and channel ownership metadata) |
 | `README.md` | Quick-start guide: commands, channel list, handoff protocol, raw usage |
+| `docs/PROJECT_STATE.md` | Live project snapshot — shipped work, test count, backlog, env vars |
 | `RESEARCH.md` | Research notes on paradigm-shifting multi-agent tools compiled 2026-03-02 |
 | `.mcp.json` | MCP server configuration for this project |
 | `.boot-gemini-backfill.sh` | Boot script for launching Gemini in backfill agent role |
@@ -38,7 +39,7 @@ convenience.
 | Directory | Purpose |
 |-----------|---------|
 | `hive/` | HIVE Python protocol library (see `hive/AGENTS.md`) |
-| `tests/` | Full test suite — 98 tests (see `tests/AGENTS.md`) |
+| `tests/` | Full test suite — 145 tests (see `tests/AGENTS.md`) |
 | `channels/` | JSONL channel files — shared message bus (see `channels/AGENTS.md`) |
 | `dashboard/` | Factory floor web UI + FastAPI server (see `dashboard/AGENTS.md`) |
 | `docs/` | Design documents and implementation plans (see `docs/AGENTS.md`) |

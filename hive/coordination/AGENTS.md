@@ -14,7 +14,8 @@ processes, no shared state outside the Board. Every module is independently impo
 | `reputation.py` | Exponential decay scoring from feedback cells — recent feedback weighted more heavily |
 | `leases.py` | Advisory file locks with TTL — race-safe task claiming without a central server |
 | `stall_detector.py` | Heartbeat monitoring — emits signal cells when agents go silent |
-| `dag.py` | Task dependency resolution — finds ready tasks (all deps have results) |
+| `dag.py` | Task dependency resolution — finds ready tasks via lifecycle reducer |
+| `lifecycle.py` | Canonical task state reducer — maps events to A2A lifecycle states |
 | `racing.py` | Multi-agent fan-out — sends same task to N agents, first valid result wins |
 | `evolution.py` | Feedback loop analysis — detects high failure rates and refuted beliefs, emits signals |
 | `memory.py` | Episodic trace storage — records HOW problems were solved (steps + outcome) |

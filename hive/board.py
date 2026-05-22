@@ -6,6 +6,7 @@ All queries go through SQLite. JSONL is write-only.
 from typing import Any
 
 from hive.cell import Cell, make_cell
+from hive.config import default_channels_dir, default_db_path, validate_channel_name
 from hive.transports.jsonl import JSONLTransport
 from hive.transports.sqlite import SQLiteTransport
 
@@ -15,11 +16,11 @@ class HiveBoard:
 
     def __init__(
         self,
-        db_path: str = "hive.db",
-        channels_dir: str = "channels",
+        db_path: str | None = None,
+        channels_dir: str | None = None,
     ):
-        self._sqlite = SQLiteTransport(db_path)
-        self._jsonl = JSONLTransport(channels_dir)
+        self._sqlite = SQLiteTransport(db_path or default_db_path())
+        self._jsonl = JSONLTransport(channels_dir or default_channels_dir())
 
     # --- Core Board Operations ---
 
@@ -52,6 +53,7 @@ class HiveBoard:
 
     def put_cell(self, cell: Cell) -> str:
         """Write a pre-built cell to both transports. Returns cell ID."""
+        validate_channel_name(cell.channel)
         self._sqlite.put(cell)
         self._jsonl.put(cell)
         return cell.id

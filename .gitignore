@@ -12,6 +12,7 @@ channels/*.jsonl
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 
 # HIVE database
 hive.db
