@@ -4,6 +4,11 @@ Universal inter-agent communication bus for CNC-1. File-based JSONL. Zero depend
 
 Multiple AI terminals (Claude Code, Gemini CLI, OpenClaw) coordinate through append-only JSONL channels. Any process that can `echo >> file` can participate.
 
+## Project state
+
+Current branch status, shipped hardening work, test count, and ranked backlog:
+[`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md).
+
 ## Quick Start
 
 ```bash
@@ -70,6 +75,16 @@ channel directory when they become JSONL filenames.
 
 The dashboard is localhost-only by default. Set `HIVE_DASHBOARD_TOKEN` before
 binding to a non-loopback host or exposing it through a tunnel.
+
+## Development
+
+```bash
+pip3 install pytest pytest-timeout -r dashboard/requirements.txt
+python3 -m pytest tests/ --timeout=30 -q   # 145 tests
+```
+
+Task readiness and lifecycle state are computed by `hive.coordination.lifecycle`
+(HIVE + legacy JSONL events → A2A-aligned states).
 
 ## Agent Behavior
 

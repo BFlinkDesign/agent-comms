@@ -29,6 +29,7 @@ convenience.
 | `pyproject.toml` | Python package config for `hive-protocol` v1.0.0; pytest timeout set to 30s |
 | `org.json` | Organizational config (agent and channel ownership metadata) |
 | `README.md` | Quick-start guide: commands, channel list, handoff protocol, raw usage |
+| `docs/PROJECT_STATE.md` | Live project snapshot — shipped work, test count, backlog, env vars |
 | `RESEARCH.md` | Research notes on paradigm-shifting multi-agent tools compiled 2026-03-02 |
 | `.mcp.json` | MCP server configuration for this project |
 | `.boot-gemini-backfill.sh` | Boot script for launching Gemini in backfill agent role |

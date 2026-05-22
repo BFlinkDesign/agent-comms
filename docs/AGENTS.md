@@ -7,6 +7,12 @@
 Design rationale, implementation plans, and protocol research. Read these before
 making architectural changes to understand why decisions were made.
 
+## Key Files
+| File | Description |
+|------|-------------|
+| `PROJECT_STATE.md` | Live snapshot — branch status, shipped work, test count, ranked backlog |
+| `2026-05-21-hive-gap-fit-analysis.md` | Gap-fit matrix, architecture decisions, implementation sequence |
+
 ## Subdirectories
 | Directory | Purpose |
 |-----------|---------|

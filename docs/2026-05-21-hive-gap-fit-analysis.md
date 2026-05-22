@@ -235,39 +235,38 @@ These decisions should be made before broad implementation:
 - `llms.txt` for agent-readable documentation indexes
 - OWASP MCP tool-poisoning mitigations
 
-## Immediate next work package
+## Implementation status (updated 2026-05-22)
 
-The first implementation PR should be intentionally narrow and should not
-migrate the full write path yet.
+See `docs/PROJECT_STATE.md` for the live project snapshot.
 
-**In scope**
+### Completed on branch `cursor/gap-fit-analysis-2e94`
 
-1. Add shared config names and defaults for:
-   - `comms.sh`
-   - `agent-runner.sh`
-   - dashboard
-   - MCP server defaults / `.mcp.json`
-   - `HiveBoard`
-   - JSONL transport
-2. Add channel name validation at ingress before any write, plus defensive
-   dashboard read validation.
-3. Keep MCP write tools read-only/disabled on the live canonical path until
-   trusted identity exists, or require a minimal trusted identity gate in the
-   same PR.
-4. Add tests proving:
-   - path traversal is rejected before SQLite or JSONL writes
-   - the covered components can point at the same temp channel directory
-   - unsafe public dashboard bind without auth fails
+| Item | Status |
+| --- | --- |
+| P0a shared config (`HIVE_CHANNELS_DIR`, `HIVE_DB_PATH`, dashboard host/port) | Done |
+| P0a channel name validation at ingress | Done |
+| P0a path traversal / symlink guards | Done |
+| P0a dashboard localhost default + token auth for non-loopback | Done |
+| P0a runtime hardening tests | Done (28 tests) |
+| P0b lifecycle/readiness reducer | Done (`hive.coordination.lifecycle`) |
+| P0b DAG wired to lifecycle reducer | Done |
+| P0b runner `depends_on` gate (JSONL) | Done |
+| P0b lifecycle reducer tests | Done (19 tests) |
 
-**Non-goals**
+**Test count:** 145 passing.
 
-- Full unified writer migration
-- Task Protocol Profile finalization
-- Signature/HMAC implementation
-- Lifecycle reducer
-- Dashboard auth beyond safe bind/CORS guardrails
-- OpenTelemetry, OpenAPI, AsyncAPI, Arazzo, or `llms.txt`
+### Still open (ranked)
 
-This reduces split-brain and path-traversal risk without forcing the full
-protocol migration in one step and without expanding live-bus write authority
-before trust controls exist.
+1. P0b — Legacy JSONL import/repair and dedupe
+2. P0b — Unified Python writer for `comms.sh` and `agent-runner.sh`
+3. P0b — Task Protocol Profile and layered write validation
+4. P0c — MCP write gate, identity/signing, runner trust boundary
+5. P1 — Dashboard structured task model via lifecycle reducer
+6. P1 — MCP output schemas and tool-poisoning mitigations
+7. P1 — CI, lockfile, integration test matrix
+
+### Original first PR scope (historical)
+
+The first implementation PR was intentionally narrow and did not migrate the
+full write path. That scope is now **complete** except MCP write gating (still
+open under P0c).
