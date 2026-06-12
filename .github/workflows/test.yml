@@ -14,8 +14,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dev dependencies
-        run: pip install pytest pytest-timeout mypy
+        run: pip install pytest pytest-timeout mypy ruff
       - name: Run test suite
         run: python -m pytest tests/ -q
       - name: Type-check hive package
         run: mypy
+      - name: Lint
+        run: ruff check .
+      - name: Shell syntax check
+        run: bash -n comms.sh agent-runner.sh

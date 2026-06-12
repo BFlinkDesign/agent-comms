@@ -1,6 +1,7 @@
 """Tests for hive.coordination.reputation."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.reputation import reputation
 

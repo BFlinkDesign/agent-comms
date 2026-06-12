@@ -1,8 +1,9 @@
 """Tests for hive.mcp.tools -- MCP tool definitions."""
-from hive.mcp.tools import get_tool_definitions, execute_tool
 import os
 import tempfile
+
 from hive.board import HiveBoard
+from hive.mcp.tools import execute_tool, get_tool_definitions
 
 
 def _make_board():

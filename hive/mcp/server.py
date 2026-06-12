@@ -7,7 +7,8 @@ Register in Claude Code settings.json:
   "mcpServers": {
     "hive": {
       "command": "python",
-      "args": ["-m", "hive.mcp.server", "--db", "C:/tools/agent-comms/hive.db", "--channels", "C:/tools/agent-comms/channels"]
+      "args": ["-m", "hive.mcp.server", "--db", "C:/tools/agent-comms/hive.db",
+               "--channels", "C:/tools/agent-comms/channels"]
     }
   }
 }
@@ -17,7 +18,7 @@ import sys
 from typing import Any
 
 from hive.board import HiveBoard
-from hive.mcp.tools import get_tool_definitions, execute_tool
+from hive.mcp.tools import execute_tool, get_tool_definitions
 
 
 def _read_message() -> dict[str, Any] | None:
@@ -46,7 +47,7 @@ def _read_message() -> dict[str, Any] | None:
 def _write_message(msg: dict[str, Any]) -> None:
     """Write a JSON-RPC message to stdout."""
     body = json.dumps(msg).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode()
     sys.stdout.buffer.write(header + body)
     sys.stdout.buffer.flush()
 

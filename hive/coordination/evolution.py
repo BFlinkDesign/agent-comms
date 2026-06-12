@@ -9,7 +9,6 @@ from typing import Any
 from hive.board import HiveBoard
 from hive.cell import Cell
 
-
 FAILURE_THRESHOLD = 5  # scores below this are considered failures
 FAILURE_RATE_ALERT = 0.3  # 30% failure rate triggers signal
 

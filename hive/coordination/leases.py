@@ -4,7 +4,7 @@ Agents claim leases before editing files. Other agents check before claiming.
 Leases are advisory (like flock in Unix). Bad actors get bad feedback scores.
 Leases expire via TTL -- no daemon needed.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from hive.board import HiveBoard
 from hive.cell import Cell
@@ -106,6 +106,6 @@ def _lease_expired(lease: Cell) -> bool:
     except ValueError:
         return True  # unparseable timestamp -- treat as expired, don't deadlock
     if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - created).total_seconds()
+        created = created.replace(tzinfo=UTC)
+    age = (datetime.now(UTC) - created).total_seconds()
     return age > lease.ttl

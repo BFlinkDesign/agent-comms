@@ -3,10 +3,11 @@ HIVE Dashboard Server — port 7842
 Reads from ~/.ai/channels/*.jsonl and hive.db (if present)
 """
 
+import contextlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +18,9 @@ from fastapi.responses import JSONResponse
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-CHANNELS_DIR = Path("C:/Users/Brady.EAGLE/.ai/channels")
-DB_PATH = Path("C:/tools/agent-comms/hive.db")
+# COMMS_CHANNELS / HIVE_DB env overrides, matching comms.sh and agent-runner.sh
+CHANNELS_DIR = Path(os.environ.get("COMMS_CHANNELS", "C:/Users/Brady.EAGLE/.ai/channels"))
+DB_PATH = Path(os.environ.get("HIVE_DB", "C:/tools/agent-comms/hive.db"))
 
 app = FastAPI(title="HIVE Dashboard", version="1.0.0")
 
@@ -46,10 +48,8 @@ def _read_jsonl(path: Path) -> list[dict]:
                 line = line.strip()
                 if not line:
                     continue
-                try:
+                with contextlib.suppress(json.JSONDecodeError):
                     cells.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
     except OSError:
         pass
     return cells
@@ -69,9 +69,9 @@ def _seconds_ago(ts_str: str | None) -> float | None:
     dt = _parse_ts(ts_str)
     if dt is None:
         return None
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return (now - dt).total_seconds()
 
 
@@ -270,8 +270,6 @@ def _build_tasks(channel: str = "signx-intel") -> list[dict]:
         cell_id = cell.get("id", "")
         ts = cell.get("ts", "")
         sender = cell.get("from", "")
-        refs = cell.get("refs") or []
-        data = cell.get("data") or {}
 
         if cell_type == "task":
             # Extract task key from msg prefix like "TASK-1 [agent]"
@@ -300,10 +298,9 @@ def _build_tasks(channel: str = "signx-intel") -> list[dict]:
         if cell_type == "claim":
             # Find which task is being claimed
             task_key = _find_referenced_task(msg, refs, tasks)
-            if task_key and task_key in tasks:
-                if tasks[task_key]["status"] == "open":
-                    tasks[task_key]["status"] = "claimed"
-                    tasks[task_key]["claimed_by"] = sender
+            if task_key and task_key in tasks and tasks[task_key]["status"] == "open":
+                tasks[task_key]["status"] = "claimed"
+                tasks[task_key]["claimed_by"] = sender
 
         elif cell_type in ("result", "error"):
             task_key = _find_referenced_task(msg, refs, tasks)
@@ -323,10 +320,9 @@ def _build_tasks(channel: str = "signx-intel") -> list[dict]:
             # Status messages like "TASK-1 starting: ..."
             # Mark as claimed if status references a task
             task_key = _find_referenced_task(msg, refs, tasks)
-            if task_key and task_key in tasks:
-                if tasks[task_key]["status"] == "open":
-                    tasks[task_key]["status"] = "claimed"
-                    tasks[task_key]["claimed_by"] = sender
+            if task_key and task_key in tasks and tasks[task_key]["status"] == "open":
+                tasks[task_key]["status"] = "claimed"
+                tasks[task_key]["claimed_by"] = sender
 
     # Add computed fields
     result = []
@@ -394,7 +390,7 @@ def get_agents() -> Any:
     return JSONResponse(content={
         "agents": list(real_agents.values()),
         "all_agents": list(roster.values()),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 
@@ -409,7 +405,7 @@ def get_tasks(channel: str = Query(default="signx-intel")) -> Any:
             "claimed": sum(1 for t in tasks if t["status"] == "claimed"),
             "complete": sum(1 for t in tasks if t["status"] == "complete"),
         },
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 
@@ -439,7 +435,7 @@ def get_feed(
     return JSONResponse(content={
         "channel": channel,
         "cells": feed,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 
@@ -496,7 +492,7 @@ def get_stats() -> Any:
         "agent_pass_rates": pass_rates,
         "active_channels": [k for k, v in channel_counts.items() if v > 0],
         "db_tables": db_stats,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 
@@ -527,7 +523,7 @@ def get_channels() -> Any:
 
     return JSONResponse(content={
         "channels": channels,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     })
 
 

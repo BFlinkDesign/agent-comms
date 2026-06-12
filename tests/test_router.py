@@ -1,6 +1,7 @@
 """Tests for hive.coordination.router."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.router import route_task
 

@@ -6,8 +6,8 @@ Cells link to each other via `refs`, forming a DAG.
 """
 import hashlib
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -54,7 +54,7 @@ def make_cell(
 ) -> Cell:
     """Create a new Cell with auto-generated ID and timestamp."""
     if ts is None:
-        ts = datetime.now(timezone.utc).astimezone().isoformat()
+        ts = datetime.now(UTC).astimezone().isoformat()
     cell_refs = tuple(refs) if refs else ()
     cell_tags = tuple(tags) if tags else ()
     cell_id = _generate_id(type, from_agent, ts, channel, data)

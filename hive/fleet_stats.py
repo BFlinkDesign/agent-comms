@@ -107,8 +107,9 @@ def print_perf(channels_dir: str, agent_filter: str = "") -> None:
     for agent in sorted(stats):
         s = stats[agent]
         channels = ", ".join(sorted(s["channels"])) if s["channels"] else "(none)"
+        rate = _success_rate(s["results"], s["errors"])
         print(f"  {agent}")
-        print(f"    Results: {s['results']}  Errors: {s['errors']}  Success rate: {_success_rate(s['results'], s['errors'])}")
+        print(f"    Results: {s['results']}  Errors: {s['errors']}  Success rate: {rate}")
         print(f"    Tasks requested: {s['tasks']}  Handoffs: sent={s['handoffs_sent']} recv={s['handoffs_recv']}")
         print(f"    Phone-homes: {s['phone_homes']}  Channels: {channels}")
         print(f"    Active: {s['first_seen'][:19]} to {s['last_seen'][:19]}")

@@ -3,7 +3,7 @@
 Checks contracts without results. If the last heartbeat is older than
 the timeout, emits a stall signal.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from hive.board import HiveBoard
@@ -42,7 +42,7 @@ def detect_stalls(
         heartbeats.sort(key=lambda h: h.ts, reverse=True)
 
         last_hb_ts = heartbeats[0].ts if heartbeats else None
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         if last_hb_ts:
             try:
