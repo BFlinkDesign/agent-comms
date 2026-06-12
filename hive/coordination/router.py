@@ -14,7 +14,8 @@ def route_task(board: HiveBoard, task: Cell) -> list[tuple[str, float]]:
     Returns list of (agent_id, score) sorted by score descending.
     """
     required = set(task.data.get("required_capabilities", []))
-    cards = board.query(type="card")
+    # Unbounded: a truncated scan would make some agents unroutable.
+    cards = board.query(type="card", limit=None)
 
     if not cards:
         return []

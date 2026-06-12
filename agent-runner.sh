@@ -23,11 +23,12 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-CHANNELS_DIR="${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}"
+# CHANNELS_DIR is the documented override; COMMS_CHANNELS kept for back-compat
+CHANNELS_DIR="${CHANNELS_DIR:-${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}}"
 COMMS_AGENT="${COMMS_AGENT:-unknown/runner}"
 AGENT_CMD="${AGENT_CMD:-gemini}"
 POLL_SECS="${POLL_SECS:-5}"
-COMMS_DIR="C:/tools/agent-comms"
+COMMS_DIR="${COMMS_DIR:-C:/tools/agent-comms}"
 
 CHANNEL="${1:-}"
 if [[ -z "$CHANNEL" ]]; then
@@ -143,59 +144,18 @@ task_is_for_me() {
 }
 
 # ---------------------------------------------------------------------------
-# Scan the channel file for unclaimed task cells.
+# Scan the channel file for claimable task cells (unclaimed, not done, and
+# all depends_on satisfied -- see hive/runner_scan.py, which is unit-tested).
 # Returns lines of: <task_id>|<task_msg>
-# Uses Python to do the full scan atomically.
 # ---------------------------------------------------------------------------
+RUNNER_SCAN="${COMMS_DIR}/hive/runner_scan.py"
+if [[ ! -f "$RUNNER_SCAN" ]]; then
+  echo "[RUNNER] ERROR: scanner not found at ${RUNNER_SCAN} — set COMMS_DIR to the agent-comms checkout"
+  exit 1
+fi
+
 find_open_tasks() {
-  python -c "
-import json, sys
-
-channel_file = sys.argv[1]
-
-tasks   = {}   # task_id -> msg
-claimed = set()
-done    = set()
-
-with open(channel_file, encoding='utf-8') as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            cell = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        ctype = cell.get('type', '')
-        cid   = cell.get('id', '')
-        data  = cell.get('data', {})
-
-        if ctype == 'task':
-            tasks[cid] = cell.get('msg', '')
-
-        elif ctype == 'claim':
-            tid = data.get('task_id', '')
-            if tid:
-                claimed.add(tid)
-
-        elif ctype == 'result':
-            tid = data.get('task_id', '')
-            if tid:
-                done.add(tid)
-
-        elif ctype == 'error':
-            tid = data.get('task_id', '')
-            if tid:
-                done.add(tid)
-
-# Emit open tasks: not yet claimed AND not yet done
-for tid, msg in tasks.items():
-    if tid not in claimed and tid not in done:
-        # Output as pipe-delimited: id|msg (msg has | replaced)
-        safe_msg = msg.replace('|', '[pipe]')
-        print(f'{tid}|{safe_msg}')
-" "$CHANNEL_FILE"
+  python "$RUNNER_SCAN" "$CHANNEL_FILE"
 }
 
 # ---------------------------------------------------------------------------

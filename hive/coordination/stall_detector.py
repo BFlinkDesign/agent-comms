@@ -25,7 +25,8 @@ def detect_stalls(
     channel with near-identical signal cells (their content-addressed IDs
     differ each run because age_seconds changes).
     """
-    contracts = board.query(type="contract")
+    # Unbounded: a truncated scan would silently stop watching contracts.
+    contracts = board.query(type="contract", limit=None)
     stalls = []
 
     for contract in contracts:
