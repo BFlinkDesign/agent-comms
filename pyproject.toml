@@ -11,3 +11,13 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 files = ["hive"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures favor readable one-line cell construction over wrapping
+"tests/*" = ["E501"]

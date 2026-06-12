@@ -39,7 +39,7 @@ The core Python library implementing the HIVE protocol — immutable, content-ad
 cd C:/tools/agent-comms && python -m pytest tests/ --timeout=30 -q
 ```
 
-- 98 tests total (all must pass)
+- All tests must pass; `mypy` (strict) and `ruff check .` must also be clean
 - Test timeout: 30 seconds (critical for detecting hangs)
 - Never run tests without `--timeout=30`
 

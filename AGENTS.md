@@ -26,19 +26,19 @@ convenience.
 | `ROLE-PROMPTS.md` | Role-scoped agent prompts (Claude/architect, Gemini/researcher, Codex/deployer) |
 | `standards.md` | Fleet operating standards — clock-in/out protocol, mandatory reads on session start |
 | `manifest.json` | Machine-readable protocol definition: identity format, channel registry, agent roster |
-| `pyproject.toml` | Python package config for `hive-protocol` v1.0.0; pytest timeout set to 30s |
+| `codex-wrap.py` | Wrapper for codex CLI: strips ANSI/progress noise, extracts test counts |
+| `pyproject.toml` | Python package config; pytest timeout 30s; mypy strict + ruff config |
 | `org.json` | Organizational config (agent and channel ownership metadata) |
 | `README.md` | Quick-start guide: commands, channel list, handoff protocol, raw usage |
 | `RESEARCH.md` | Research notes on paradigm-shifting multi-agent tools compiled 2026-03-02 |
 | `.mcp.json` | MCP server configuration for this project |
-| `.boot-gemini-backfill.sh` | Boot script for launching Gemini in backfill agent role |
 
 ## Subdirectories
 
 | Directory | Purpose |
 |-----------|---------|
 | `hive/` | HIVE Python protocol library (see `hive/AGENTS.md`) |
-| `tests/` | Full test suite — 98 tests (see `tests/AGENTS.md`) |
+| `tests/` | Full pytest suite (see `tests/AGENTS.md`) |
 | `channels/` | JSONL channel files — shared message bus (see `channels/AGENTS.md`) |
 | `dashboard/` | Factory floor web UI + FastAPI server (see `dashboard/AGENTS.md`) |
 | `docs/` | Design documents and implementation plans (see `docs/AGENTS.md`) |
@@ -51,6 +51,8 @@ convenience.
 - CHANNELS_DIR = `C:/Users/Brady.EAGLE/.ai/channels` (canonical — NOT `channels/` in this repo)
 - Set `COMMS_AGENT` before any comms command: `export COMMS_AGENT="agent/role"`
 - Run tests: `cd C:/tools/agent-comms && python -m pytest tests/ --timeout=30 -q`
+- Quality gates (all enforced in CI, all must pass before pushing):
+  `python -m pytest tests/ -q` && `mypy` && `ruff check .`
 - `comms.sh` is the CLI entry point — source it, don't execute directly
 
 ### Task Protocol (A2A-Aligned — 7 States)

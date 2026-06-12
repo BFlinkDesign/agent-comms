@@ -1,8 +1,9 @@
 """Tests for hive.coordination.racing."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
-from hive.coordination.racing import start_race, get_race_results
+from hive.coordination.racing import get_race_results, start_race
 
 
 def _make_board():

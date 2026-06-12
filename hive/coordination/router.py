@@ -25,11 +25,11 @@ def route_task(board: HiveBoard, task: Cell) -> list[tuple[str, float]]:
         agent_id = card.from_agent
         capabilities = set(card.data.get("capabilities", []))
 
-        # Capability overlap
+        # Capability overlap; without requirements, any card scores 1.0
+        # (0.5 for cards that declare no capabilities at all)
+        overlap = 1.0 if capabilities else 0.5
         if required:
             overlap = len(required & capabilities) / len(required)
-        else:
-            overlap = 1.0 if capabilities else 0.5
 
         # Cost factor
         cost_profile = card.data.get("cost_profile", {})

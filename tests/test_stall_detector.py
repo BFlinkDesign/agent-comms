@@ -1,6 +1,7 @@
 """Tests for hive.coordination.stall_detector."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.stall_detector import detect_stalls
 

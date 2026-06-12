@@ -1,6 +1,7 @@
 """Allow running as: python -m hive.mcp"""
-from hive.mcp.server import run_server
 import argparse
+
+from hive.mcp.server import run_server
 
 parser = argparse.ArgumentParser(description="HIVE MCP Server")
 parser.add_argument("--db", default="C:/tools/agent-comms/hive.db")

@@ -48,4 +48,4 @@ def reputation(board: HiveBoard, agent_id: str, capability: str | None = None) -
         return DEFAULT_SCORE
 
     # scores come from cell data (untyped JSON); coerce defensively
-    return float(sum(float(s) * w for s, w in zip(scores, weights))) / total_weight
+    return float(sum(float(s) * w for s, w in zip(scores, weights, strict=True))) / total_weight

@@ -1,6 +1,7 @@
 """Tests for hive.coordination.evolution."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.evolution import evolve
 

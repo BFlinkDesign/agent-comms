@@ -18,7 +18,11 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "type": {"type": "string", "description": "Cell type (task, card, bid, contract, result, feedback, lease, release, heartbeat, signal)"},
+                    "type": {
+                        "type": "string",
+                        "description": "Cell type (task, card, bid, contract, result, "
+                                       "feedback, lease, release, heartbeat, signal)",
+                    },
                     "from_agent": {"type": "string", "description": "Agent identity (e.g. claude/1, gemini/signx)"},
                     "channel": {"type": "string", "description": "Channel name (e.g. general, signx-intel)"},
                     "data": {"type": "object", "description": "Type-specific payload"},
@@ -48,7 +52,10 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "properties": {
                     "type": {"type": "string"},
                     "channel": {"type": "string"},
-                    "from_prefix": {"type": "string", "description": "Agent prefix match (e.g. 'claude' matches 'claude/1')"},
+                    "from_prefix": {
+                        "type": "string",
+                        "description": "Agent prefix match (e.g. 'claude' matches 'claude/1')",
+                    },
                     "since": {"type": "string", "description": "ISO-8601 timestamp -- cells after this time"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "refs": {"type": "string", "description": "Cell ID -- find cells referencing this"},
@@ -139,14 +146,19 @@ def get_tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "hive_trace",
-            "description": "Record a reasoning trace for a contract. Stores HOW a problem was solved, not just the result.",
+            "description": "Record a reasoning trace for a contract. "
+                           "Stores HOW a problem was solved, not just the result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "from_agent": {"type": "string"},
                     "contract_id": {"type": "string", "description": "Contract this trace belongs to"},
                     "channel": {"type": "string", "default": "general"},
-                    "steps": {"type": "array", "items": {"type": "object"}, "description": "Reasoning steps: [{attempt, action, outcome}]"},
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Reasoning steps: [{attempt, action, outcome}]",
+                    },
                     "outcome": {"type": "string", "enum": ["success", "failure", "partial"], "default": "success"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                 },

@@ -8,9 +8,7 @@ import os
 import tempfile
 
 from hive.board import HiveBoard
-from hive.cell import cell_to_dict
-from hive.coordination.dag import get_ready_tasks, get_task_deps
-from hive.coordination.evolution import evolve
+from hive.coordination.dag import get_ready_tasks
 from hive.coordination.leases import acquire_lease, is_leased, release_lease
 from hive.coordination.racing import get_race_results, start_race
 from hive.coordination.reputation import reputation
@@ -82,7 +80,7 @@ class TestFullLifecycle:
         )
 
         # 7. Claude provides feedback
-        fb_id = board.feedback(
+        board.feedback(
             from_agent="claude/1",
             channel="general",
             result_id=result_id,

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -346,5 +347,5 @@ class SQLiteTransport:
                 continue
             try:
                 cb(cell)
-            except Exception:
-                pass
+            except Exception as exc:  # a broken watcher must not break PUT
+                print(f"watch callback failed for {cell.id}: {exc!r}", file=sys.stderr)

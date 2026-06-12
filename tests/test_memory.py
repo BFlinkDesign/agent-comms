@@ -1,6 +1,7 @@
 """Tests for hive.coordination.memory -- episodic trace storage."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.memory import (
     get_contract_trace,

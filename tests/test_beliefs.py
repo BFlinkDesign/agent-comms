@@ -1,6 +1,7 @@
 """Tests for hive.coordination.beliefs -- auditable agent priors."""
 import os
 import tempfile
+
 from hive.board import HiveBoard
 from hive.coordination.beliefs import (
     assert_belief,
@@ -125,7 +126,7 @@ class TestBeliefAudit:
     def test_audit_counts_all_categories(self):
         board = _make_board()
         # 1 active, 1 confirmed, 1 refuted
-        b1 = assert_belief(board, from_agent="claude/1", channel="general", claim="X")
+        assert_belief(board, from_agent="claude/1", channel="general", claim="X")
         b2 = assert_belief(board, from_agent="claude/1", channel="general", claim="Y")
         b3 = assert_belief(board, from_agent="claude/1", channel="general", claim="Z")
         confirm_belief(board, belief_id=b2, from_agent="claude/1", channel="general")
