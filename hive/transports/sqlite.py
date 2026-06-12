@@ -111,8 +111,8 @@ class SQLiteTransport:
         self._db_path = str(db_path)
         self._local = threading.local()
         self._watch_lock = threading.Lock()
-        # channel -> list of callbacks
-        self._watchers: dict[str, list[Callable[[Cell], None]]] = {}
+        # channel -> list of (callback, type_filter) pairs
+        self._watchers: dict[str, list[tuple[Callable[[Cell], None], str | None]]] = {}
         # Eagerly initialise the schema on the calling thread's connection.
         self._init_schema()
 
@@ -122,13 +122,14 @@ class SQLiteTransport:
 
     def _conn(self) -> sqlite3.Connection:
         """Return (or create) the thread-local sqlite3 connection."""
-        if not hasattr(self._local, "conn") or self._local.conn is None:
+        conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
+        if conn is None:
             conn = sqlite3.connect(self._db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             self._local.conn = conn
-        return self._local.conn
+        return conn
 
     def _init_schema(self) -> None:
         conn = self._conn()

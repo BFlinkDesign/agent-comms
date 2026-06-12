@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from hive.board import HiveBoard
+from hive.cell import Cell
 
 
 def detect_stalls(
@@ -85,13 +86,13 @@ def detect_stalls(
     return stalls
 
 
-def _already_signaled(contract_refs: list, last_hb_ts: str | None) -> bool:
+def _already_signaled(contract_refs: list[Cell], last_hb_ts: str | None) -> bool:
     """True if a stall signal for this episode was already emitted.
 
     A heartbeat newer than the latest signal starts a new episode (the agent
     made progress, then stalled again), so a fresh signal is warranted.
     """
-    signal_ts = [
+    signal_ts: list[str] = [
         r.ts
         for r in contract_refs
         if r.type == "signal" and r.data.get("event") == "stall_detected"

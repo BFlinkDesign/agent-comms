@@ -575,55 +575,11 @@ BOOTEOF
       # 1. Capture performance summary before termination
       echo ""
       echo "  === TERMINATION REPORT: ${agent_id} ==="
-      local fire_tmp
-      fire_tmp=$(mktemp "${TMPDIR:-/tmp}/comms-fire.XXXXXX")
-      local perf_summary
-      perf_summary=$(python -c "
-import json, glob, sys
-from collections import defaultdict
-agent_id = sys.argv[1]
-stats = {'results': 0, 'errors': 0, 'tasks': 0, 'channels': set(), 'messages': []}
-for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
-    with open(f) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line: continue
-            try:
-                m = json.loads(line)
-                if agent_id not in m.get('from', ''): continue
-                mtype = m.get('type', '')
-                ch = m.get('channel', '')
-                if ch != 'roster': stats['channels'].add(ch)
-                if mtype == 'result': stats['results'] += 1
-                elif mtype == 'error': stats['errors'] += 1
-                elif mtype == 'task': stats['tasks'] += 1
-                stats['messages'].append(m.get('msg', '')[:80])
-            except: pass
-
-total = stats['results'] + stats['errors']
-rate = f\"{(stats['results']/total*100):.0f}%\" if total > 0 else 'n/a'
-channels = ', '.join(sorted(stats['channels'])) if stats['channels'] else '(none)'
-print(f'  Results: {stats[\"results\"]}  Errors: {stats[\"errors\"]}  Success rate: {rate}')
-print(f'  Tasks taken: {stats[\"tasks\"]}  Channels: {channels}')
-if stats['messages']:
-    print(f'  Last messages:')
-    for msg in stats['messages'][-5:]:
-        print(f'    - {msg}')
-
-# Output JSON for roster record
-summary = {
-    'results': stats['results'], 'errors': stats['errors'],
-    'tasks': stats['tasks'], 'success_rate': rate,
-    'channels': sorted(stats['channels']) if stats['channels'] else []
-}
-print('---JSON---', file=sys.stderr)
-print(json.dumps(summary), file=sys.stderr)
-" "$agent_id" 2>"$fire_tmp")
-      echo "$perf_summary"
+      python "${COMMS_DIR}/hive/fleet_stats.py" fire-report "${CHANNELS_DIR}" "$agent_id"
 
       # 2. Build termination record with full summary
       local summary_json
-      summary_json=$(grep -A1 '---JSON---' "$fire_tmp" 2>/dev/null | tail -1)
+      summary_json=$(python "${COMMS_DIR}/hive/fleet_stats.py" fire-json "${CHANNELS_DIR}" "$agent_id" 2>/dev/null)
       [[ -z "$summary_json" ]] && summary_json="{}"
       local data
       data=$(printf '%s' "$summary_json" | python -c "
@@ -635,7 +591,6 @@ summary['fired_by'] = sys.argv[3]
 print(json.dumps(summary))
 " "$agent_id" "$reason" "$COMMS_AGENT")
       _comms_write "roster" "fire" "FIRED ${agent_id}: ${reason}" "$data"
-      rm -f "$fire_tmp"
 
       # 3. Kill the terminal process (close the window/tab)
       local pid_file="${COMMS_DIR}/.pid-${agent_id//\//-}"
@@ -730,57 +685,9 @@ print()
 
     perf)
       # comms perf [agent] — performance summary from message history
+      # Logic lives in hive/fleet_stats.py (typed + unit-tested)
       local agent_filter="${1:-}"
-      python -c "
-import json, glob, os, sys
-from collections import defaultdict
-
-stats = defaultdict(lambda: {'tasks': 0, 'results': 0, 'errors': 0, 'handoffs_sent': 0, 'handoffs_recv': 0, 'phone_homes': 0, 'first_seen': '', 'last_seen': '', 'channels': set()})
-agent_filter = sys.argv[1]
-
-for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
-    with open(f) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line: continue
-            try:
-                m = json.loads(line)
-                agent = m.get('from', '?')
-                if agent_filter and agent_filter not in agent: continue
-                mtype = m.get('type', '')
-                ts = m.get('ts', '')
-                ch = m.get('channel', '')
-
-                s = stats[agent]
-                if not s['first_seen'] or ts < s['first_seen']: s['first_seen'] = ts
-                if not s['last_seen'] or ts > s['last_seen']: s['last_seen'] = ts
-                if ch != 'roster': s['channels'].add(ch)
-
-                if mtype == 'task': s['tasks'] += 1
-                elif mtype == 'result': s['results'] += 1
-                elif mtype == 'error': s['errors'] += 1
-                elif mtype == 'handoff': s['handoffs_sent'] += 1
-                elif mtype == 'ack': s['handoffs_recv'] += 1
-                elif mtype == 'phone-home': s['phone_homes'] += 1
-            except: pass
-
-if not stats:
-    print('  (no data — agents need to use the bus first)')
-else:
-    print('=== Agent Performance ===')
-    print()
-    for agent in sorted(stats):
-        s = stats[agent]
-        total = s['results'] + s['errors']
-        success_rate = f\"{(s['results']/total*100):.0f}%\" if total > 0 else 'n/a'
-        channels = ', '.join(sorted(s['channels'])) if s['channels'] else '(none)'
-        print(f'  {agent}')
-        print(f'    Results: {s[\"results\"]}  Errors: {s[\"errors\"]}  Success rate: {success_rate}')
-        print(f'    Tasks requested: {s[\"tasks\"]}  Handoffs: sent={s[\"handoffs_sent\"]} recv={s[\"handoffs_recv\"]}')
-        print(f'    Phone-homes: {s[\"phone_homes\"]}  Channels: {channels}')
-        print(f'    Active: {s[\"first_seen\"][:19]} to {s[\"last_seen\"][:19]}')
-        print()
-" "$agent_filter"
+      python "${COMMS_DIR}/hive/fleet_stats.py" perf "${CHANNELS_DIR}" "$agent_filter"
       ;;
 
     niche)

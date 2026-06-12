@@ -3,6 +3,7 @@
 Dual-writes to SQLite (primary, queryable) + JSONL (projection, backward compat).
 All queries go through SQLite. JSONL is write-only.
 """
+from collections.abc import Callable
 from typing import Any
 
 from hive.cell import Cell, make_cell
@@ -60,7 +61,7 @@ class HiveBoard:
         """Retrieve a cell by ID."""
         return self._sqlite.get(cell_id)
 
-    def query(self, **kwargs) -> list[Cell]:
+    def query(self, **kwargs: Any) -> list[Cell]:
         """Find cells matching criteria. See SQLiteTransport.query for params."""
         return self._sqlite.query(**kwargs)
 
@@ -72,7 +73,12 @@ class HiveBoard:
         """Remove expired cells. Returns count removed."""
         return self._sqlite.expire()
 
-    def watch(self, channel: str, callback, type_filter: str | None = None):
+    def watch(
+        self,
+        channel: str,
+        callback: Callable[[Cell], None],
+        type_filter: str | None = None,
+    ) -> None:
         """Subscribe to new cells on a channel."""
         self._sqlite.watch(channel, callback, type_filter)
 
@@ -151,7 +157,7 @@ class HiveBoard:
         contract_id: str,
         output: str,
         artifacts: list[str] | None = None,
-        metrics: dict | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> str:
         """Create a result cell."""
         data: dict[str, Any] = {"output": output}

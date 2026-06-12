@@ -17,9 +17,10 @@ A dependency id that has no task cell in the channel counts as unsatisfied.
 """
 import json
 import sys
+from collections.abc import Iterable, Iterator
 
 
-def scan(lines):
+def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     """Yield (task_id, msg) for claimable tasks given JSONL lines."""
     tasks = {}        # task_id -> cell
     claimed = set()
@@ -63,7 +64,7 @@ def scan(lines):
         yield tid, cell.get("msg", "")
 
 
-def main(argv):
+def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: runner_scan.py <channel.jsonl>", file=sys.stderr)
         return 1

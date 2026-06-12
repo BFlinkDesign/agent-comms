@@ -28,7 +28,7 @@ class Cell:
     sig: str | None = None
 
 
-def _generate_id(type: str, from_agent: str, ts: str, channel: str, data: dict) -> str:
+def _generate_id(type: str, from_agent: str, ts: str, channel: str, data: dict[str, Any]) -> str:
     """Generate deterministic content-addressable cell ID.
 
     Formula: hive: + SHA-256(type + from + ts + channel + JSON(data))[:16]

@@ -119,3 +119,11 @@ class TestProtocolCommands:
         out = run(env, "help").stdout
         for cmd in ("task-ref", "comms trace", "comms belief", "comms refute"):
             assert cmd in out
+
+    def test_perf_uses_fleet_stats_module(self, env):
+        run(env, "send", "general", "doing some work")
+        run(env, "result", "general", "the work is finished")
+        r = run(env, "perf")
+        assert r.returncode == 0, r.stderr
+        assert "test/agent" in r.stdout
+        assert "Results: 1" in r.stdout
