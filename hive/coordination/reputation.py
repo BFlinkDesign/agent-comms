@@ -15,8 +15,9 @@ def reputation(board: HiveBoard, agent_id: str, capability: str | None = None) -
     Finds all feedback cells for contracts assigned to this agent,
     applies exponential decay weighting (most recent first).
     """
-    # Find all contracts where this agent was the worker
-    contracts = board.query(type="contract")
+    # Find all contracts where this agent was the worker.
+    # Unbounded: truncation would score reputation on a partial history.
+    contracts = board.query(type="contract", limit=None)
     agent_contracts = [c for c in contracts if c.data.get("agent") == agent_id]
 
     if not agent_contracts:

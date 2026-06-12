@@ -13,6 +13,26 @@ FAILURE_THRESHOLD = 5  # scores below this are considered failures
 FAILURE_RATE_ALERT = 0.3  # 30% failure rate triggers signal
 
 
+def _emit_once(board: HiveBoard, signal_data: dict[str, Any]) -> bool:
+    """Write a signal cell unless an identical one already exists.
+
+    evolve() is safe to run repeatedly only if unchanged findings don't
+    re-emit: the payload captures the finding (rates, counts, corrections),
+    so an identical payload means nothing new happened since the last run.
+    Returns True if a cell was written.
+    """
+    existing = board.query(type="signal", channel="roster", limit=None)
+    if any(c.data == signal_data for c in existing):
+        return False
+    board.put(
+        type="signal",
+        from_agent="hive/evolution",
+        channel="roster",
+        data=signal_data,
+    )
+    return True
+
+
 def evolve(board: HiveBoard) -> list[dict[str, Any]]:
     """Analyze feedback patterns and emit improvement signals.
 
@@ -20,11 +40,13 @@ def evolve(board: HiveBoard) -> list[dict[str, Any]]:
     1. High failure rate by task_type tag (feedback scores)
     2. Refuted beliefs -- wrong priors that agents acted on
 
-    Returns list of signal info dicts for signals emitted.
+    Returns list of signal info dicts for signals emitted. Re-running with
+    unchanged board state emits nothing new (see _emit_once).
     """
     signals = []
 
-    feedbacks = board.query(type="feedback")
+    # Unbounded: truncation would compute failure rates on a partial sample.
+    feedbacks = board.query(type="feedback", limit=None)
     if feedbacks:
         # Check failure rates by task_type tag
         by_type: dict[str, list] = defaultdict(list)
@@ -48,13 +70,8 @@ def evolve(board: HiveBoard) -> list[dict[str, Any]]:
                         "sample_size": len(type_feedbacks),
                     },
                 }
-                board.put(
-                    type="signal",
-                    from_agent="hive/evolution",
-                    channel="roster",
-                    data=signal_data,
-                )
-                signals.append(signal_data)
+                if _emit_once(board, signal_data):
+                    signals.append(signal_data)
 
     # Check for refuted beliefs -- wrong priors that need correction
     try:
@@ -72,13 +89,8 @@ def evolve(board: HiveBoard) -> list[dict[str, Any]]:
                     ],
                 },
             }
-            board.put(
-                type="signal",
-                from_agent="hive/evolution",
-                channel="roster",
-                data=signal_data,
-            )
-            signals.append(signal_data)
+            if _emit_once(board, signal_data):
+                signals.append(signal_data)
     except ImportError:
         pass  # beliefs module not yet available
 

@@ -94,6 +94,13 @@ class TestQuery:
         assert len(results) == 1
         assert results[0].data.get("new") is True
 
+    def test_query_limit_none_is_unbounded(self):
+        t, _ = _make_transport()
+        for i in range(150):
+            t.put(make_cell(type="task", from_agent="claude/1", channel="general", data={"n": i}))
+        assert len(t.query(type="task")) == 100  # default still truncates
+        assert len(t.query(type="task", limit=None)) == 150
+
     def test_query_order_by_rowid_uses_commit_order(self):
         t, _ = _make_transport()
         # Second insert carries an EARLIER timestamp than the first.

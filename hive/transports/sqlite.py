@@ -191,7 +191,7 @@ class SQLiteTransport:
         since: str | None = None,
         tags: list[str] | tuple[str, ...] | None = None,
         refs: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
         order: str = "asc",
         order_by: str = "ts",
     ) -> list[Cell]:
@@ -209,6 +209,11 @@ class SQLiteTransport:
 
         Parameters
         ----------
+        limit:
+            Maximum rows returned, or ``None`` for unbounded. Callers whose
+            correctness depends on seeing every matching cell (stall
+            detection, reputation, DAG readiness) must pass ``None`` --
+            the default of 100 silently truncates on large boards.
         order:
             ``"asc"`` (oldest first) or ``"desc"`` (newest first).
         order_by:
@@ -242,7 +247,8 @@ class SQLiteTransport:
         if order_by not in ("ts", "rowid"):
             raise ValueError(f"order_by must be 'ts' or 'rowid', got {order_by!r}")
         sql = f'SELECT * FROM cells {where} ORDER BY {order_by} {direction} LIMIT ?'
-        params.append(limit)
+        # SQLite treats a negative LIMIT as unbounded.
+        params.append(-1 if limit is None else limit)
 
         conn = self._conn()
         cur = conn.execute(sql, params)

@@ -36,7 +36,8 @@ def get_ready_tasks(board: HiveBoard, channel: str | None = None) -> list[Cell]:
     2. All referenced tasks have results (dependencies satisfied)
     AND it does not already have a contract.
     """
-    kwargs = {"type": "task"}
+    # Unbounded: a truncated scan would silently hide ready tasks.
+    kwargs = {"type": "task", "limit": None}
     if channel:
         kwargs["channel"] = channel
     tasks = board.query(**kwargs)
