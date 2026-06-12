@@ -14,6 +14,8 @@ The core Python library implementing the HIVE protocol — immutable, content-ad
 | `__init__.py` | Package exports: HiveBoard, Cell, cell_from_dict, cell_to_dict, make_cell. Version 1.1.0 |
 | `board.py` | HiveBoard facade — dual-writes every cell to SQLite (primary, queryable) + JSONL (write-only compat). Public API: put, get, query, refs, watch, expire. Convenience methods: task, card, heartbeat, result, feedback. |
 | `cell.py` | Cell dataclass (frozen=True) — immutable, content-addressed by SHA-256 hash of (type + from_agent + ts + channel + JSON(data)). ID format: "hive:" + first 16 chars of digest. refs and tags are tuple[str, ...] only. |
+| `runner_scan.py` | Standalone stdlib-only scanner for agent-runner.sh — finds claimable tasks, enforces depends_on (unknown dep ids count as unsatisfied). No hive imports; invoked as a script. |
+| `fleet_stats.py` | Standalone stdlib-only scanner backing `comms perf` / `comms fire` — per-agent activity stats from channel JSONL. No hive imports; invoked as a script. |
 
 ## Subdirectories
 

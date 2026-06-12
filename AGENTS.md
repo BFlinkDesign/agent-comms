@@ -19,6 +19,7 @@ convenience.
 
 | File | Description |
 |------|-------------|
+| `CLAUDE.md` | Claude Code guidance: commands, architecture, concurrency invariants |
 | `comms.sh` | Primary CLI entry point — source this, do not execute directly |
 | `agent-runner.sh` | Persistent dispatch loop for non-interactive agents; validates cells before posting |
 | `PROTOCOL.md` | Canonical A2A-aligned task lifecycle schema and cell format specification |
