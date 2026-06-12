@@ -20,7 +20,7 @@ from hive.board import HiveBoard
 from hive.mcp.tools import get_tool_definitions, execute_tool
 
 
-def _read_message() -> dict | None:
+def _read_message() -> dict[str, Any] | None:
     """Read a JSON-RPC message from stdin (LSP-style Content-Length headers)."""
     headers: dict[str, str] = {}
     while True:
@@ -39,10 +39,11 @@ def _read_message() -> dict | None:
         return None
 
     body = sys.stdin.buffer.read(content_length)
-    return json.loads(body.decode("utf-8"))
+    parsed: dict[str, Any] = json.loads(body.decode("utf-8"))
+    return parsed
 
 
-def _write_message(msg: dict):
+def _write_message(msg: dict[str, Any]) -> None:
     """Write a JSON-RPC message to stdout."""
     body = json.dumps(msg).encode("utf-8")
     header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
@@ -50,15 +51,15 @@ def _write_message(msg: dict):
     sys.stdout.buffer.flush()
 
 
-def _make_response(request_id: Any, result: Any) -> dict:
+def _make_response(request_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _make_error(request_id: Any, code: int, message: str) -> dict:
+def _make_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def run_server(db_path: str = "hive.db", channels_dir: str = "channels"):
+def run_server(db_path: str = "hive.db", channels_dir: str = "channels") -> None:
     """Run the HIVE MCP server (stdio transport)."""
     board = HiveBoard(db_path=db_path, channels_dir=channels_dir)
     tools = get_tool_definitions()

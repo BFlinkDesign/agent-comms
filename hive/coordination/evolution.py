@@ -7,6 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from hive.board import HiveBoard
+from hive.cell import Cell
 
 
 FAILURE_THRESHOLD = 5  # scores below this are considered failures
@@ -49,7 +50,7 @@ def evolve(board: HiveBoard) -> list[dict[str, Any]]:
     feedbacks = board.query(type="feedback", limit=None)
     if feedbacks:
         # Check failure rates by task_type tag
-        by_type: dict[str, list] = defaultdict(list)
+        by_type: dict[str, list[Cell]] = defaultdict(list)
         for fb in feedbacks:
             for tag in fb.tags:
                 if tag.startswith("task_type:"):
