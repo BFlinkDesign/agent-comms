@@ -193,6 +193,7 @@ class SQLiteTransport:
         refs: str | None = None,
         limit: int = 100,
         order: str = "asc",
+        order_by: str = "ts",
     ) -> list[Cell]:
         """Return cells matching the given filters.
 
@@ -210,6 +211,10 @@ class SQLiteTransport:
         ----------
         order:
             ``"asc"`` (oldest first) or ``"desc"`` (newest first).
+        order_by:
+            ``"ts"`` (cell timestamp, default) or ``"rowid"`` (commit order).
+            Use rowid when winner-takes-first semantics must not depend on
+            the writers' clocks agreeing (e.g. lease claim arbitration).
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -234,7 +239,9 @@ class SQLiteTransport:
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         direction = "ASC" if order.lower() == "asc" else "DESC"
-        sql = f'SELECT * FROM cells {where} ORDER BY ts {direction} LIMIT ?'
+        if order_by not in ("ts", "rowid"):
+            raise ValueError(f"order_by must be 'ts' or 'rowid', got {order_by!r}")
+        sql = f'SELECT * FROM cells {where} ORDER BY {order_by} {direction} LIMIT ?'
         params.append(limit)
 
         conn = self._conn()

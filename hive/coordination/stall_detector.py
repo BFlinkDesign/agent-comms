@@ -17,6 +17,13 @@ def detect_stalls(
 
     Returns list of stall info dicts with contract_id, agent, last_heartbeat.
     Also emits signal cells to the board for each detected stall.
+
+    A signal cell is emitted at most once per stall episode: if a
+    stall_detected signal for the contract already exists and no heartbeat
+    has arrived since it was emitted, the stall is still returned but no
+    duplicate signal is written. Otherwise every poll cycle would flood the
+    channel with near-identical signal cells (their content-addressed IDs
+    differ each run because age_seconds changes).
     """
     contracts = board.query(type="contract")
     stalls = []
@@ -59,6 +66,9 @@ def detect_stalls(
             }
             stalls.append(stall_info)
 
+            if _already_signaled(refs, last_hb_ts):
+                continue
+
             # Emit signal
             board.put(
                 type="signal",
@@ -72,3 +82,21 @@ def detect_stalls(
             )
 
     return stalls
+
+
+def _already_signaled(contract_refs: list, last_hb_ts: str | None) -> bool:
+    """True if a stall signal for this episode was already emitted.
+
+    A heartbeat newer than the latest signal starts a new episode (the agent
+    made progress, then stalled again), so a fresh signal is warranted.
+    """
+    signal_ts = [
+        r.ts
+        for r in contract_refs
+        if r.type == "signal" and r.data.get("event") == "stall_detected"
+    ]
+    if not signal_ts:
+        return False
+    if last_hb_ts is None:
+        return True
+    return max(signal_ts) > last_hb_ts
