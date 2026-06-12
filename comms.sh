@@ -6,7 +6,7 @@
 # Identity: COMMS_AGENT = "agent/session" e.g. "claude/1", "gemini/signx", "gemini/warehouse"
 # Channels: project-scoped e.g. "signx-intel", "signx-warehouse", "keyedin", "general"
 
-COMMS_DIR="C:/tools/agent-comms"
+COMMS_DIR="${COMMS_DIR:-C:/tools/agent-comms}"
 # Canonical shared channel dir — symlinked from ~/.claude/channels, ~/.gemini/channels, ~/.codex/channels
 # Use COMMS_CHANNELS env override, or fall back to known Windows path
 CHANNELS_DIR="${COMMS_CHANNELS:-C:/Users/Brady.EAGLE/.ai/channels}"
@@ -97,6 +97,10 @@ comms() {
         echo "usage: comms read <channel> [--last N] [--from agent] [--type type]"
         return 1
       fi
+      if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+        echo "--last must be a number, got '${last}'"
+        return 1
+      fi
       local f="${CHANNELS_DIR}/${channel}.jsonl"
       if [[ ! -f "$f" ]]; then
         echo "channel '${channel}' does not exist"
@@ -108,10 +112,12 @@ comms() {
         echo "(no messages in ${channel})"
         return 0
       fi
+      # Filters passed as argv, not interpolated into the source: a quote in
+      # a filter value must not break (or rewrite) the embedded Python.
       tail -n "$last" "$f" | python -c "
 import sys, json
-filter_from = '$filter_from'
-filter_type = '$filter_type'
+filter_from = sys.argv[1]
+filter_type = sys.argv[2]
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
@@ -128,7 +134,7 @@ for line in sys.stdin:
                 print(f\"{'':>30}{k}: {vstr}\")
     except json.JSONDecodeError:
         print(f'  (bad json) {line[:80]}')
-"
+" "$filter_from" "$filter_type"
       ;;
 
     phone-home)
@@ -248,6 +254,24 @@ else:
       _comms_write "$channel" "ack" "acknowledged ${task_id}" "$data"
       ;;
 
+    task-ref)
+      # comms task-ref <channel> <msg> <task_id> — result cell referencing a task
+      local channel="$1" msg="$2" task_id="$3"
+      if [[ -z "$channel" || -z "$msg" || -z "$task_id" ]]; then
+        echo "usage: comms task-ref <channel> <msg> <task_id>"
+        return 1
+      fi
+      local data
+      data=$(python -c "import json,sys;print(json.dumps({'task_id':sys.argv[1]}))" "$task_id")
+      _comms_write "$channel" "result" "$msg" "$data"
+      ;;
+
+    # Cognitive-layer commands. PROTOCOL.md documents these top-level forms;
+    # they delegate to the hive bridge.
+    trace)   comms hive trace "$@" ;;
+    belief)  comms hive belief "$@" ;;
+    refute)  comms hive refute "$@" ;;
+
     status)
       # comms status — all channels grouped by project
       echo "=== Agent Comms Status ==="
@@ -315,8 +339,12 @@ if line:
     log)
       # comms log — unified timeline across ALL channels, last N messages
       local last="${1:-20}"
+      if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+        echo "usage: comms log [N] — N must be a number, got '${last}'"
+        return 1
+      fi
       python -c "
-import json, os, glob
+import json, os, glob, sys
 msgs = []
 for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
     with open(f) as fh:
@@ -326,10 +354,10 @@ for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
             try: msgs.append(json.loads(line))
             except: pass
 msgs.sort(key=lambda m: m.get('ts', ''))
-for m in msgs[-${last}:]:
+for m in msgs[-int(sys.argv[1]):]:
     ch = m.get('channel', '?')
     print(f\"[{m.get('ts','?')[:19]}] {ch:>16} | {m.get('from','?'):>16} | {m.get('type','?'):>10} | {m.get('msg','')[:60]}\")
-"
+" "$last"
       ;;
 
     hire)
@@ -378,6 +406,10 @@ for m in msgs[-${last}:]:
         echo "    comms clock-in \"${role}\""
         return 0
       fi
+
+      # Working directory must be resolved BEFORE the boot script is written:
+      # the gemini heredoc below expands ${launch_dir} at write time.
+      local launch_dir="${work_dir:-.}"
 
       # Write boot script for the new terminal
       local boot_script="${COMMS_DIR}/.boot-${agent_id//\//-}.sh"
@@ -512,9 +544,6 @@ BOOTEOF
 
       chmod +x "$boot_script"
 
-      # Determine working directory
-      local launch_dir="${work_dir:-.}"
-
       # Launch headed terminal via Windows Terminal (wt.exe)
       local title="${agent_id} [${dept}]"
       local wt_path
@@ -546,10 +575,13 @@ BOOTEOF
       # 1. Capture performance summary before termination
       echo ""
       echo "  === TERMINATION REPORT: ${agent_id} ==="
+      local fire_tmp
+      fire_tmp=$(mktemp "${TMPDIR:-/tmp}/comms-fire.XXXXXX")
       local perf_summary
       perf_summary=$(python -c "
-import json, glob
+import json, glob, sys
 from collections import defaultdict
+agent_id = sys.argv[1]
 stats = {'results': 0, 'errors': 0, 'tasks': 0, 'channels': set(), 'messages': []}
 for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
     with open(f) as fh:
@@ -558,7 +590,7 @@ for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
             if not line: continue
             try:
                 m = json.loads(line)
-                if '${agent_id}' not in m.get('from', ''): continue
+                if agent_id not in m.get('from', ''): continue
                 mtype = m.get('type', '')
                 ch = m.get('channel', '')
                 if ch != 'roster': stats['channels'].add(ch)
@@ -584,15 +616,14 @@ summary = {
     'tasks': stats['tasks'], 'success_rate': rate,
     'channels': sorted(stats['channels']) if stats['channels'] else []
 }
-import sys
 print('---JSON---', file=sys.stderr)
 print(json.dumps(summary), file=sys.stderr)
-" 2>/tmp/_comms_fire_data.txt)
+" "$agent_id" 2>"$fire_tmp")
       echo "$perf_summary"
 
       # 2. Build termination record with full summary
       local summary_json
-      summary_json=$(grep -A1 '---JSON---' /tmp/_comms_fire_data.txt 2>/dev/null | tail -1)
+      summary_json=$(grep -A1 '---JSON---' "$fire_tmp" 2>/dev/null | tail -1)
       [[ -z "$summary_json" ]] && summary_json="{}"
       local data
       data=$(printf '%s' "$summary_json" | python -c "
@@ -604,7 +635,7 @@ summary['fired_by'] = sys.argv[3]
 print(json.dumps(summary))
 " "$agent_id" "$reason" "$COMMS_AGENT")
       _comms_write "roster" "fire" "FIRED ${agent_id}: ${reason}" "$data"
-      rm -f /tmp/_comms_fire_data.txt
+      rm -f "$fire_tmp"
 
       # 3. Kill the terminal process (close the window/tab)
       local pid_file="${COMMS_DIR}/.pid-${agent_id//\//-}"
@@ -699,13 +730,13 @@ print()
 
     perf)
       # comms perf [agent] — performance summary from message history
-      local agent_filter="$1"
+      local agent_filter="${1:-}"
       python -c "
-import json, glob, os
+import json, glob, os, sys
 from collections import defaultdict
 
 stats = defaultdict(lambda: {'tasks': 0, 'results': 0, 'errors': 0, 'handoffs_sent': 0, 'handoffs_recv': 0, 'phone_homes': 0, 'first_seen': '', 'last_seen': '', 'channels': set()})
-agent_filter = '$agent_filter'
+agent_filter = sys.argv[1]
 
 for f in glob.glob('${CHANNELS_DIR}/*.jsonl'):
     with open(f) as fh:
@@ -749,7 +780,7 @@ else:
         print(f'    Phone-homes: {s[\"phone_homes\"]}  Channels: {channels}')
         print(f'    Active: {s[\"first_seen\"][:19]} to {s[\"last_seen\"][:19]}')
         print()
-"
+" "$agent_filter"
       ;;
 
     niche)
@@ -949,6 +980,7 @@ Messaging:
   comms phone-home <msg> [--channel X]       Check in with the boss
   comms handoff <ch> <agent> <instructions>  Hand off work
   comms ack <ch> <task_id>                   Acknowledge a handoff
+  comms task-ref <ch> <msg> <task_id>        Result cell referencing a task
   comms clock-in [role]                      Register terminal as active
   comms clock-out [reason]                   Mark terminal as offline
   comms roster                               Who's online
@@ -965,6 +997,11 @@ HIVE Protocol:
   comms hive task <ch> <title> [spec]        Create a task cell
   comms hive refs <cell_id>                  Reverse DAG lookup
   comms hive expire                          Remove expired cells
+
+Cognitive layer:
+  comms trace <contract_id> <ch> <outcome> <steps_json>   Record reasoning trace
+  comms belief <ch> <claim> [confidence]                  Assert a prior belief
+  comms refute <belief_id> <reason> [correction] [ch]     Refute a belief
 
 Organization:
   comms hire <agent/session> <dept> <role>   Hire agent + launch terminal

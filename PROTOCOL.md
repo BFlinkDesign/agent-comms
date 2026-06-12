@@ -187,11 +187,12 @@ comms error <channel> "<msg>"        # type=error
 comms clock-in "<role>"              # register to roster
 comms clock-out                      # deregister
 comms roster                         # show who's online
-comms hire <channel> <task>          # post task + watch for result
+comms hire <agent/session> <dept> <role> [--task "..."] [--cwd /path]
+                                     # hire agent + launch terminal
 
 # Coordination
 comms task-ref <channel> <msg> <task_id>    # result that refs a task
-comms expire <channel> <id>                 # expire a cell
+comms hive expire                           # remove all TTL-expired cells
 
 # Cognitive layer
 comms trace <contract_id> <channel> <outcome> <steps_json>
