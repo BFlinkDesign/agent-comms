@@ -94,6 +94,25 @@ class TestQuery:
         assert len(results) == 1
         assert results[0].data.get("new") is True
 
+    def test_query_order_by_rowid_uses_commit_order(self):
+        t, _ = _make_transport()
+        # Second insert carries an EARLIER timestamp than the first.
+        t.put(make_cell(type="task", from_agent="claude/1", channel="general", data={"n": 1}, ts="2026-03-01T23:00:00-06:00"))
+        t.put(make_cell(type="task", from_agent="claude/1", channel="general", data={"n": 2}, ts="2026-03-01T20:00:00-06:00"))
+        by_ts = t.query(type="task")
+        by_rowid = t.query(type="task", order_by="rowid")
+        assert [c.data["n"] for c in by_ts] == [2, 1]
+        assert [c.data["n"] for c in by_rowid] == [1, 2]
+
+    def test_query_order_by_rejects_unknown_column(self):
+        t, _ = _make_transport()
+        try:
+            t.query(type="task", order_by="id; DROP TABLE cells")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for invalid order_by")
+
 
 class TestRefs:
     def test_refs_returns_referencing_cells(self):

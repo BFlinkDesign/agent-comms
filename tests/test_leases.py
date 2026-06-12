@@ -87,3 +87,38 @@ class TestLeaseExpiry:
         naive_old = (datetime.utcnow() - timedelta(seconds=600)).isoformat()
         _put_lease_with_ts(board, resource="src/main.py", holder="claude/1", ttl=300, ts=naive_old)
         assert is_leased(board, resource="src/main.py") is False
+
+
+class TestLeaseRaceArbitration:
+    def test_race_loser_backs_off(self, monkeypatch):
+        """Two agents pass the is_leased pre-check; the later claim must lose."""
+        import hive.coordination.leases as leases_mod
+
+        board = _make_board()
+        lease_a = acquire_lease(board, resource="src/main.py", holder="claude/1")
+        assert lease_a is not None
+
+        # Simulate the race window: gemini's pre-check ran before claude's
+        # claim landed, so it sees the resource as free and writes a claim.
+        monkeypatch.setattr(leases_mod, "is_leased", lambda *a, **k: False)
+        lease_b = leases_mod.acquire_lease(board, resource="src/main.py", holder="gemini/1")
+        monkeypatch.undo()
+
+        assert lease_b is None  # verify step detected the earlier claim
+        active = leases_mod._active_leases(board, resource="src/main.py")
+        assert len(active) == 1
+        assert active[0].id == lease_a
+        assert active[0].data["holder"] == "claude/1"
+
+    def test_winner_is_commit_order_not_timestamp(self):
+        """Arbitration must use commit order so clock skew can't grant two winners."""
+        from hive.coordination.leases import _active_leases
+
+        board = _make_board()
+        first = acquire_lease(board, resource="src/main.py", holder="claude/1")
+        # A second claim lands later but carries an earlier (skewed) timestamp.
+        skewed_ts = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        _put_lease_with_ts(board, resource="src/main.py", holder="gemini/1", ttl=300, ts=skewed_ts)
+
+        active = _active_leases(board, resource="src/main.py")
+        assert active[0].id == first  # commit order wins, not the skewed ts
