@@ -84,3 +84,40 @@ class TestHiveBoard:
         results = board.query(type="feedback")
         assert len(results) == 1
         assert results[0].data["score"] == 8
+
+    def test_contract_convenience(self):
+        board, _ = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        cell = board.get(cid)
+        assert cell is not None
+        assert cell.type == "contract"
+        assert cell.data["agent"] == "gemini/1"
+        assert tid in cell.refs
+
+    def test_contract_refs_task(self):
+        board, _ = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        back_refs = board.refs(tid)
+        assert any(c.id == cid for c in back_refs)
+
+    def test_contract_race_flag(self):
+        board, _ = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1", race=True)
+        cell = board.get(cid)
+        assert cell is not None
+        assert cell.data["race"] is True
+
+    def test_contract_extra_refs(self):
+        board, _ = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        bid_id = board.put(type="bid", from_agent="gemini/1", channel="general", data={"cost": 3}, refs=[tid])
+        cid = board.contract(
+            from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1", refs=[bid_id],
+        )
+        cell = board.get(cid)
+        assert cell is not None
+        assert tid in cell.refs
+        assert bid_id in cell.refs

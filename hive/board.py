@@ -173,6 +173,33 @@ class HiveBoard:
             data["metrics"] = metrics
         return self.put(type="result", from_agent=from_agent, channel=channel, data=data, refs=[contract_id])
 
+    def contract(
+        self,
+        *,
+        from_agent: str,
+        channel: str,
+        task_id: str,
+        agent: str,
+        race: bool = False,
+        refs: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> str:
+        """Claim a task by creating a contract cell.
+
+        The contract refs the task, transitioning it to WORKING state as seen
+        by lifecycle.get_task_state(). Extra refs (e.g. a bid cell) may be
+        passed in addition to task_id.
+        """
+        all_refs = [task_id, *(refs or [])]
+        return self.put(
+            type="contract",
+            from_agent=from_agent,
+            channel=channel,
+            data={"agent": agent, "race": race},
+            refs=all_refs,
+            tags=tags,
+        )
+
     def feedback(
         self,
         *,
