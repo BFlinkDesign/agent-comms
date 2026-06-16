@@ -77,41 +77,13 @@ ensure_dirs() {
   fi
 }
 
-# Write a JSONL cell to the channel using Python (mirrors comms.sh _comms_write).
+# Write a JSONL cell to the channel.  Delegates to shell_write.py, which
+# validates the channel name, blocks traversal/symlinks, and uses O_NOFOLLOW.
 # Args: channel type msg data_json
 write_cell() {
   local channel="$1" type_="$2" msg="$3" data="${4:-"{}"}"
-  local out_file="${CHANNELS_DIR}/${channel}.jsonl"
-  python -c "
-import json, uuid, datetime, sys
-
-agent  = sys.argv[1]
-ch     = sys.argv[2]
-type_  = sys.argv[3]
-msg    = sys.argv[4]
-data_s = sys.argv[5]
-path   = sys.argv[6]
-
-try:
-    data = json.loads(data_s)
-except json.JSONDecodeError as e:
-    data = {'_parse_error': str(e), '_raw': data_s}
-
-obj = {
-    'id':      str(uuid.uuid4()),
-    'from':    agent,
-    'ts':      datetime.datetime.now().astimezone().isoformat(),
-    'channel': ch,
-    'type':    type_,
-    'msg':     msg,
-    'data':    data,
-}
-with open(path, 'a', encoding='utf-8') as f:
-    f.write(json.dumps(obj, ensure_ascii=False) + '\n')
-
-# Echo the generated cell ID to stdout so bash can capture it
-print(obj['id'])
-" "$COMMS_AGENT" "$channel" "$type_" "$msg" "$data" "$out_file"
+  python "${COMMS_DIR}/hive/shell_write.py" \
+    "$COMMS_AGENT" "$channel" "$type_" "$msg" "$data" "${CHANNELS_DIR}"
 }
 
 # Mark a task ID as processed in the local state file
@@ -261,33 +233,16 @@ echo ""
 ensure_dirs
 
 # Clock in to the roster
-python -c "
-import json, uuid, datetime, sys
-
-agent   = sys.argv[1]
-channel = 'roster'
-path    = sys.argv[2] + '/roster.jsonl'
-
-obj = {
-    'id':      str(uuid.uuid4()),
-    'from':    agent,
-    'ts':      datetime.datetime.now().astimezone().isoformat(),
-    'channel': channel,
-    'type':    'clock-in',
-    'msg':     agent + ' online -- agent-runner.sh',
-    'data':    {'role': sys.argv[3]},
-}
-with open(path, 'a', encoding='utf-8') as f:
-    f.write(json.dumps(obj, ensure_ascii=False) + '\n')
-print('[RUNNER] Clocked in to roster')
-" "$COMMS_AGENT" "$CHANNELS_DIR" "${CHANNEL}-runner"
+python "${COMMS_DIR}/hive/shell_write.py" \
+  "$COMMS_AGENT" "roster" "clock-in" "$COMMS_AGENT online -- agent-runner.sh" \
+  "{\"role\":\"${CHANNEL}-runner\"}" "${CHANNELS_DIR}"
+log "Clocked in to roster"
 
 trap 'log "Shutting down — clocking out"; \
-      python -c "
-import json,uuid,datetime,sys
-obj={\"id\":str(uuid.uuid4()),\"from\":\"$COMMS_AGENT\",\"ts\":datetime.datetime.now().astimezone().isoformat(),\"channel\":\"roster\",\"type\":\"clock-out\",\"msg\":\"$COMMS_AGENT offline -- agent-runner.sh\",\"data\":{}}
-with open(\"$CHANNELS_DIR/roster.jsonl\",\"a\",encoding=\"utf-8\") as f: f.write(json.dumps(obj)+chr(10))
-"; exit 0' INT TERM
+      python "${COMMS_DIR}/hive/shell_write.py" \
+        "$COMMS_AGENT" "roster" "clock-out" "$COMMS_AGENT offline -- agent-runner.sh" \
+        "{}" "${CHANNELS_DIR}"; \
+      exit 0' INT TERM
 
 while true; do
   log "Checking ${CHANNEL} for tasks..."

@@ -4,6 +4,7 @@ Reads from ~/.ai/channels/*.jsonl and hive.db (if present)
 """
 
 import contextlib
+import ipaddress
 import json
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -22,6 +23,11 @@ from fastapi.responses import JSONResponse
 CHANNELS_DIR = Path(os.environ.get("COMMS_CHANNELS", "C:/Users/Brady.EAGLE/.ai/channels"))
 DB_PATH = Path(os.environ.get("HIVE_DB", "C:/tools/agent-comms/hive.db"))
 
+# Optional auth token.  When set, non-loopback callers must supply:
+#   Authorization: Bearer <HIVE_DASHBOARD_TOKEN>
+# Loopback (127.x, ::1) is always allowed regardless of this setting.
+_DASHBOARD_TOKEN: str | None = os.environ.get("HIVE_DASHBOARD_TOKEN") or None
+
 app = FastAPI(title="HIVE Dashboard", version="1.0.0")
 
 app.add_middleware(
@@ -31,6 +37,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+def _is_loopback(addr: str) -> bool:
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return addr in ("localhost", "::1")
+
+
+def _require_auth(request: Request) -> None:
+    """FastAPI dependency: 401 for non-loopback requests when token is configured."""
+    if _DASHBOARD_TOKEN is None:
+        return
+    client_host = (request.client.host if request.client else "127.0.0.1")
+    if _is_loopback(client_host):
+        return
+    auth = request.headers.get("Authorization", "")
+    prefix = "Bearer "
+    if not auth.startswith(prefix) or auth[len(prefix):] != _DASHBOARD_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +410,7 @@ def _find_referenced_task(msg: str, refs: list, tasks: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/agents")
-def get_agents() -> Any:
+def get_agents(_: None = Depends(_require_auth)) -> Any:
     roster = _build_roster()
     # Filter out boring system/test agents, show only real ones
     real_agents = {
@@ -395,7 +425,7 @@ def get_agents() -> Any:
 
 
 @app.get("/api/tasks")
-def get_tasks(channel: str = Query(default="signx-intel")) -> Any:
+def get_tasks(channel: str = Query(default="signx-intel"), _: None = Depends(_require_auth)) -> Any:
     tasks = _build_tasks(channel)
     return JSONResponse(content={
         "channel": channel,
@@ -413,6 +443,7 @@ def get_tasks(channel: str = Query(default="signx-intel")) -> Any:
 def get_feed(
     channel: str = Query(default="signx-intel"),
     limit: int = Query(default=50, le=200),
+    _: None = Depends(_require_auth),
 ) -> Any:
     ch_path = CHANNELS_DIR / f"{channel}.jsonl"
     cells = _read_jsonl(ch_path)
@@ -440,7 +471,7 @@ def get_feed(
 
 
 @app.get("/api/stats")
-def get_stats() -> Any:
+def get_stats(_: None = Depends(_require_auth)) -> Any:
     if not CHANNELS_DIR.exists():
         return JSONResponse(content={"error": "channels dir not found"})
 
@@ -497,7 +528,7 @@ def get_stats() -> Any:
 
 
 @app.get("/api/channels")
-def get_channels() -> Any:
+def get_channels(_: None = Depends(_require_auth)) -> Any:
     if not CHANNELS_DIR.exists():
         return JSONResponse(content={"channels": [], "error": "channels dir not found"})
 
