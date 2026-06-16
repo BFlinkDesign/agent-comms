@@ -59,17 +59,41 @@ mutating. Terminal task states (COMPLETE/FAILED/CANCELED) are permanent.
 
 **Shell layer delegates logic to tested Python.** `comms.sh` (source it, don't execute) and
 `agent-runner.sh` keep argument parsing in bash but call stdlib-only scripts in `hive/` for anything
-with logic: `runner_scan.py` (claimable-task scan, enforces `depends_on` — a task is withheld until
-every dependency has a result cell; unknown dep ids count as unsatisfied) and `fleet_stats.py`
-(`comms perf` / `comms fire`). Follow this pattern for new shell features; pass user input to embedded
-Python as argv, never by interpolating into the source.
+with logic: `runner_scan.py` (claimable-task scan), `fleet_stats.py` (`comms perf` / `comms fire`),
+and `shell_write.py` (all channel writes). Follow this pattern for new shell features; pass user input
+to embedded Python as argv, never by interpolating into the source.
+
+**`hive/shell_write.py`** is the single validated JSONL write entry point for shell scripts. It:
+validates the channel name against `^[a-z0-9][a-z0-9_-]{0,63}$`, rejects path traversal and symlinks,
+opens with `O_NOFOLLOW`, and prints the generated cell ID to stdout. `comms.sh` and `agent-runner.sh`
+both call it — never `open()` a channel file directly from shell.
+
+**`hive/runner_scan.py`** has two modes. Board mode (`--db hive.db --channels-dir dir channel`) uses
+`HiveBoard + get_ready_tasks()` for full lifecycle awareness (contracts, results, cancels, DAG refs).
+Legacy mode (`channel.jsonl`) is stdlib-only for environments without `hive.db`. `agent-runner.sh`
+auto-selects board mode when `${COMMS_DIR}/hive.db` exists. Add new readiness rules to `lifecycle.py`
+not to `runner_scan.py`.
 
 **Dispatch loop** (`agent-runner.sh`): polls a channel, claims via first-claim-in-file-order with a
 post-write verify, invokes the agent CLI (`codex` goes through `codex-wrap.py` to strip ANSI/progress
 noise), posts the result cell. State file prevents reprocessing across restarts.
 
 **Other entry points:** `hive/mcp/server.py` (stdio JSON-RPC MCP server exposing board ops as tools);
-`dashboard/server.py` (FastAPI on :7842, read-only views over channels + hive.db).
+`dashboard/server.py` (FastAPI on :7842, read-only views over channels + hive.db; protected by
+`HIVE_DASHBOARD_TOKEN` env var when set — loopback requests bypass auth).
+
+**MCP server** (`hive/mcp/server.py`): implements LSP-style Content-Length framing. The public
+`handle_message(board, tools, msg)` function dispatches a single JSON-RPC message and is tested
+directly in `tests/test_mcp_server.py` without subprocess overhead. Available tools (as of PR #13):
+
+| Tool | Purpose |
+|---|---|
+| `hive_put` / `hive_get` / `hive_query` / `hive_refs` / `hive_expire` | Raw board ops |
+| `hive_task` / `hive_card` / `hive_heartbeat` / `hive_feedback` | Convenience wrappers |
+| `hive_trace` / `hive_belief` / `hive_refute` | Memory & belief cells |
+| `hive_bid` / `hive_contract` | Bidding and task-claim workflow |
+| `hive_lease` / `hive_release` / `hive_is_leased` | Advisory resource locking |
+| `hive_task_state` / `hive_ready_tasks` / `hive_result` | Task lifecycle |
 
 ## Deployment facts that bite
 

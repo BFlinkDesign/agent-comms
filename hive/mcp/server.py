@@ -7,8 +7,8 @@ Register in Claude Code settings.json:
   "mcpServers": {
     "hive": {
       "command": "python",
-      "args": ["-m", "hive.mcp.server", "--db", "C:/tools/agent-comms/hive.db",
-               "--channels", "C:/tools/agent-comms/channels"]
+      "args": ["-m", "hive.mcp.server", "--db", "/path/to/hive.db",
+               "--channels", "/path/to/channels"]
     }
   }
 }
@@ -60,6 +60,60 @@ def _make_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
+def handle_message(
+    board: HiveBoard,
+    tools: list[dict[str, Any]],
+    msg: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Dispatch a single JSON-RPC message and return a response dict, or None for notifications."""
+    request_id = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params", {})
+
+    if method == "initialize":
+        return _make_response(request_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hive", "version": "1.1.0"},
+        })
+
+    if method == "notifications/initialized":
+        return None  # notification — no response
+
+    if method == "ping":
+        return _make_response(request_id, {})
+
+    if method == "tools/list":
+        tool_list = [
+            {
+                "name": t["name"],
+                "description": t["description"],
+                "inputSchema": t["inputSchema"],
+            }
+            for t in tools
+        ]
+        return _make_response(request_id, {"tools": tool_list})
+
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        try:
+            result = execute_tool(board, tool_name, tool_args)
+            return _make_response(request_id, {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+            })
+        except Exception as e:
+            return _make_response(request_id, {
+                "content": [{"type": "text", "text": json.dumps({"error": str(e)})}],
+                "isError": True,
+            })
+
+    # Unknown method: return error if it has an id (request), ignore if it's a notification
+    if request_id is not None:
+        return _make_error(request_id, -32601, f"Method not found: {method}")
+    return None
+
+
 def run_server(db_path: str = "hive.db", channels_dir: str = "channels") -> None:
     """Run the HIVE MCP server (stdio transport)."""
     board = HiveBoard(db_path=db_path, channels_dir=channels_dir)
@@ -69,55 +123,15 @@ def run_server(db_path: str = "hive.db", channels_dir: str = "channels") -> None
         msg = _read_message()
         if msg is None:
             break
-
-        request_id = msg.get("id")
-        method = msg.get("method", "")
-        params = msg.get("params", {})
-
-        if method == "initialize":
-            _write_message(_make_response(request_id, {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "hive", "version": "1.1.0"},
-            }))
-
-        elif method == "notifications/initialized":
-            pass  # no response needed
-
-        elif method == "tools/list":
-            tool_list = [
-                {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "inputSchema": t["inputSchema"],
-                }
-                for t in tools
-            ]
-            _write_message(_make_response(request_id, {"tools": tool_list}))
-
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments", {})
-            try:
-                result = execute_tool(board, tool_name, tool_args)
-                _write_message(_make_response(request_id, {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                }))
-            except Exception as e:
-                _write_message(_make_response(request_id, {
-                    "content": [{"type": "text", "text": json.dumps({"error": str(e)})}],
-                    "isError": True,
-                }))
-
-        else:
-            if request_id is not None:
-                _write_message(_make_error(request_id, -32601, f"Method not found: {method}"))
+        response = handle_message(board, tools, msg)
+        if response is not None:
+            _write_message(response)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="HIVE MCP Server")
-    parser.add_argument("--db", default="C:/tools/agent-comms/hive.db")
-    parser.add_argument("--channels", default="C:/tools/agent-comms/channels")
+    parser.add_argument("--db", default="hive.db")
+    parser.add_argument("--channels", default="channels")
     args = parser.parse_args()
     run_server(db_path=args.db, channels_dir=args.channels)
