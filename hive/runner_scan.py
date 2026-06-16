@@ -1,30 +1,50 @@
-"""Channel scanner for agent-runner.sh -- find claimable tasks.
+"""Channel scanner for agent-runner.sh — find claimable tasks.
 
-Standalone stdlib-only script (no hive imports) so the runner can invoke it
-directly: python runner_scan.py <channel.jsonl>
+Two modes
+---------
+Board mode (preferred, uses canonical lifecycle reducer):
+
+    python runner_scan.py --db <hive.db> --channels-dir <dir> <channel>
+
+    Requires the hive package on sys.path (PYTHONPATH="${COMMS_DIR}").
+    Uses HiveBoard + coordination.lifecycle.is_task_ready(), which understands
+    all cell types: claim, contract, result, error, cancel, blocked, verified,
+    plus dependency resolution via both data.depends_on and cell refs.
+
+Legacy mode (stdlib-only, raw JSONL scan):
+
+    python runner_scan.py <channel.jsonl>
+
+    No hive imports.  Only understands data.task_id-based claim/result/error
+    and data.depends_on dependency lists.  Use when hive.db is not available.
 
 Emits one line per claimable task: <task_id>|<msg with | escaped as [pipe]>
-
-A task is claimable when:
-  1. no claim cell references it, AND
-  2. no result/error cell references it, AND
-  3. every task id in its data.depends_on has a result cell.
-
-Rule 3 is the dependency enforcement PROTOCOL.md promises ("Checks
-dependencies -- skips BLOCKED tasks") and the FLEET-OPS never-again rule
-exists for: Codex once claimed TASK-3 before TASK-2 was even posted.
-A dependency id that has no task cell in the channel counts as unsatisfied.
 """
+from __future__ import annotations
+
 import json
 import sys
 from collections.abc import Iterable, Iterator
+from typing import Any
 
+# ---------------------------------------------------------------------------
+# Legacy raw-JSONL scan (stdlib only)
+# ---------------------------------------------------------------------------
 
 def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
-    """Yield (task_id, msg) for claimable tasks given JSONL lines."""
-    tasks = {}        # task_id -> cell
-    claimed = set()
-    done = set()      # task ids with a result or error
+    """Yield (task_id, msg) for claimable tasks given raw JSONL lines.
+
+    A task is claimable when:
+      1. no claim cell references it (via data.task_id), AND
+      2. no result/error cell references it (via data.task_id), AND
+      3. every task id in data.depends_on has a result/error cell.
+
+    Unknown dependency ids count as unsatisfied (FLEET-OPS incident: Codex
+    claimed TASK-3 before TASK-2 was even posted).
+    """
+    tasks: dict[str, dict[str, Any]] = {}
+    claimed: set[str] = set()
+    done: set[str] = set()
 
     for line in lines:
         line = line.strip()
@@ -60,15 +80,68 @@ def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
         if not isinstance(deps, list):
             deps = []
         if any(dep not in done for dep in deps):
-            continue  # blocked -- runner re-checks on a later poll
-        yield tid, cell.get("msg", "")
+            continue
+        yield tid, cell.get("msg", "") or cell.get("data", {}).get("title", "")
 
+
+# ---------------------------------------------------------------------------
+# Board mode (uses HiveBoard + lifecycle.is_task_ready)
+# ---------------------------------------------------------------------------
+
+def scan_board(db_path: str, channels_dir: str, channel: str) -> Iterator[tuple[str, str]]:
+    """Yield (task_id, msg) using canonical lifecycle reducer via HiveBoard.
+
+    Requires hive package on sys.path.  Uses is_task_ready() which handles
+    all cell types and dependency variants (refs + data.depends_on).
+    """
+    import sys as _sys
+
+    # Allow callers to have hive on path without re-importing here.
+    try:
+        from hive.board import HiveBoard
+        from hive.coordination.dag import get_ready_tasks
+    except ImportError as exc:
+        print(f"ERROR: hive package not importable — {exc}", file=_sys.stderr)
+        return
+
+    board = HiveBoard(db_path=db_path, channels_dir=channels_dir)
+    for cell in get_ready_tasks(board, channel=channel):
+        msg = cell.data.get("title") or cell.data.get("msg") or ""
+        yield cell.id, msg
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: runner_scan.py <channel.jsonl>", file=sys.stderr)
+    args = argv[1:]
+
+    # Board mode: --db <path> --channels-dir <dir> <channel>
+    if args and args[0] == "--db":
+        if len(args) < 5 or args[2] != "--channels-dir":
+            print(
+                "usage: runner_scan.py --db <hive.db> --channels-dir <dir> <channel>",
+                file=sys.stderr,
+            )
+            return 1
+        db_path = args[1]
+        channels_dir = args[3]
+        channel = args[4]
+        for tid, msg in scan_board(db_path, channels_dir, channel):
+            print(f"{tid}|{msg.replace('|', '[pipe]')}")
+        return 0
+
+    # Legacy mode: <channel.jsonl>
+    if len(args) != 1:
+        print(
+            "usage: runner_scan.py <channel.jsonl>\n"
+            "   or: runner_scan.py --db <hive.db> --channels-dir <dir> <channel>",
+            file=sys.stderr,
+        )
         return 1
-    with open(argv[1], encoding="utf-8") as f:
+
+    with open(args[0], encoding="utf-8") as f:
         for tid, msg in scan(f):
             print(f"{tid}|{msg.replace('|', '[pipe]')}")
     return 0

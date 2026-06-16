@@ -127,7 +127,16 @@ if [[ ! -f "$RUNNER_SCAN" ]]; then
 fi
 
 find_open_tasks() {
-  python "$RUNNER_SCAN" "$CHANNEL_FILE"
+  # Board mode uses lifecycle.is_task_ready() — handles all cell types + full
+  # dep resolution (refs AND data.depends_on).  Falls back to raw JSONL scan
+  # when hive.db is not present (fresh env or non-board deployments).
+  local db_path="${COMMS_DIR}/hive.db"
+  if [[ -f "$db_path" ]]; then
+    PYTHONPATH="${COMMS_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python "$RUNNER_SCAN" --db "$db_path" --channels-dir "${CHANNELS_DIR}" "$CHANNEL"
+  else
+    python "$RUNNER_SCAN" "$CHANNEL_FILE"
+  fi
 }
 
 # ---------------------------------------------------------------------------
