@@ -7,6 +7,8 @@ from typing import Any
 
 from hive.board import HiveBoard
 from hive.cell import cell_to_dict
+from hive.coordination.dag import get_ready_tasks
+from hive.coordination.lifecycle import get_task_state
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -197,6 +199,59 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "required": ["belief_id", "from_agent", "reason"],
             },
         },
+        {
+            "name": "hive_task_state",
+            "description": (
+                "Return the canonical lifecycle state of a task: "
+                "SUBMITTED | WORKING | BLOCKED | COMPLETE | FAILED | CANCELED | VERIFIED. "
+                "Also returns claimed_by, contract_id, result_id, verified_by, and "
+                "unmet_dependencies. Use this before claiming a task to confirm it is "
+                "still SUBMITTED with no unmet deps."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Cell ID of the task (hive:...)"},
+                },
+                "required": ["task_id"],
+            },
+        },
+        {
+            "name": "hive_ready_tasks",
+            "description": (
+                "List all tasks that are ready to be claimed: SUBMITTED status with every "
+                "dependency COMPLETE or VERIFIED. Optionally filter by channel."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Restrict to tasks on this channel (omit for all channels)",
+                    },
+                },
+            },
+        },
+        {
+            "name": "hive_result",
+            "description": "Post a result cell for a contract. Marks the corresponding task COMPLETE.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_agent": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "contract_id": {"type": "string", "description": "ID of the contract being fulfilled"},
+                    "output": {"type": "string", "description": "Result text / summary"},
+                    "artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of artifact paths or URLs",
+                    },
+                    "metrics": {"type": "object", "description": "Optional performance metrics"},
+                },
+                "required": ["from_agent", "channel", "contract_id", "output"],
+            },
+        },
     ]
 
 
@@ -313,6 +368,48 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
             channel=args.get("channel", "general"),
             reason=args["reason"],
             correction=args.get("correction"),
+        )
+        return {"id": cell_id}
+
+    elif tool_name == "hive_task_state":
+        try:
+            state = get_task_state(board, task_or_id=args["task_id"])
+        except ValueError as e:
+            return {"error": str(e)}
+        return {
+            "task_id": state.task_id,
+            "status": state.status,
+            "claimed_by": state.claimed_by,
+            "contract_id": state.contract_id,
+            "result_id": state.result_id,
+            "verified_by": state.verified_by,
+            "unmet_dependencies": list(state.unmet_dependencies),
+        }
+
+    elif tool_name == "hive_ready_tasks":
+        channel = args.get("channel")
+        cells = get_ready_tasks(board, channel=channel)
+        return {
+            "tasks": [
+                {
+                    "id": c.id,
+                    "title": c.data.get("title", ""),
+                    "channel": c.channel,
+                    "from_agent": c.from_agent,
+                    "ts": c.ts,
+                }
+                for c in cells
+            ]
+        }
+
+    elif tool_name == "hive_result":
+        cell_id = board.result(
+            from_agent=args["from_agent"],
+            channel=args["channel"],
+            contract_id=args["contract_id"],
+            output=args["output"],
+            artifacts=args.get("artifacts"),
+            metrics=args.get("metrics"),
         )
         return {"id": cell_id}
 
