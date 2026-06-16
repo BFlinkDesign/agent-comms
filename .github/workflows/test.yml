@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dev dependencies
-        run: pip install pytest pytest-timeout mypy ruff
+        run: pip install pytest pytest-timeout mypy ruff fastapi uvicorn httpx
       - name: Run test suite
         run: python -m pytest tests/ -q
       - name: Type-check hive package

@@ -20,34 +20,14 @@ _comms_ts() {
   date -Iseconds
 }
 
-_comms_ensure_channel() {
-  local ch="$1"
-  if [[ ! -f "${CHANNELS_DIR}/${ch}.jsonl" ]]; then
-    touch "${CHANNELS_DIR}/${ch}.jsonl"
-  fi
-}
-
 _comms_write() {
   local channel="$1" type="$2" msg="$3" data="${4:-"{}"}"
-  _comms_ensure_channel "$channel"
-  if printf '%s' "$data" | python -c "
-import json, uuid, datetime, sys
-data_raw = sys.stdin.read()
-obj = {
-    'id': str(uuid.uuid4()),
-    'from': sys.argv[1],
-    'ts': datetime.datetime.now().astimezone().isoformat(),
-    'channel': sys.argv[2],
-    'type': sys.argv[3],
-    'msg': sys.argv[4],
-    'data': json.loads(data_raw)
-}
-with open(sys.argv[5], 'a', encoding='utf-8') as f:
-    f.write(json.dumps(obj, ensure_ascii=False) + '\n')
-" "$COMMS_AGENT" "$channel" "$type" "$msg" "${CHANNELS_DIR}/${channel}.jsonl" 2>/dev/null; then
+  # shell_write.py validates channel name, blocks traversal/symlinks, and uses O_NOFOLLOW.
+  if python "${COMMS_DIR}/hive/shell_write.py" \
+      "$COMMS_AGENT" "$channel" "$type" "$msg" "$data" "${CHANNELS_DIR}" >/dev/null; then
     echo "sent to ${channel} [${type}]"
   else
-    echo "FAILED to send to ${channel} [${type}] — check data payload" >&2
+    echo "FAILED to send to ${channel} [${type}] — check channel name and data payload" >&2
     return 1
   fi
 }
