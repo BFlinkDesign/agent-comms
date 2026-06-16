@@ -223,3 +223,113 @@ class TestResultToolViaMCP:
             "metrics": {"tokens": 500},
         })
         assert "id" in res
+
+
+class TestBidContractToolsViaMCP:
+    def test_hive_bid_creates_bid_referencing_task(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_bid", {
+            "from_agent": "gemini/1",
+            "channel": "general",
+            "task_id": tid,
+            "cost": 3,
+        })
+        assert "id" in res
+        assert res["id"].startswith("hive:")
+        # The bid cell should reference the task
+        refs = board.refs(tid)
+        bid_ids = {c.id for c in refs if c.type == "bid"}
+        assert res["id"] in bid_ids
+
+    def test_hive_contract_creates_contract_and_marks_task_working(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_contract", {
+            "from_agent": "claude/1",
+            "channel": "general",
+            "task_id": tid,
+            "agent": "gemini/1",
+        })
+        assert "id" in res
+        state = execute_tool(board, "hive_task_state", {"task_id": tid})
+        assert state["status"] == "WORKING"
+        assert state["claimed_by"] == "gemini/1"
+        assert state["contract_id"] == res["id"]
+
+    def test_hive_contract_race_flag_stored(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_contract", {
+            "from_agent": "claude/1",
+            "channel": "general",
+            "task_id": tid,
+            "agent": "gemini/1",
+            "race": True,
+        })
+        cell = board.get(res["id"])
+        assert cell is not None
+        assert cell.data.get("race") is True
+
+
+class TestLeaseToolsViaMCP:
+    def test_hive_is_leased_false_when_empty(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_is_leased", {"resource": "myfile.txt"})
+        assert res["leased"] is False
+
+    def test_hive_lease_acquires_returns_id(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_lease", {
+            "from_agent": "claude/1",
+            "resource": "myfile.txt",
+        })
+        assert res["id"] is not None
+        assert res["id"].startswith("hive:")
+
+    def test_hive_is_leased_true_after_acquire(self):
+        board = _make_board()
+        execute_tool(board, "hive_lease", {
+            "from_agent": "claude/1",
+            "resource": "shared-resource",
+        })
+        res = execute_tool(board, "hive_is_leased", {"resource": "shared-resource"})
+        assert res["leased"] is True
+
+    def test_hive_lease_blocked_when_already_leased(self):
+        board = _make_board()
+        execute_tool(board, "hive_lease", {
+            "from_agent": "claude/1",
+            "resource": "locked-file",
+        })
+        res = execute_tool(board, "hive_lease", {
+            "from_agent": "gemini/1",
+            "resource": "locked-file",
+        })
+        assert res["id"] is None
+
+    def test_hive_release_clears_lease(self):
+        board = _make_board()
+        lease_res = execute_tool(board, "hive_lease", {
+            "from_agent": "claude/1",
+            "resource": "temp-resource",
+        })
+        execute_tool(board, "hive_release", {
+            "from_agent": "claude/1",
+            "lease_id": lease_res["id"],
+        })
+        res = execute_tool(board, "hive_is_leased", {"resource": "temp-resource"})
+        assert res["leased"] is False
+
+    def test_hive_release_returns_release_cell_id(self):
+        board = _make_board()
+        lease_res = execute_tool(board, "hive_lease", {
+            "from_agent": "claude/1",
+            "resource": "r",
+        })
+        release_res = execute_tool(board, "hive_release", {
+            "from_agent": "claude/1",
+            "lease_id": lease_res["id"],
+        })
+        assert "id" in release_res
+        assert release_res["id"].startswith("hive:")

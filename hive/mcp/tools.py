@@ -8,6 +8,7 @@ from typing import Any
 from hive.board import HiveBoard
 from hive.cell import cell_to_dict
 from hive.coordination.dag import get_ready_tasks
+from hive.coordination.leases import acquire_lease, is_leased, release_lease
 from hive.coordination.lifecycle import get_task_state
 
 
@@ -200,6 +201,98 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "hive_bid",
+            "description": (
+                "Post a bid for a task. Signals willingness to work on it. "
+                "A bid refs the task and carries optional cost and capability metadata."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_agent": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "task_id": {"type": "string", "description": "Task cell ID this bid is for"},
+                    "cost": {"type": "integer", "description": "Offered cost in credits"},
+                    "eta": {"type": "string", "description": "ISO-8601 estimated completion time"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["from_agent", "channel", "task_id"],
+            },
+        },
+        {
+            "name": "hive_contract",
+            "description": (
+                "Create a contract cell claiming a task for an agent. "
+                "A contract refs the task and sets the agent to WORKING state. "
+                "Use hive_task_state first to confirm the task is SUBMITTED."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_agent": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "task_id": {"type": "string", "description": "Task cell ID to claim"},
+                    "agent": {"type": "string", "description": "Agent that will perform the work"},
+                    "race": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "True if this is a race contract (multiple agents compete)",
+                    },
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["from_agent", "channel", "task_id", "agent"],
+            },
+        },
+        {
+            "name": "hive_lease",
+            "description": (
+                "Acquire an advisory lease on a named resource. Returns the lease ID if acquired, "
+                "or null if the resource is already leased. Uses claim-then-verify to be race-safe."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_agent": {"type": "string"},
+                    "resource": {"type": "string", "description": "Unique resource name to lock"},
+                    "ttl": {
+                        "type": "integer",
+                        "default": 300,
+                        "description": "Seconds until lease expires (default 300 = 5 min)",
+                    },
+                    "channel": {
+                        "type": "string",
+                        "default": "roster",
+                        "description": "Channel to record the lease on",
+                    },
+                },
+                "required": ["from_agent", "resource"],
+            },
+        },
+        {
+            "name": "hive_release",
+            "description": "Release a previously acquired lease.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_agent": {"type": "string"},
+                    "lease_id": {"type": "string", "description": "Lease cell ID to release"},
+                    "channel": {"type": "string", "default": "roster"},
+                },
+                "required": ["from_agent", "lease_id"],
+            },
+        },
+        {
+            "name": "hive_is_leased",
+            "description": "Check whether a named resource currently has an active, unexpired lease.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "resource": {"type": "string", "description": "Resource name to check"},
+                },
+                "required": ["resource"],
+            },
+        },
+        {
             "name": "hive_task_state",
             "description": (
                 "Return the canonical lifecycle state of a task: "
@@ -370,6 +463,53 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
             correction=args.get("correction"),
         )
         return {"id": cell_id}
+
+    elif tool_name == "hive_bid":
+        cell_id = board.put(
+            type="bid",
+            from_agent=args["from_agent"],
+            channel=args["channel"],
+            data={
+                "cost": args.get("cost"),
+                "eta": args.get("eta"),
+            },
+            refs=[args["task_id"]],
+            tags=args.get("tags"),
+        )
+        return {"id": cell_id}
+
+    elif tool_name == "hive_contract":
+        cell_id = board.put(
+            type="contract",
+            from_agent=args["from_agent"],
+            channel=args["channel"],
+            data={"agent": args["agent"], "race": args.get("race", False)},
+            refs=[args["task_id"]],
+            tags=args.get("tags"),
+        )
+        return {"id": cell_id}
+
+    elif tool_name == "hive_lease":
+        lease_id = acquire_lease(
+            board,
+            resource=args["resource"],
+            holder=args["from_agent"],
+            ttl=args.get("ttl", 300),
+            channel=args.get("channel", "roster"),
+        )
+        return {"id": lease_id}
+
+    elif tool_name == "hive_release":
+        release_id = release_lease(
+            board,
+            lease_id=args["lease_id"],
+            holder=args["from_agent"],
+            channel=args.get("channel", "roster"),
+        )
+        return {"id": release_id}
+
+    elif tool_name == "hive_is_leased":
+        return {"leased": is_leased(board, resource=args["resource"])}
 
     elif tool_name == "hive_task_state":
         try:
