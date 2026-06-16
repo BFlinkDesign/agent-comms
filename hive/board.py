@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from hive.cell import Cell, make_cell
+from hive.config import validate_channel_name
 from hive.transports.jsonl import JSONLTransport
 from hive.transports.sqlite import SQLiteTransport
 
@@ -52,7 +53,12 @@ class HiveBoard:
         return self.put_cell(cell)
 
     def put_cell(self, cell: Cell) -> str:
-        """Write a pre-built cell to both transports. Returns cell ID."""
+        """Write a pre-built cell to both transports. Returns cell ID.
+
+        The channel name is validated before either write, so an unsafe
+        channel never produces a SQLite row or a JSONL file.
+        """
+        validate_channel_name(cell.channel)
         self._sqlite.put(cell)
         self._jsonl.put(cell)
         return cell.id
