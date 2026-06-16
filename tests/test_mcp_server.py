@@ -155,14 +155,28 @@ class TestToolsCall:
         assert resp["result"].get("isError") is True
 
 
+class TestSpecComplianceMethods:
+    def test_resources_list_returns_empty(self) -> None:
+        board = _make_board()
+        resp = handle_message(board, _tools(), _req("resources/list"))
+        assert resp is not None
+        assert resp["result"]["resources"] == []
+
+    def test_prompts_list_returns_empty(self) -> None:
+        board = _make_board()
+        resp = handle_message(board, _tools(), _req("prompts/list"))
+        assert resp is not None
+        assert resp["result"]["prompts"] == []
+
+
 class TestUnknownMethods:
     def test_unknown_method_with_id_returns_error_code(self) -> None:
         board = _make_board()
-        resp = handle_message(board, _tools(), _req("resources/list", req_id=42))
+        resp = handle_message(board, _tools(), _req("zzz/unknown", req_id=42))
         assert resp is not None
         assert resp["id"] == 42
         assert resp["error"]["code"] == -32601
-        assert "resources/list" in resp["error"]["message"]
+        assert "zzz/unknown" in resp["error"]["message"]
 
     def test_unknown_notification_ignored(self) -> None:
         board = _make_board()

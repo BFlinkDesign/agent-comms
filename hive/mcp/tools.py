@@ -479,12 +479,12 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
         return {"id": cell_id}
 
     elif tool_name == "hive_contract":
-        cell_id = board.put(
-            type="contract",
+        cell_id = board.contract(
             from_agent=args["from_agent"],
             channel=args["channel"],
-            data={"agent": args["agent"], "race": args.get("race", False)},
-            refs=[args["task_id"]],
+            task_id=args["task_id"],
+            agent=args["agent"],
+            race=args.get("race", False),
             tags=args.get("tags"),
         )
         return {"id": cell_id}

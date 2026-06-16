@@ -83,6 +83,12 @@ def handle_message(
     if method == "ping":
         return _make_response(request_id, {})
 
+    if method == "resources/list":
+        return _make_response(request_id, {"resources": []})
+
+    if method == "prompts/list":
+        return _make_response(request_id, {"prompts": []})
+
     if method == "tools/list":
         tool_list = [
             {
