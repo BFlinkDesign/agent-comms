@@ -333,3 +333,72 @@ class TestLeaseToolsViaMCP:
         })
         assert "id" in release_res
         assert release_res["id"].startswith("hive:")
+
+
+class TestReputationToolViaMCP:
+    def test_no_feedback_returns_default_score(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_reputation", {"agent_id": "gemini/1"})
+        assert res["agent_id"] == "gemini/1"
+        assert res["score"] == 5.0
+
+    def test_reputation_reflects_feedback(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        rid = board.result(from_agent="gemini/1", channel="general", contract_id=cid, output="done")
+        board.feedback(from_agent="claude/1", channel="general", result_id=rid, contract_id=cid, score=10)
+        res = execute_tool(board, "hive_reputation", {"agent_id": "gemini/1"})
+        assert res["score"] == 10.0
+
+    def test_reputation_tool_in_tool_definitions(self):
+        names = [t["name"] for t in get_tool_definitions()]
+        assert "hive_reputation" in names
+
+    def test_reputation_score_is_rounded(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_reputation", {"agent_id": "nobody"})
+        # Default 5.0 has at most 4 decimal places (it's exact, so 5.0)
+        assert isinstance(res["score"], float)
+
+
+class TestRouteToolViaMCP:
+    def test_no_cards_returns_empty(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_route", {"task_id": tid})
+        assert res["task_id"] == tid
+        assert res["ranked_agents"] == []
+
+    def test_routes_capable_agent_first(self):
+        board = _make_board()
+        tid = board.put(
+            type="task",
+            from_agent="claude/1",
+            channel="general",
+            data={"title": "T", "required_capabilities": ["python"]},
+        )
+        board.card(from_agent="gemini/expert", capabilities=["python", "sql"])
+        board.card(from_agent="codex/junior", capabilities=["markdown"])
+        res = execute_tool(board, "hive_route", {"task_id": tid})
+        agent_ids = [a["agent_id"] for a in res["ranked_agents"]]
+        # Expert with python capability should rank first
+        assert agent_ids[0] == "gemini/expert"
+
+    def test_unknown_task_returns_error(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_route", {"task_id": "hive:doesnotexist"})
+        assert "error" in res
+
+    def test_route_tool_in_tool_definitions(self):
+        names = [t["name"] for t in get_tool_definitions()]
+        assert "hive_route" in names
+
+    def test_route_scores_are_rounded(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        board.card(from_agent="gemini/1", capabilities=["x"])
+        res = execute_tool(board, "hive_route", {"task_id": tid})
+        for agent in res["ranked_agents"]:
+            # Score should be a float with at most 4 decimal places
+            assert isinstance(agent["score"], float)

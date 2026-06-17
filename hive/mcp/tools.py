@@ -10,6 +10,8 @@ from hive.cell import cell_to_dict
 from hive.coordination.dag import get_ready_tasks
 from hive.coordination.leases import acquire_lease, is_leased, release_lease
 from hive.coordination.lifecycle import get_task_state
+from hive.coordination.reputation import reputation as compute_reputation
+from hive.coordination.router import route_task
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -293,6 +295,40 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "hive_reputation",
+            "description": (
+                "Return the exponentially-weighted reputation score (1–10, default 5.0) for an agent "
+                "derived from all feedback cells on their contracts. Use this to select reliable workers."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Agent identity string (e.g. gemini/researcher)"},
+                    "capability": {
+                        "type": "string",
+                        "description": "Restrict to feedback tagged with this capability (omit for overall score)",
+                    },
+                },
+                "required": ["agent_id"],
+            },
+        },
+        {
+            "name": "hive_route",
+            "description": (
+                "Rank registered agents by suitability for a task. "
+                "Score = capability_overlap × reputation / (1 + cost). "
+                "Returns agents sorted by score descending. "
+                "Use this before creating a contract to pick the best available agent."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Cell ID of the task to route"},
+                },
+                "required": ["task_id"],
+            },
+        },
+        {
             "name": "hive_task_state",
             "description": (
                 "Return the canonical lifecycle state of a task: "
@@ -510,6 +546,24 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
 
     elif tool_name == "hive_is_leased":
         return {"leased": is_leased(board, resource=args["resource"])}
+
+    elif tool_name == "hive_reputation":
+        score = compute_reputation(
+            board,
+            agent_id=args["agent_id"],
+            capability=args.get("capability"),
+        )
+        return {"agent_id": args["agent_id"], "score": round(score, 4)}
+
+    elif tool_name == "hive_route":
+        task_cell = board.get(args["task_id"])
+        if task_cell is None:
+            return {"error": f"Task not found: {args['task_id']}"}
+        ranked = route_task(board, task_cell)
+        return {
+            "task_id": args["task_id"],
+            "ranked_agents": [{"agent_id": agent_id, "score": round(score, 4)} for agent_id, score in ranked],
+        }
 
     elif tool_name == "hive_task_state":
         try:
