@@ -122,6 +122,19 @@ class TestGetRefutedBeliefs:
         assert refuted[0]["correction"] == "Use connection pooling"
 
 
+class TestBeliefAuditLimit:
+    def test_audit_counts_beyond_200_beliefs(self):
+        """Regression: belief_audit must scan all beliefs, not truncate at 200."""
+        board = _make_board()
+        for i in range(201):
+            assert_belief(board, from_agent="claude/1", channel="general", claim=f"claim {i}")
+
+        audit = belief_audit(board)
+        # Without limit=None the audit caps at 200 and reports total=200, active=200.
+        assert audit["total"] == 201
+        assert audit["active"] == 201
+
+
 class TestBeliefAudit:
     def test_audit_counts_all_categories(self):
         board = _make_board()
