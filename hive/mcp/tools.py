@@ -7,9 +7,17 @@ from typing import Any
 
 from hive.board import HiveBoard
 from hive.cell import cell_to_dict
+from hive.coordination.beliefs import (
+    belief_audit,
+    confirm_belief,
+    get_active_beliefs,
+    get_refuted_beliefs,
+)
 from hive.coordination.dag import get_ready_tasks
 from hive.coordination.leases import acquire_lease, is_leased, release_lease
 from hive.coordination.lifecycle import get_task_state
+from hive.coordination.memory import get_contract_trace, get_traces, summarize_traces
+from hive.coordination.racing import get_race_results, start_race
 from hive.coordination.reputation import reputation as compute_reputation
 from hive.coordination.router import route_task
 
@@ -295,6 +303,135 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "hive_confirm_belief",
+            "description": "Mark a belief as confirmed by evidence. Complement to hive_refute.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "belief_id": {"type": "string"},
+                    "from_agent": {"type": "string"},
+                    "channel": {"type": "string", "default": "general"},
+                    "evidence": {"type": "string", "default": ""},
+                },
+                "required": ["belief_id", "from_agent"],
+            },
+        },
+        {
+            "name": "hive_get_beliefs",
+            "description": (
+                "List active beliefs (not yet confirmed or refuted). "
+                "Use before acting to check what assumptions are already on the board."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "from_agent": {"type": "string"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+        },
+        {
+            "name": "hive_get_refuted_beliefs",
+            "description": "List beliefs that have been refuted, with reasons and corrections.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+        },
+        {
+            "name": "hive_belief_audit",
+            "description": (
+                "Summary of all beliefs: total, active, confirmed, refuted counts, "
+                "and accuracy rate (confirmed / (confirmed + refuted))."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "hive_get_traces",
+            "description": (
+                "Retrieve recent reasoning traces. Use before starting a task to find "
+                "how similar problems were solved (or failed) before."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["success", "failure", "partial"],
+                        "description": "Filter to a specific outcome",
+                    },
+                    "from_agent": {"type": "string"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+            },
+        },
+        {
+            "name": "hive_get_contract_trace",
+            "description": "Get the reasoning trace recorded for a specific contract, if any.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": {"type": "string"},
+                },
+                "required": ["contract_id"],
+            },
+        },
+        {
+            "name": "hive_summarize_traces",
+            "description": (
+                "Summarize recent trace patterns: success rate, average steps, outcome distribution. "
+                "Use to understand fleet performance before assigning tasks."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+            },
+        },
+        {
+            "name": "hive_race",
+            "description": (
+                "Start a race: create contracts for multiple agents on the same task. "
+                "All receive the task; the best result wins. Returns list of contract IDs."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "agents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Agent IDs to race",
+                    },
+                    "channel": {"type": "string", "default": "general"},
+                },
+                "required": ["task_id", "agents"],
+            },
+        },
+        {
+            "name": "hive_race_results",
+            "description": "Get all results submitted so far for a racing task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+        {
             "name": "hive_reputation",
             "description": (
                 "Return the exponentially-weighted reputation score (1–10, default 5.0) for an agent "
@@ -546,6 +683,72 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
 
     elif tool_name == "hive_is_leased":
         return {"leased": is_leased(board, resource=args["resource"])}
+
+    elif tool_name == "hive_confirm_belief":
+        cell_id = confirm_belief(
+            board,
+            belief_id=args["belief_id"],
+            from_agent=args["from_agent"],
+            channel=args.get("channel", "general"),
+            evidence=args.get("evidence", ""),
+        )
+        return {"id": cell_id}
+
+    elif tool_name == "hive_get_beliefs":
+        cells = get_active_beliefs(
+            board,
+            channel=args.get("channel"),
+            from_agent=args.get("from_agent"),
+            limit=args.get("limit", 50),
+        )
+        return {"beliefs": [cell_to_dict(c) for c in cells]}
+
+    elif tool_name == "hive_get_refuted_beliefs":
+        items = get_refuted_beliefs(
+            board,
+            channel=args.get("channel"),
+            limit=args.get("limit", 50),
+        )
+        return {"refuted": items}
+
+    elif tool_name == "hive_belief_audit":
+        audit = belief_audit(board, channel=args.get("channel"))
+        return audit
+
+    elif tool_name == "hive_get_traces":
+        cells = get_traces(
+            board,
+            channel=args.get("channel"),
+            outcome=args.get("outcome"),
+            from_agent=args.get("from_agent"),
+            limit=args.get("limit", 20),
+        )
+        return {"traces": [cell_to_dict(c) for c in cells]}
+
+    elif tool_name == "hive_get_contract_trace":
+        cell = get_contract_trace(board, args["contract_id"])
+        return {"trace": cell_to_dict(cell) if cell else None}
+
+    elif tool_name == "hive_summarize_traces":
+        summary = summarize_traces(
+            board,
+            channel=args.get("channel"),
+            limit=args.get("limit", 10),
+        )
+        return summary
+
+    elif tool_name == "hive_race":
+        contract_ids = start_race(
+            board,
+            task_id=args["task_id"],
+            agents=args["agents"],
+            channel=args.get("channel", "general"),
+        )
+        return {"contract_ids": contract_ids}
+
+    elif tool_name == "hive_race_results":
+        cells = get_race_results(board, task_id=args["task_id"])
+        return {"results": [cell_to_dict(c) for c in cells]}
 
     elif tool_name == "hive_reputation":
         score = compute_reputation(
