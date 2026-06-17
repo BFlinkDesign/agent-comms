@@ -402,3 +402,171 @@ class TestRouteToolViaMCP:
         for agent in res["ranked_agents"]:
             # Score should be a float with at most 4 decimal places
             assert isinstance(agent["score"], float)
+
+
+class TestBeliefQueryToolsViaMCP:
+    def test_confirm_belief_returns_id(self):
+        board = _make_board()
+        bid = board.put(
+            type="belief", from_agent="claude/1", channel="general",
+            data={"claim": "X causes Y", "confidence": 0.8, "evidence": [], "status": "active"},
+        )
+        res = execute_tool(board, "hive_confirm_belief", {
+            "belief_id": bid, "from_agent": "claude/1", "evidence": "verified in prod",
+        })
+        assert res["id"].startswith("hive:")
+
+    def test_get_beliefs_returns_active_only(self):
+        board = _make_board()
+        b1 = board.put(
+            type="belief", from_agent="claude/1", channel="general",
+            data={"claim": "A", "confidence": 0.7, "evidence": [], "status": "active"},
+        )
+        b2 = board.put(
+            type="belief", from_agent="claude/1", channel="general",
+            data={"claim": "B", "confidence": 0.5, "evidence": [], "status": "active"},
+        )
+        # Refute b2
+        board.put(type="refutation", from_agent="claude/1", channel="general",
+                  data={"reason": "wrong", "correction": ""}, refs=[b2])
+        res = execute_tool(board, "hive_get_beliefs", {})
+        ids = [c["id"] for c in res["beliefs"]]
+        assert b1 in ids
+        assert b2 not in ids
+
+    def test_get_refuted_beliefs_includes_reason(self):
+        board = _make_board()
+        bid = board.put(
+            type="belief", from_agent="claude/1", channel="general",
+            data={"claim": "X", "confidence": 0.9, "evidence": [], "status": "active"},
+        )
+        board.put(type="refutation", from_agent="gemini/1", channel="general",
+                  data={"reason": "tested and false", "correction": "Y is the real cause"}, refs=[bid])
+        res = execute_tool(board, "hive_get_refuted_beliefs", {})
+        assert len(res["refuted"]) == 1
+        assert res["refuted"][0]["reason"] == "tested and false"
+        assert res["refuted"][0]["correction"] == "Y is the real cause"
+
+    def test_belief_audit_counts(self):
+        board = _make_board()
+        board.put(type="belief", from_agent="claude/1", channel="general",
+                  data={"claim": "A", "confidence": 0.7, "evidence": [], "status": "active"})
+        b2 = board.put(type="belief", from_agent="claude/1", channel="general",
+                       data={"claim": "B", "confidence": 0.5, "evidence": [], "status": "active"})
+        b3 = board.put(type="belief", from_agent="claude/1", channel="general",
+                       data={"claim": "C", "confidence": 0.9, "evidence": [], "status": "active"})
+        board.put(type="refutation", from_agent="gemini/1", channel="general",
+                  data={"reason": "wrong", "correction": ""}, refs=[b2])
+        board.put(type="confirmation", from_agent="gemini/1", channel="general",
+                  data={"evidence": "verified"}, refs=[b3])
+        audit = execute_tool(board, "hive_belief_audit", {})
+        assert audit["total"] == 3
+        assert audit["active"] == 1
+        assert audit["confirmed"] == 1
+        assert audit["refuted"] == 1
+        assert audit["accuracy"] == 0.5
+
+
+class TestTraceQueryToolsViaMCP:
+    def test_get_traces_returns_traces(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        execute_tool(board, "hive_trace", {
+            "from_agent": "gemini/1", "contract_id": cid, "channel": "general",
+            "steps": [{"attempt": 1, "action": "tried X", "outcome": "ok"}],
+            "outcome": "success",
+        })
+        res = execute_tool(board, "hive_get_traces", {})
+        assert len(res["traces"]) == 1
+
+    def test_get_traces_filters_by_outcome(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        c1 = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        execute_tool(board, "hive_trace", {
+            "from_agent": "gemini/1", "contract_id": c1, "channel": "general",
+            "steps": [], "outcome": "failure",
+        })
+        res = execute_tool(board, "hive_get_traces", {"outcome": "success"})
+        assert res["traces"] == []
+        res2 = execute_tool(board, "hive_get_traces", {"outcome": "failure"})
+        assert len(res2["traces"]) == 1
+
+    def test_get_contract_trace_returns_trace(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        execute_tool(board, "hive_trace", {
+            "from_agent": "gemini/1", "contract_id": cid, "channel": "general",
+            "steps": [{"attempt": 1, "action": "A", "outcome": "ok"}], "outcome": "success",
+        })
+        res = execute_tool(board, "hive_get_contract_trace", {"contract_id": cid})
+        assert res["trace"] is not None
+        assert res["trace"]["data"]["outcome"] == "success"
+
+    def test_get_contract_trace_none_when_missing(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        res = execute_tool(board, "hive_get_contract_trace", {"contract_id": cid})
+        assert res["trace"] is None
+
+    def test_summarize_traces_empty_board(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_summarize_traces", {})
+        assert res["total"] == 0
+        assert res["success_rate"] == 0.0
+
+    def test_summarize_traces_with_data(self):
+        board = _make_board()
+        for outcome in ["success", "success", "failure"]:
+            tid = board.task(from_agent="claude/1", channel="general", title="T")
+            cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+            execute_tool(board, "hive_trace", {
+                "from_agent": "gemini/1", "contract_id": cid, "channel": "general",
+                "steps": [{"attempt": 1, "action": "A", "outcome": "x"}], "outcome": outcome,
+            })
+        res = execute_tool(board, "hive_summarize_traces", {})
+        assert res["total"] == 3
+        assert abs(res["success_rate"] - 0.67) < 0.01
+
+
+class TestRaceToolsViaMCP:
+    def test_hive_race_creates_contracts_for_all_agents(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_race", {
+            "task_id": tid,
+            "agents": ["gemini/1", "gemini/2", "codex/1"],
+            "channel": "general",
+        })
+        assert len(res["contract_ids"]) == 3
+        for cid in res["contract_ids"]:
+            assert cid.startswith("hive:")
+
+    def test_hive_race_results_empty_before_submissions(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        execute_tool(board, "hive_race", {
+            "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
+        })
+        res = execute_tool(board, "hive_race_results", {"task_id": tid})
+        assert res["results"] == []
+
+    def test_hive_race_results_after_submissions(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        race_res = execute_tool(board, "hive_race", {
+            "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
+        })
+        # One agent submits a result
+        execute_tool(board, "hive_result", {
+            "from_agent": "gemini/1",
+            "channel": "general",
+            "contract_id": race_res["contract_ids"][0],
+            "output": "my answer",
+        })
+        res = execute_tool(board, "hive_race_results", {"task_id": tid})
+        assert len(res["results"]) == 1
+        assert res["results"][0]["data"]["output"] == "my answer"
