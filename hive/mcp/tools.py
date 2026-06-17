@@ -14,12 +14,14 @@ from hive.coordination.beliefs import (
     get_refuted_beliefs,
 )
 from hive.coordination.dag import get_ready_tasks
+from hive.coordination.evolution import evolve
 from hive.coordination.leases import acquire_lease, is_leased, release_lease
 from hive.coordination.lifecycle import get_task_state
 from hive.coordination.memory import get_contract_trace, get_traces, summarize_traces
 from hive.coordination.racing import get_race_results, start_race
 from hive.coordination.reputation import reputation as compute_reputation
 from hive.coordination.router import route_task
+from hive.coordination.stall_detector import detect_stalls
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -409,6 +411,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "from_agent": {"type": "string", "description": "Coordinator identity"},
                     "task_id": {"type": "string"},
                     "agents": {
                         "type": "array",
@@ -417,7 +420,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                     },
                     "channel": {"type": "string", "default": "general"},
                 },
-                "required": ["task_id", "agents"],
+                "required": ["from_agent", "task_id", "agents"],
             },
         },
         {
@@ -430,6 +433,34 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 },
                 "required": ["task_id"],
             },
+        },
+        {
+            "name": "hive_detect_stalls",
+            "description": (
+                "Scan all active contracts for stalls (no recent heartbeat, no result). "
+                "Emits a stall_detected signal cell for each new stall found (deduped). "
+                "Returns list of stall info dicts with contract_id, agent, last_heartbeat."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "default": 300,
+                        "description": "Seconds of silence before a contract is stalled",
+                    },
+                },
+            },
+        },
+        {
+            "name": "hive_evolve",
+            "description": (
+                "Analyze board state and emit improvement signals: high failure rates by "
+                "task type, and refuted beliefs with corrections. Safe to call repeatedly — "
+                "dedupes by payload so identical findings don't re-emit. "
+                "Returns list of signal dicts for newly emitted signals."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "hive_reputation",
@@ -743,12 +774,21 @@ def execute_tool(board: HiveBoard, tool_name: str, args: dict[str, Any]) -> dict
             task_id=args["task_id"],
             agents=args["agents"],
             channel=args.get("channel", "general"),
+            from_agent=args["from_agent"],
         )
         return {"contract_ids": contract_ids}
 
     elif tool_name == "hive_race_results":
         cells = get_race_results(board, task_id=args["task_id"])
         return {"results": [cell_to_dict(c) for c in cells]}
+
+    elif tool_name == "hive_detect_stalls":
+        stalls = detect_stalls(board, timeout_seconds=args.get("timeout_seconds", 300))
+        return {"stalls": stalls}
+
+    elif tool_name == "hive_evolve":
+        signals = evolve(board)
+        return {"signals": signals}
 
     elif tool_name == "hive_reputation":
         score = compute_reputation(

@@ -537,6 +537,7 @@ class TestRaceToolsViaMCP:
         board = _make_board()
         tid = board.task(from_agent="claude/1", channel="general", title="T")
         res = execute_tool(board, "hive_race", {
+            "from_agent": "claude/1",
             "task_id": tid,
             "agents": ["gemini/1", "gemini/2", "codex/1"],
             "channel": "general",
@@ -545,11 +546,25 @@ class TestRaceToolsViaMCP:
         for cid in res["contract_ids"]:
             assert cid.startswith("hive:")
 
+    def test_hive_race_coordinator_identity_in_contracts(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        res = execute_tool(board, "hive_race", {
+            "from_agent": "claude/coord",
+            "task_id": tid,
+            "agents": ["gemini/1", "gemini/2"],
+            "channel": "general",
+        })
+        for cid in res["contract_ids"]:
+            cell = board.get(cid)
+            assert cell is not None
+            assert cell.from_agent == "claude/coord"
+
     def test_hive_race_results_empty_before_submissions(self):
         board = _make_board()
         tid = board.task(from_agent="claude/1", channel="general", title="T")
         execute_tool(board, "hive_race", {
-            "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
+            "from_agent": "claude/1", "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
         })
         res = execute_tool(board, "hive_race_results", {"task_id": tid})
         assert res["results"] == []
@@ -558,7 +573,7 @@ class TestRaceToolsViaMCP:
         board = _make_board()
         tid = board.task(from_agent="claude/1", channel="general", title="T")
         race_res = execute_tool(board, "hive_race", {
-            "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
+            "from_agent": "claude/1", "task_id": tid, "agents": ["gemini/1", "gemini/2"], "channel": "general",
         })
         # One agent submits a result
         execute_tool(board, "hive_result", {
@@ -570,3 +585,55 @@ class TestRaceToolsViaMCP:
         res = execute_tool(board, "hive_race_results", {"task_id": tid})
         assert len(res["results"]) == 1
         assert res["results"][0]["data"]["output"] == "my answer"
+
+
+class TestStallDetectToolViaMCP:
+    def test_no_stalls_on_empty_board(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_detect_stalls", {})
+        assert res["stalls"] == []
+
+    def test_completed_contract_not_a_stall(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        cid = board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        board.result(from_agent="gemini/1", channel="general", contract_id=cid, output="done")
+        res = execute_tool(board, "hive_detect_stalls", {"timeout_seconds": 0})
+        assert res["stalls"] == []
+
+    def test_new_contract_with_zero_timeout_is_stalled(self):
+        board = _make_board()
+        tid = board.task(from_agent="claude/1", channel="general", title="T")
+        board.contract(from_agent="claude/1", channel="general", task_id=tid, agent="gemini/1")
+        res = execute_tool(board, "hive_detect_stalls", {"timeout_seconds": 0})
+        assert len(res["stalls"]) == 1
+        assert res["stalls"][0]["agent"] == "gemini/1"
+
+
+class TestEvolveToolViaMCP:
+    def test_evolve_empty_board_emits_nothing(self):
+        board = _make_board()
+        res = execute_tool(board, "hive_evolve", {})
+        assert res["signals"] == []
+
+    def test_evolve_idempotent(self):
+        board = _make_board()
+        res1 = execute_tool(board, "hive_evolve", {})
+        res2 = execute_tool(board, "hive_evolve", {})
+        # Both calls see the same (empty) board state
+        assert res1["signals"] == res2["signals"]
+
+    def test_evolve_detects_refuted_belief(self):
+        board = _make_board()
+        bid = board.put(
+            type="belief", from_agent="claude/1", channel="general",
+            data={"claim": "X is safe", "confidence": 0.9, "evidence": [], "status": "active"},
+        )
+        board.put(
+            type="refutation", from_agent="gemini/1", channel="general",
+            data={"reason": "X caused incident", "correction": "Use Y instead"}, refs=[bid],
+        )
+        res = execute_tool(board, "hive_evolve", {})
+        # Should emit a refuted_beliefs signal
+        events = [s["event"] for s in res["signals"]]
+        assert "refuted_beliefs" in events
