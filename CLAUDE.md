@@ -84,16 +84,24 @@ noise), posts the result cell. State file prevents reprocessing across restarts.
 
 **MCP server** (`hive/mcp/server.py`): implements LSP-style Content-Length framing. The public
 `handle_message(board, tools, msg)` function dispatches a single JSON-RPC message and is tested
-directly in `tests/test_mcp_server.py` without subprocess overhead. Available tools (as of PR #13):
+directly in `tests/test_mcp_server.py` without subprocess overhead. Available tools:
 
 | Tool | Purpose |
 |---|---|
 | `hive_put` / `hive_get` / `hive_query` / `hive_refs` / `hive_expire` | Raw board ops |
 | `hive_task` / `hive_card` / `hive_heartbeat` / `hive_feedback` | Convenience wrappers |
+| `hive_result` | Post a result cell and mark the contract complete |
 | `hive_trace` / `hive_belief` / `hive_refute` | Memory & belief cells |
+| `hive_confirm_belief` / `hive_get_beliefs` / `hive_get_refuted_beliefs` / `hive_belief_audit` | Belief lifecycle queries |
+| `hive_get_traces` / `hive_get_contract_trace` / `hive_summarize_traces` | Episodic memory queries |
 | `hive_bid` / `hive_contract` | Bidding and task-claim workflow |
 | `hive_lease` / `hive_release` / `hive_is_leased` | Advisory resource locking |
-| `hive_task_state` / `hive_ready_tasks` / `hive_result` | Task lifecycle |
+| `hive_task_state` / `hive_ready_tasks` | Task lifecycle queries |
+| `hive_race` / `hive_race_results` | Multi-agent racing (same task, multiple contracts) |
+| `hive_detect_stalls` | Find contracts that have gone silent (no heartbeat within timeout) |
+| `hive_evolve` | Emit evolution signals based on failure rates and refuted beliefs |
+| `hive_reputation` | Compute exponential-decay reputation score for an agent |
+| `hive_route` | Score candidate agents for a task (capability × reputation / cost) |
 
 ## Deployment facts that bite
 

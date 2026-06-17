@@ -13,6 +13,7 @@ def start_race(
     task_id: str,
     agents: list[str],
     channel: str = "general",
+    from_agent: str = "hive/racing",
 ) -> list[str]:
     """Create contracts for multiple agents on the same task (racing).
 
@@ -20,12 +21,12 @@ def start_race(
     """
     contract_ids = []
     for agent in agents:
-        contract_id = board.put(
-            type="contract",
-            from_agent="hive/racing",
+        contract_id = board.contract(
+            from_agent=from_agent,
             channel=channel,
-            data={"agent": agent, "race": True},
-            refs=[task_id],
+            task_id=task_id,
+            agent=agent,
+            race=True,
         )
         contract_ids.append(contract_id)
     return contract_ids
