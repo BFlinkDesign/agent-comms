@@ -1,0 +1,56 @@
+# CodeRabbit — fleet-standard config (all BFlinkDesign repos)
+# Layer 1 REVIEW: advisory comments only; does not gate merges.
+# Pairs with .gemini/config.yaml (Gemini Code Assist) for cross-vendor coverage.
+# NOISE policy: silent on routine success; MEDIUM+ findings only; no boilerplate.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - master
+      - main
+      - maintenance
+  auto_pause_after_reviewed_commits: 2
+
+  path_filters:
+    - "!**/*.dxf"
+    - "!**/*.pdf"
+    - "!**/*.png"
+    - "!**/_generated/**"
+    - "!**/output/**"
+    - "!**/previews/**"
+    - "!**/*.lock"
+    - "!**/node_modules/**"
+    - "!**/*.min.js"
+
+  path_instructions:
+    - path: "**/*.py"
+      instructions: |
+        Eagle standard Python rules:
+        - No hardcoded real-world facts (addresses, phones, legal names, rates) — source from constants.py
+        - No secrets or credentials in code; load from env/.env only
+        - No bare except; log which step failed
+        - UTF-8 everywhere; use python (not python3) on Windows
+        - subprocess calls must capture output; check returncode
+    - path: "**/*.ts,**/*.tsx,**/*.js,**/*.jsx"
+      instructions: |
+        - Treat all user/request input as untrusted; escape before inserting into HTML/headers (XSS)
+        - No secrets in client-side code or build artifacts
+        - Flag path traversal on any file-serving route
+    - path: ".github/workflows/**"
+      instructions: |
+        - All actions must be pinned to full commit SHAs (no floating tags like @v3)
+        - No secrets echoed in run steps; use masks
+        - Every job should have timeout-minutes set
+        - Event-driven only; no cron unless explicitly required
+
+chat:
+  auto_reply: true
+
+language: en-US
