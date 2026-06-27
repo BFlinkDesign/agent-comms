@@ -1,0 +1,34 @@
+# Gemini Code Assist for GitHub — fleet-standard cross-vendor reviewer.
+# Gemini (Google) reviewing Brady's code keeps author != reviewer.
+# Review priorities live in .gemini/styleguide.md.
+#
+# NOISE policy: only MEDIUM+ findings surface; no help boilerplate; one summary per PR.
+# schema: developers.google.com/gemini-code-assist
+have_fun: false
+
+code_review:
+  disable: false
+  comment_severity_threshold: MEDIUM
+  max_review_comments: -1
+  pull_request_opened:
+    help: false
+    summary: true
+    code_review: true
+    include_drafts: true
+
+# Don't review build output, vendored bytes, generated assets, or lock files.
+ignore_patterns:
+  - "**/*.dxf"
+  - "**/*.pdf"
+  - "**/*.png"
+  - "**/*.jpg"
+  - "**/*.jpeg"
+  - "**/_generated/**"
+  - "**/output/**"
+  - "**/previews/**"
+  - "**/*.lock"
+  - "**/package-lock.json"
+  - "**/node_modules/**"
+  - "**/*.min.js"
+  - "**/*.min.css"
+  - "docs/**"
