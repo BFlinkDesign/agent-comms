@@ -1,56 +1,57 @@
-# CodeRabbit — fleet-standard config (all BFlinkDesign repos)
-# Layer 1 REVIEW: advisory comments only; does not gate merges.
-# Pairs with .gemini/config.yaml (Gemini Code Assist) for cross-vendor coverage.
-# NOISE policy: silent on routine success; MEDIUM+ findings only; no boilerplate.
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Copy to a target repo root as `.coderabbit.yaml` only when CodeRabbit remains
+# installed for that repo. This template keeps CodeRabbit quiet unless requested,
+# avoiding paid-review/status noise while deterministic CI stays the merge gate.
+#
+# Start from defaults: open any PR and comment `@coderabbitai configuration`,
+# then merge the pieces you want from this file.
+language: "en-US"
+early_access: false
 
 reviews:
-  profile: chill
+  profile: "chill"
   request_changes_workflow: false
   high_level_summary: true
   poem: false
-  review_status: true
+  review_status: false
+  review_details: false
+  commit_status: true
+  fail_commit_status: false
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimated_effort: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  abort_on_close: true
+
   auto_review:
-    enabled: true
-    drafts: true
-    base_branches:
-      - master
-      - main
-      - maintenance
-  auto_pause_after_reviewed_commits: 2
+    enabled: false
+    description_keyword: "@coderabbitai review"
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 12
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "[skip review]"
+      - "chore(deps)"
+      - "chore(deps-dev)"
+    labels:
+      - "!do-not-review"
+      - "!automation"
+    base_branches: []
 
-  path_filters:
-    - "!**/*.dxf"
-    - "!**/*.pdf"
-    - "!**/*.png"
-    - "!**/_generated/**"
-    - "!**/output/**"
-    - "!**/previews/**"
-    - "!**/*.lock"
-    - "!**/node_modules/**"
-    - "!**/*.min.js"
-
-  path_instructions:
-    - path: "**/*.py"
-      instructions: |
-        Eagle standard Python rules:
-        - No hardcoded real-world facts (addresses, phones, legal names, rates) — source from constants.py
-        - No secrets or credentials in code; load from env/.env only
-        - No bare except; log which step failed
-        - UTF-8 everywhere; use python (not python3) on Windows
-        - subprocess calls must capture output; check returncode
-    - path: "**/*.ts,**/*.tsx,**/*.js,**/*.jsx"
-      instructions: |
-        - Treat all user/request input as untrusted; escape before inserting into HTML/headers (XSS)
-        - No secrets in client-side code or build artifacts
-        - Flag path traversal on any file-serving route
-    - path: ".github/workflows/**"
-      instructions: |
-        - All actions must be pinned to full commit SHAs (no floating tags like @v3)
-        - No secrets echoed in run steps; use masks
-        - Every job should have timeout-minutes set
-        - Event-driven only; no cron unless explicitly required
-
-chat:
-  auto_reply: true
-
-language: en-US
+  # Automatic mode (uncomment only for repos that still want CodeRabbit on every PR):
+  # auto_review:
+  #   enabled: true
+  #   drafts: false
+  #
+  # Label-gated mode (only PRs tagged `needs-review`):
+  # auto_review:
+  #   enabled: true
+  #   labels: ["needs-review"]
