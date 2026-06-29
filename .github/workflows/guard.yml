@@ -1,0 +1,17 @@
+# Low-noise default-branch guard.
+# Reusable logic lives in BFlinkDesign/dev-setup.
+name: guard
+
+on:
+  push:
+    branches: [main]
+  delete:
+
+jobs:
+  guard:
+    uses: BFlinkDesign/dev-setup/.github/workflows/guard-main.yml@main
+    with:
+      protected_branch: main
+    permissions:
+      contents: read
+      issues: write
