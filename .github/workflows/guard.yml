@@ -1,17 +1,72 @@
 # Low-noise default-branch guard.
-# Reusable logic lives in BFlinkDesign/dev-setup.
+# Self-contained by design: no cross-repo reusable-workflow dependency, so a
+# dev-setup branch state cannot break every consumer repo.
 name: guard
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   delete:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   guard:
-    uses: BFlinkDesign/dev-setup/.github/workflows/guard-main.yml@main
-    with:
-      protected_branch: main
-    permissions:
-      contents: read
-      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate protected branch event
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_REF: ${{ github.event.ref }}
+          EVENT_REF_TYPE: ${{ github.event.ref_type }}
+          FORCED: ${{ github.event.forced }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          PROTECTED_BRANCH: main
+        run: |
+          echo "event=$EVENT_NAME ref=$REF_NAME protected=$PROTECTED_BRANCH forced=$FORCED"
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_NAME" = "$PROTECTED_BRANCH" ] && [ "$FORCED" = "true" ]; then
+            echo "kind=force-push" >> "$GITHUB_OUTPUT"
+            echo "::error title=Force-push detected::$PROTECTED_BRANCH was force-pushed. before=$BEFORE after=$AFTER"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "delete" ] && [ "$EVENT_REF" = "$PROTECTED_BRANCH" ] && [ "$EVENT_REF_TYPE" = "branch" ]; then
+            echo "kind=delete" >> "$GITHUB_OUTPUT"
+            echo "::error title=Branch deleted::$PROTECTED_BRANCH was deleted."
+            exit 1
+          fi
+          echo "No protected-branch force-push or deletion detected."
+
+      - name: Open guard alert issue
+        if: ${{ failure() }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          KIND: ${{ steps.guard.outputs.kind }}
+          BRANCH: main
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        with:
+          script: |
+            const kind = process.env.KIND || "guard";
+            const branch = process.env.BRANCH;
+            const before = process.env.BEFORE || "";
+            const after = process.env.AFTER || "";
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "[guard] protected branch " + branch + " " + kind,
+              body: [
+                "Protected branch " + branch + " triggered guard kind " + kind + ".",
+                "",
+                "- actor: @" + context.actor,
+                "- before: " + before + "",
+                "- after: " + after + "",
+              ].join('\n'),
+              labels: ['guard', 'security'],
+            });
