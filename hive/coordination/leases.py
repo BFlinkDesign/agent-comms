@@ -84,7 +84,7 @@ def _active_leases(board: HiveBoard, *, resource: str) -> list[Cell]:
     The first element is the arbitration winner when claims race.
     """
     leases = board.query(
-        type="lease", tags=[f"resource:{resource}"], order_by="rowid"
+        type="lease", tags=[f"resource:{resource}"], order_by="rowid", limit=None
     )
     active = []
     for lease in leases:

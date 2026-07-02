@@ -89,6 +89,44 @@ class TestLeaseExpiry:
         assert is_leased(board, resource="src/main.py") is False
 
 
+class TestLimitNoneScan:
+    def test_active_lease_not_missed_beyond_100_history(self):
+        """Regression: _active_leases must scan all history, not truncate at 100."""
+        from hive.coordination.leases import _active_leases
+
+        board = _make_board()
+
+        # 100 released lease cells for the same resource (fills the old default limit)
+        for _ in range(100):
+            lid = board.put(
+                type="lease",
+                from_agent="claude/test",
+                channel="roster",
+                data={"resource": "db", "holder": "claude/test"},
+                ttl=0,
+                tags=["resource:db"],
+            )
+            board.put(type="release", from_agent="claude/test", channel="roster",
+                      data={}, refs=[lid])
+
+        # The 101st lease cell is the live, unreleased one
+        active_id = board.put(
+            type="lease",
+            from_agent="claude/test",
+            channel="roster",
+            data={"resource": "db", "holder": "claude/test"},
+            ttl=0,
+            tags=["resource:db"],
+        )
+
+        # Without limit=None the query stops at 100, sees only released leases,
+        # and incorrectly reports the resource as free.
+        assert is_leased(board, resource="db") is True
+        active = _active_leases(board, resource="db")
+        assert len(active) == 1
+        assert active[0].id == active_id
+
+
 class TestLeaseRaceArbitration:
     def test_race_loser_backs_off(self, monkeypatch):
         """Two agents pass the is_leased pre-check; the later claim must lose."""
