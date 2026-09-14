@@ -1,0 +1,13 @@
+# Go sources are LF on every platform.
+#
+# Git for Windows sets core.autocrlf=true by default, so without this a Windows
+# checkout rewrites every .go file to CRLF. gofmt treats CRLF as unformatted, so
+# the format gate then fails on all files at once and the rest of the job never
+# runs -- which is exactly what happened on this repository's first Windows run.
+*.go text eol=lf
+
+# Channel and journal files are append-only records written byte-for-byte by
+# several different writers, including a native binary that appends a single "\n"
+# terminated line per record. Line-ending translation would rewrite bytes that a
+# content-addressed id was computed over, so git must leave them exactly alone.
+*.jsonl -text
