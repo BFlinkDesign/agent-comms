@@ -269,7 +269,10 @@ fleetd where  [--json] [--dir D] [--limit N]
 journal repository, with an upstream branch. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never writes that file. A push rejected
-because another machine pushed first is retried, up to three attempts.
+because another machine pushed first is retried, up to three attempts. It then
+brings in every other file the remote changed or deleted, except a file with
+local changes the remote does not have, which it leaves alone and reports
+(`kept` in `--json`).
 
 `fleetd` resolves its journal directory from `--dir`, else
 `$COMMS_CHANNELS/journal`, else `./channels/journal`. `fleetd where` reports an

@@ -61,7 +61,8 @@ repository, used for nothing else. It publishes only this machine's file, as of
 its last complete record, in a commit built on top of the remote; it never
 rebases and never writes this machine's file, so a record written during a sync
 is never lost. Each machine writes only its own file, so machines never
-conflict.
+conflict. A file with changes the remote does not have is never overwritten;
+sync names it instead.
 
 The OS account name is recorded only with --include-user. These records are
 meant to be committed, and on a domain-joined host that name carries the domain
@@ -289,6 +290,12 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "published %s from %s; received %s from other machines; journal at %.7s\n",
 		plural(res.Published, "record"), h.Name, plural(res.Received, "commit"), res.Head)
+	if len(res.Kept) > 0 {
+		fmt.Fprintf(stdout, "kept this machine's copy of %s: it has changes the remote does not have.\n"+
+			"  Another identity's journal file is published by syncing with that identity's salt. For anything else,\n"+
+			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
+			strings.Join(res.Kept, ", "), store.Dir())
+	}
 	return nil
 }
 

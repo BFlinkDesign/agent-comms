@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,7 +211,7 @@ func TestAPushRejectedByAnotherMachineIsRetriedAndSucceeds(t *testing.T) {
 	raced := false
 	o := options(a, "host-a")
 	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-		if args[0] == "push" && !raced {
+		if slices.Contains(args, "push") && !raced {
 			raced = true
 			mustSync(t, options(b, "host-b"))
 		}
@@ -425,5 +426,198 @@ func TestNothingToPublishStillReceives(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(m[1], "host-a.jsonl")); err != nil {
 		t.Fatal("machine b did not receive machine a's file")
+	}
+}
+
+// commitByHand makes a change on the remote the way a person would, from a clone
+// of their own, so a machine's next sync has something other than journal
+// records to bring in.
+func commitByHand(t *testing.T, clone string, change func(dir string)) {
+	t.Helper()
+	run(t, clone, "pull", "--quiet", "--ff-only")
+	change(clone)
+	run(t, clone, "add", "--all")
+	run(t, clone, "commit", "--quiet", "-m", "by hand")
+	run(t, clone, "push", "--quiet")
+}
+
+func TestAnotherIdentitysUnpublishedRecordsAreNeverOverwritten(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	// One machine, two identities: a missing FLEET_SALT is only a warning, so
+	// the same machine can record under either.
+	second := filepath.Join(a, "host-x2.jsonl")
+	appendLines(t, second, `{"id":"hive:x2-published"}`)
+	mustSync(t, options(a, "host-x2"))
+	appendLines(t, second, `{"id":"hive:x2-unpublished"}`)
+
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
+	res := mustSync(t, options(a, "host-a"))
+
+	got, _ := os.ReadFile(second)
+	if string(got) != "{\"id\":\"hive:x2-published\"}\n{\"id\":\"hive:x2-unpublished\"}\n" {
+		t.Fatalf("another identity's unpublished record was lost; the file is now %q", got)
+	}
+	if len(res.Kept) != 0 {
+		t.Fatalf("nothing changed on the remote for that file, so nothing should be reported: %+v", res)
+	}
+	if remoteFile(t, remote, "host-x2.jsonl") != "{\"id\":\"hive:x2-published\"}\n" {
+		t.Fatal("a sync as host-a must not publish host-x2's records")
+	}
+}
+
+func TestAFileChangedHereAndOnTheRemoteIsKeptAndReported(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	write(t, filepath.Join(a, "README.md"), "edited on this machine\n")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "edited upstream\n") })
+
+	res := mustSync(t, options(a, "host-a"))
+	got, _ := os.ReadFile(filepath.Join(a, "README.md"))
+	if string(got) != "edited on this machine\n" {
+		t.Fatalf("a local edit was overwritten with %q", got)
+	}
+	if !slices.Equal(res.Kept, []string{"README.md"}) {
+		t.Fatalf("the kept file must be reported: %+v", res)
+	}
+}
+
+func TestAFileDeletedOnTheRemoteIsRemovedHere(t *testing.T) {
+	_, m := fleet(t, 3)
+	a, b, admin := m[0], m[1], m[2]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
+	mustSync(t, options(a, "host-a"))
+	mustSync(t, options(b, "host-b"))
+	if _, err := os.Stat(filepath.Join(b, "host-a.jsonl")); err != nil {
+		t.Fatal("machine b did not receive machine a's file")
+	}
+	// Machine a is decommissioned and its file removed from the journal.
+	commitByHand(t, admin, func(dir string) { run(t, dir, "rm", "--quiet", "host-a.jsonl") })
+
+	res := mustSync(t, options(b, "host-b"))
+	if _, err := os.Stat(filepath.Join(b, "host-a.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a file deleted on the remote is still here (%v): %+v", err, res)
+	}
+	if status := run(t, b, "status", "--porcelain"); status != "" {
+		t.Fatalf("the clone should match the remote, git status says:\n%s", status)
+	}
+}
+
+func TestACRLFCheckoutOfThisHostsFileStillPublishes(t *testing.T) {
+	remote, m := fleet(t, 1)
+	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(m[0], "host-a"))
+
+	// The same machine re-clones with core.autocrlf=true, the git for Windows
+	// default, which checks this host's file out with CRLF line endings.
+	clone := filepath.Join(t.TempDir(), "reclone")
+	run(t, t.TempDir(), "clone", "--quiet", "-c", "core.autocrlf=true", remote, clone)
+	identify(t, clone)
+	path := filepath.Join(clone, "host-a.jsonl")
+	if got, _ := os.ReadFile(path); !strings.Contains(string(got), "\r\n") {
+		t.Fatalf("the test needs a CRLF checkout, got %q", got)
+	}
+	appendLines(t, path, `{"id":"hive:2"}`)
+
+	if res := mustSync(t, options(clone, "host-a")); res.Published != 1 {
+		t.Fatalf("%+v", res)
+	}
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n" {
+		t.Fatalf("remote has %q, want both records with LF endings", got)
+	}
+}
+
+func TestTheUsersOwnSSHCommandIsRespected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in ssh is a shell script")
+	}
+	cases := map[string]func(t *testing.T, clone, ssh string){
+		"GIT_SSH":         func(t *testing.T, _, ssh string) { t.Setenv("GIT_SSH", ssh) },
+		"GIT_SSH_COMMAND": func(t *testing.T, _, ssh string) { t.Setenv("GIT_SSH_COMMAND", ssh) },
+		"core.sshCommand": func(t *testing.T, clone, ssh string) { run(t, clone, "config", "core.sshCommand", ssh) },
+	}
+	for name, choose := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, m := fleet(t, 1)
+			a := m[0]
+			run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
+			marker := filepath.Join(t.TempDir(), "invoked")
+			ssh := filepath.Join(t.TempDir(), "my-ssh")
+			write(t, ssh, "#!/bin/sh\ntouch '"+marker+"'\nexit 1\n")
+			if err := os.Chmod(ssh, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			choose(t, a, ssh)
+			if _, err := Sync(context.Background(), options(a, "host-a")); err == nil {
+				t.Fatal("the stand-in ssh fails, so the sync should too")
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatal("the user's ssh command was overridden")
+			}
+		})
+	}
+	t.Run("none chosen", func(t *testing.T) {
+		_, m := fleet(t, 1)
+		o := options(m[0], "host-a")
+		var fetch []string
+		o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+			if slices.Contains(args, "fetch") {
+				fetch = args
+			}
+			return Git(ctx, dir, stdin, args...)
+		}
+		mustSync(t, o)
+		if !slices.Contains(fetch, "core.sshCommand=ssh -o BatchMode=yes") {
+			t.Fatalf("with no ssh command chosen, ssh must run in batch mode; fetch ran with %q", fetch)
+		}
+	})
+}
+
+func TestARewrittenRemoteNamesTheWayBackAndKeepsUnpublishedRecords(t *testing.T) {
+	remote, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	path := filepath.Join(a, "host-a.jsonl")
+	appendLines(t, path, `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	first := run(t, a, "rev-parse", "HEAD")
+	appendLines(t, path, `{"id":"hive:2"}`)
+	mustSync(t, options(a, "host-a"))
+	// Someone force-pushes the remote back to before the second record.
+	run(t, admin, "fetch", "--quiet")
+	run(t, admin, "push", "--quiet", "--force", "origin", first+":refs/heads/main")
+	appendLines(t, path, `{"id":"hive:3"}`)
+
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	if !errors.Is(err, ErrLocalCommits) || !strings.Contains(err.Error(), "reset --soft '@{upstream}'") {
+		t.Fatalf("expected ErrLocalCommits naming the way back, got %v", err)
+	}
+	run(t, a, "reset", "--soft", "@{upstream}")
+	if res := mustSync(t, options(a, "host-a")); res.Published != 2 {
+		t.Fatalf("both records the rewrite dropped or never saw should go out: %+v", res)
+	}
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n{\"id\":\"hive:3\"}\n" {
+		t.Fatalf("remote has %q", got)
+	}
+}
+
+func TestASyncInterruptedWhileBringingFilesInIsRepairedByTheNext(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+
+	o := options(b, "host-b")
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "checkout") {
+			return "", errors.New("interrupted")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Sync(context.Background(), o); err == nil {
+		t.Fatal("the injected interruption should surface")
+	}
+	mustSync(t, options(b, "host-b"))
+	if got, _ := os.ReadFile(filepath.Join(b, "host-a.jsonl")); string(got) != "{\"id\":\"hive:1\"}\n" {
+		t.Fatalf("the next sync did not bring in what the interrupted one missed: %q", got)
 	}
 }

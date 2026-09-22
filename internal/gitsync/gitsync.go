@@ -6,7 +6,9 @@
 // this host's file: `fleetd record` may be appending to it at the same moment. It
 // builds this host's commit with git plumbing directly on top of the remote tip,
 // from a snapshot of the file cut at its last complete line, pushes exactly that
-// commit, and only then brings the other hosts' files into the working tree.
+// commit, and only then brings the other hosts' files into the working tree. A
+// file with changes that are not on the remote, such as another identity's
+// unpublished records on this machine, is left as it is and reported.
 //
 // Because each host owns one file, the only way two hosts can collide is by
 // deriving the same host id. That is detected by content rather than by reading
@@ -47,9 +49,9 @@ var (
 	// ErrSameFile means the remote copy of this host's file holds records this
 	// machine never wrote: another machine derives the same host id.
 	ErrSameFile = errors.New("gitsync: another machine wrote this host's journal file")
-	// ErrLocalCommits means the clone has commits that are not on the remote.
-	// fleetd never leaves any, so they were made by hand and are not fleetd's to
-	// discard.
+	// ErrLocalCommits means the clone's branch has commits that are not on the
+	// remote: made by hand, or left behind when the remote was rewritten. fleetd
+	// never makes such commits and does not discard them.
 	ErrLocalCommits = errors.New("gitsync: the journal clone has commits that are not on the remote")
 	// ErrBusy means another sync of the same clone is running.
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
@@ -60,21 +62,16 @@ var (
 type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error)
 
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
-// terminal and credential prompts are off, ssh runs in batch mode unless the user
-// chose their own ssh command, hooks do not run, and commits are never signed,
-// since a signer can prompt. A child that outlives the context is cut off after a
-// short delay rather than holding the sync open.
+// terminal and credential prompts are off, hooks do not run, and commits are
+// never signed, since a signer can prompt. A child that outlives the context is
+// cut off after a short delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
 	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = dir
 	cmd.WaitDelay = waitDelay
 	killTree(cmd)
-	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
-	if os.Getenv("GIT_SSH_COMMAND") == "" {
-		env = append(env, "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
-	}
-	cmd.Env = env
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -112,6 +109,9 @@ type Result struct {
 	Head string `json:"head"`
 	// Attempts is how many push attempts it took.
 	Attempts int `json:"attempts"`
+	// Kept lists files the remote changed that were left as they are, because
+	// this clone has changes to them that are not on the remote.
+	Kept []string `json:"kept,omitempty"`
 }
 
 type git struct {
@@ -174,9 +174,10 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		return res, err
 	}
 
+	ssh := batchSSH(g)
 	var tip string
 	for res.Attempts = 1; ; res.Attempts++ {
-		if _, err := g.line("fetch", "--quiet", "--no-tags", remote); err != nil {
+		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", remote)...); err != nil {
 			return res, err
 		}
 		remoteTip, err := g.line("rev-parse", "--verify", "refs/remotes/"+upstream)
@@ -184,7 +185,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			return res, err
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
-			return res, fmt.Errorf("%w: %s", ErrLocalCommits, o.Dir)
+			return res, fmt.Errorf("%w: %s. If they are not wanted, or the remote was rewritten, "+
+				"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
+				"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
 		}
 		commit, published, err := snapshotCommit(g, remoteTip, own, o.File, o.Message)
 		if err != nil {
@@ -194,7 +197,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			tip = remoteTip
 			break
 		}
-		out, err := g.line("push", "--porcelain", "--no-verify", remote, commit+":refs/heads/"+branch)
+		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", remote, commit+":refs/heads/"+branch)...)
 		if err == nil {
 			tip, res.Published = commit, published
 			break
@@ -214,11 +217,24 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	if res.Published > 0 {
 		res.Received-- // this host's own commit
 	}
-	if err := bringIn(g, localRef, local, tip, own); err != nil {
+	if res.Kept, err = bringIn(g, localRef, local, tip, own); err != nil {
 		return res, err
 	}
 	res.Head = tip
 	return res, nil
+}
+
+// batchSSH returns the arguments that keep ssh from waiting for a person, or none
+// when the user has chosen an ssh command of their own (a deploy key, plink): that
+// choice is theirs, and git would otherwise let this one override it.
+func batchSSH(g git) []string {
+	if os.Getenv("GIT_SSH_COMMAND") != "" || os.Getenv("GIT_SSH") != "" {
+		return nil
+	}
+	if configured, _ := g.line("config", "--get", "core.sshCommand"); configured != "" {
+		return nil
+	}
+	return []string{"-c", "core.sshCommand=ssh -o BatchMode=yes"}
 }
 
 // snapshotCommit builds, without touching the working tree or the index, a commit
@@ -233,8 +249,10 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		return "", 0, err
 	}
 	// A record still being appended ends without a newline; it waits for the
-	// next sync rather than being published torn.
-	complete := data[:bytes.LastIndexByte(data, '\n')+1]
+	// next sync rather than being published torn. Line endings are published as
+	// LF: git for Windows checks this file out with CRLF by default, and a JSON
+	// record never contains a raw carriage return, so dropping it loses nothing.
+	complete := bytes.ReplaceAll(data[:bytes.LastIndexByte(data, '\n')+1], []byte("\r\n"), []byte("\n"))
 
 	var published []byte
 	if blob, ok, err := blobAt(g, remoteTip, own); err != nil {
@@ -296,37 +314,110 @@ func blobAt(g git, commit, name string) (string, bool, error) {
 	return fields[2], true, nil
 }
 
-// bringIn points the local branch at tip and writes every other host's file into
-// the working tree. This host's file is never written.
-func bringIn(g git, localRef, local, tip, own string) error {
+// bringIn points the local branch at tip and brings every other file the index
+// does not already hold at tip's version into the working tree. This host's file
+// is never written. Neither is a file with changes the remote does not have,
+// such as another identity's records on this machine or an edit made by hand:
+// it is returned, left as it is.
+func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 	if _, err := g.line("update-ref", "-m", "fleetd sync", localRef, tip, local); err != nil {
-		return err
+		return nil, err
 	}
-	listing, err := g.raw(nil, "ls-tree", "-r", "-z", "--name-only", tip)
+	// Comparing the index, rather than the old commit, with tip also repairs
+	// files a sync interrupted after this point left behind.
+	diff, err := g.raw(nil, "diff-index", "--cached", "-z", "--name-status", "--no-renames", tip)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var others []string
-	for _, path := range strings.Split(listing, "\x00") {
-		if path != "" && path != own {
-			others = append(others, path)
+	var update, remove, paths []string
+	fields := strings.Split(diff, "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		status, path := fields[i], fields[i+1]
+		if path == own {
+			continue
+		}
+		paths = append(paths, path)
+		if status == "A" { // in the index only: the remote deleted it
+			remove = append(remove, path)
+		} else {
+			update = append(update, path)
 		}
 	}
-	if len(others) > 0 {
-		if _, err := g.line(append([]string{"checkout", tip, "--"}, others...)...); err != nil {
-			return err
+	var kept []string
+	if len(paths) > 0 {
+		changed, err := locallyChanged(g, paths)
+		if err != nil {
+			return nil, err
+		}
+		synced, err := g.raw(nil, "ls-tree", "-r", "-z", "--name-only", local)
+		if err != nil {
+			return nil, err
+		}
+		fromRemote := map[string]bool{}
+		for _, path := range strings.Split(synced, "\x00") {
+			fromRemote[path] = true
+		}
+		keep := func(list []string, needsSynced bool) []string {
+			var out []string
+			for _, path := range list {
+				if changed[path] || (needsSynced && !fromRemote[path]) {
+					kept = append(kept, path)
+				} else {
+					out = append(out, path)
+				}
+			}
+			return out
+		}
+		update, remove = keep(update, false), keep(remove, true)
+	}
+	if len(update) > 0 {
+		if _, err := g.raw(nulList(update), "checkout", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+			return nil, err
+		}
+	}
+	if len(remove) > 0 {
+		if _, err := g.raw(nulList(remove), "update-index", "-z", "--force-remove", "--stdin"); err != nil {
+			return nil, err
+		}
+		for _, path := range remove {
+			if err := os.Remove(filepath.Join(g.dir, filepath.FromSlash(path))); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
 		}
 	}
 	// Keep this host's index entry equal to the remote's, so `git status` shows
 	// exactly the records not yet published.
 	if blob, ok, err := blobAt(g, tip, own); err != nil {
-		return err
+		return nil, err
 	} else if ok {
 		if _, err := g.line("update-index", "--add", "--cacheinfo", "100644,"+blob+","+own); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return kept, nil
+}
+
+// locallyChanged reports which paths hold content the index does not: a file
+// modified in the working tree, or one git does not track.
+func locallyChanged(g git, paths []string) (map[string]bool, error) {
+	out, err := g.raw(nil, append([]string{"status", "--porcelain=v1", "-z", "--no-renames",
+		"--untracked-files=all", "--ignored=matching", "--"}, paths...)...)
+	if err != nil {
+		return nil, err
+	}
+	changed := map[string]bool{}
+	for _, entry := range strings.Split(out, "\x00") {
+		// "XY path": Y compares the working tree with the index. A file deleted
+		// here has nothing to lose.
+		if len(entry) > 3 && entry[1] != ' ' && entry[1] != 'D' {
+			changed[entry[3:]] = true
+		}
+	}
+	return changed, nil
+}
+
+func nulList(paths []string) []byte {
+	return []byte(strings.Join(paths, "\x00") + "\x00")
 }
 
 // lock takes a lock file in the clone's git directory so two syncs of the same

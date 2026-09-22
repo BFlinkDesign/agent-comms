@@ -124,3 +124,28 @@ func TestSyncOutsideACloneExplainsItself(t *testing.T) {
 		t.Fatalf("expected a not-a-clone error, got %v", err)
 	}
 }
+
+func TestSyncNamesAFileItLeftAloneAndHowToTakeTheRemotesCopy(t *testing.T) {
+	a, b := twoMachines(t)
+	if err := os.WriteFile(filepath.Join(a, "README.md"), []byte("edited on cnc-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b, "README.md"), []byte("edited on hpremote\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, b, "commit", "--quiet", "--all", "-m", "by hand")
+	gitIn(t, b, "push", "--quiet")
+
+	stdout, stderr, err := exec(t, "sync", "--dir", a, "--salt", "s")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, stderr)
+	}
+	if !strings.Contains(stdout, "kept this machine's copy of README.md") ||
+		!strings.Contains(stdout, "checkout '@{upstream}' -- <file>") {
+		t.Fatalf("sync should name the file it kept and the way to take the remote's copy:\n%s", stdout)
+	}
+	got, _ := os.ReadFile(filepath.Join(a, "README.md"))
+	if string(got) != "edited on cnc-1\n" {
+		t.Fatalf("the local edit was overwritten: %q", got)
+	}
+}
