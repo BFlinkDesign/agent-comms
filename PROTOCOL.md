@@ -123,6 +123,65 @@ Empty msg field = protocol violation. Agents that post empty cells are broken.
 }
 ```
 
+### Observation Cell (type="observation" | "handoff" | "note", channel="journal")
+
+Written by `fleetd` (see the Fleet Command Reference below) to record **which
+machine** did a piece of work. Git records no such thing: a commit carries an
+author, a committer and a UTC offset, none of which identify a host, so this is
+recorded at the time or not at all.
+
+These cells use the content-addressed id from `hive/cell.py`, not the raw
+plane's uuid4, because two hosts recording the same observation must derive the
+same id for a reader to collapse the duplicate.
+
+```json
+{
+  "id": "hive:3e5ac3f5428c3abf",
+  "v": 1,
+  "type": "observation",
+  "from": "claude/cloud",
+  "ts": "2026-09-14T13:55:00.123456789Z",
+  "channel": "journal",
+  "data": {
+    "host.id": "host:21f5d68f266ed466",
+    "host.name": "CNC-1",
+    "host.os": "windows",
+    "host.arch": "amd64",
+    "host.source": "windows:MachineGuid",
+    "host.stable": true,
+    "note": "fleetd packages green, cross-compiled to 5 targets",
+    "repo": "agent-comms",
+    "branch": "main"
+  },
+  "refs": [],
+  "ttl": 0,
+  "tags": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `host.id` | Salted digest of the platform's stable machine identifier. The raw value is never published. |
+| `host.name` | Hostname, in clear — distinguishing CNC-1 from BRADY-HPREMOTE by eye is the point. |
+| `host.source` | Where `host.id` came from: `linux:machine-id`, `windows:MachineGuid`, `darwin:IOPlatformUUID`, or `hostname-only`. |
+| `host.stable` | `false` means no stable identifier was readable and the id is hostname-derived: it changes if the machine is renamed and may collide with another machine of that name. |
+| `note` / `repo` / `branch` | Optional, present only when supplied. |
+| `user` | Optional. Present **only** with `--include-user`: on a domain-joined host the OS account name carries the domain with it, and these records are committed. |
+
+`ts` carries nanosecond precision. At whole-second resolution two distinct
+records written in the same second would derive the same id and one would be
+collapsed away as a duplicate.
+
+Records live in one append-only file per host at
+`$COMMS_CHANNELS/journal/<host-id>.jsonl`. One file per writer is the
+concurrency design: several machines publishing into one repository would
+otherwise conflict on the same trailing lines on every push.
+
+**Ordering.** Within a host, file order is authoritative — it is the order the
+appends committed, and unlike a timestamp it cannot be wrong because a writer's
+clock was. Across hosts there is deliberately **no total order**: nothing in the
+journal proves machine A's entry happened before machine B's.
+
 ---
 
 ## Agent Card (A2A Standard)
@@ -198,7 +257,20 @@ comms hive expire                           # remove all TTL-expired cells
 comms trace <contract_id> <channel> <outcome> <steps_json>
 comms belief <channel> <claim> [confidence]
 comms refute <belief_id> <reason> [correction] [channel]
+
+# Host attribution (fleetd — a separate single static binary, no runtime)
+fleetd host   [--json] [--salt S]
+fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
+fleetd where  [--json] [--dir D] [--limit N]
 ```
+
+`fleetd` resolves its journal directory from `--dir`, else
+`$COMMS_CHANNELS/journal`, else `./channels/journal`. `fleetd where` reports an
+error rather than "no records" when that directory does not exist, so a mistyped
+path is distinguishable from a machine that genuinely recorded nothing.
+
+`--salt` (or `$FLEET_SALT`) must be identical on every machine in the fleet, or
+one machine will appear as several. It is not a credential.
 
 DOES NOT EXIST (never use):
 - comms join

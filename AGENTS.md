@@ -39,6 +39,8 @@ convenience.
 | Directory | Purpose |
 |-----------|---------|
 | `hive/` | HIVE Python protocol library (see `hive/AGENTS.md`) |
+| `cmd/fleetd/` | `fleetd` — native host-attributed journal writer (see below) |
+| `internal/` | Go packages backing `fleetd`: `cell`, `hostid`, `journal` |
 | `tests/` | Full pytest suite (see `tests/AGENTS.md`) |
 | `channels/` | JSONL channel files — shared message bus (see `channels/AGENTS.md`) |
 | `dashboard/` | Factory floor web UI + FastAPI server (see `dashboard/AGENTS.md`) |
@@ -73,6 +75,82 @@ See `PROTOCOL.md` for full schema. Never post empty cells (msg < 20 chars = viol
 - Never write to any channel path other than `C:/Users/Brady.EAGLE/.ai/channels` — the repo's `channels/` directory is not the live bus; split writes corrupt the fleet's shared state
 - Never post a result more than once for the same task_id — Gemini posted TASK-2 results twice with different content; one result per task, tracked in agent-runner state file
 - Never run comms commands with `COMMS_AGENT` unset or set to "unknown" — agent identity must be set in format `name/role` before any comms operation; `agent-runner.sh` exits immediately otherwise
+
+## fleetd — the native writer
+
+`fleetd` answers one question the rest of this bus cannot: **which machine did that
+happen on.** It is a single static binary with no runtime, built from `cmd/fleetd`
+and `internal/`, so it runs on a host that has no Python and participates in the bus
+through the documented extension point — any process that can append a file.
+
+```
+fleetd host                     what this machine is, and how much that is worth
+fleetd record --type T --note N append one host-attributed record
+fleetd where                    per machine, what it was last doing
+```
+
+Every command takes `--json`, so one surface serves a person and a program. The
+journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.
+`PROTOCOL.md` carries the cell schema and the full command reference.
+
+Two defaults are deliberate and worth knowing before you use it:
+
+- **The OS account is not recorded unless you pass `--include-user`.** These
+  records are meant to be committed, and on a domain-joined Windows host
+  `user.Current().Username` is `DOMAIN\account` — publishing it by default would
+  put the AD domain and the operator's account name into the repository on every
+  record, which would undo the care taken not to publish the machine identifier.
+- **`fleetd where` fails on a directory that does not exist** rather than
+  answering "no records". An empty answer that is indistinguishable from a
+  mistyped path is the worst available output for a tool whose only job is
+  saying which machine did something.
+
+Three things about it are load-bearing, and each exists because the naive version
+was wrong:
+
+- **Host identity is derived, not assumed.** `internal/hostid` reads
+  `/etc/machine-id`, the Windows `MachineGuid`, or the macOS `IOPlatformUUID`, and
+  publishes only a salted digest of it — a hardware fingerprint committed to a
+  repository has left the machine. Set `FLEET_SALT` to the *same* value on every
+  host or one machine will appear as several. When no stable source is readable it
+  degrades to the hostname and says so: `stable: false` means the attribution will
+  change if the machine is renamed and may collide with another machine of that
+  name. A weak identity is labelled weak rather than presented as a strong one.
+
+- **One file per host is the whole concurrency design.** Several machines publish
+  into one repository; a shared file would make every push a conflict on the same
+  trailing lines. Within a host, concurrent appends from several CLIs are safe
+  because each record is a single write to a file opened `O_APPEND` — this is
+  verified against six real concurrent processes, not asserted.
+
+- **Order within a host is file order, and there is no order across hosts.**
+  `Record.Line` is the position the append actually committed at, which is the same
+  reason the board arbitrates races by `rowid` and never by `ts`: writer clocks
+  cannot be trusted. Nothing in the journal proves machine A's entry happened before
+  machine B's, and `fleetd where` says so in its own output. Where machines *are*
+  ranked for display, they are compared as instants rather than as strings —
+  lexical comparison of RFC3339 is only correct when every timestamp is UTC `Z`,
+  and `hive/cell.py` writes local time with an offset.
+
+- **A line this parser cannot read never hides the records after it.** The bus is
+  open to any process that can append, including the raw uuid4 plane whose
+  records this parser rejects, so an unreadable line is an expected input rather
+  than proof the file is ruined. Every defect is reported, and every intact
+  record is still returned.
+
+**Which plane `fleetd` writes to, and why it matters.** This bus has two documented
+planes over the same files: the raw plane is plain JSONL appends with uuid4 ids,
+and the board plane (`hive/cell.py`) is content-addressed. `fleetd` writes
+content-addressed cells, and `internal/cell` proves its ids byte-identical against
+the live `hive.cell` module across eight payload shapes.
+
+That choice is forced by the multi-host case rather than being a preference. A
+random id makes a duplicate undetectable: if the same observation is published
+twice — a retry, a re-run, or two machines seeing the same fact — nothing lets a
+reader tell it is the same record. A content-derived id makes them collide, so the
+reader can collapse them. Anything appended to a journal through the raw plane's
+uuid4 path therefore cannot be deduplicated across hosts; that is a property of
+that plane, not a defect in it, and it is the reason `fleetd` does not use it.
 
 ## Dependencies
 

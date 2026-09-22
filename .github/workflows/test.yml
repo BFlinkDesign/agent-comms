@@ -23,3 +23,99 @@ jobs:
         run: ruff check .
       - name: Shell syntax check
         run: bash -n comms.sh agent-runner.sh
+
+  # The native writer is gated on Windows as well as Linux, deliberately. Its
+  # journal open path is build-tagged per platform, so internal/journal/open_windows.go
+  # is never compiled or executed by a Linux-only job -- and Windows is a first-class
+  # target for this binary, not an afterthought. A gate that cannot see half the code
+  # is not a gate.
+  #
+  # No setup-go action is used: Go is preinstalled on both runner images, and go.mod
+  # states a minor-version floor, so this avoids adding an action whose pinned commit
+  # would otherwise have to be taken on trust.
+  go:
+    name: go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain
+        run: go version
+
+      - name: Check formatting
+        # Linux only. Formatting is not platform-specific, so running this twice
+        # adds no coverage -- and it makes the gate depend on checkout line-ending
+        # behaviour, which differs per platform and produced a false failure on
+        # every file the first time this ran. .gitattributes pins .go to LF so the
+        # check is correct either way; keeping it to one platform removes the
+        # dependency entirely.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          # gofmt exits 0 whether or not it finds anything, so the file list is the
+          # signal. Without this check the job would pass on unformatted code.
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Race detector
+        # Appends are concurrent by design, so a data race here is a correctness
+        # bug rather than a style issue. Linux only: the race detector needs cgo,
+        # and the Windows runner has no C toolchain configured.
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./... -count=1 -race
+
+  cross-compile:
+    # The binary has to exist for every machine in the fleet, so every target is
+    # built on every change. A target that silently stops building is a machine
+    # that silently stops being supported.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build every fleet target
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          failed=0
+          outdir="$(mktemp -d)"
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            # Compile every package, so a build-tagged file that only exists for one
+            # platform is still type-checked. -o is omitted here because it is illegal
+            # with a multi-package pattern.
+            if GOOS="$os" GOARCH="$arch" go build ./...; then
+              # Then link the actual binary, which is what gets shipped.
+              ext=""; [ "$os" = "windows" ] && ext=".exe"
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "-s -w" \
+                -o "$outdir/fleetd-$os-$arch$ext" ./cmd/fleetd
+              printf 'ok    %-16s %8s bytes\n' "$target" "$(wc -c <"$outdir/fleetd-$os-$arch$ext")"
+            else
+              echo "FAIL  $target"; failed=1
+            fi
+          done
+          exit "$failed"
