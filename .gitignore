@@ -15,3 +15,7 @@ __pycache__/
 
 # HIVE database
 hive.db
+
+# fleetd journal written by `fleetd record` run inside this repository; the real
+# journal is a clone of the journal repository, never part of this one.
+channels/journal/

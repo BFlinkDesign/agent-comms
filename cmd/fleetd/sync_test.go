@@ -120,7 +120,7 @@ func TestSyncOutsideACloneExplainsItself(t *testing.T) {
 		t.Skip("git is not installed")
 	}
 	_, _, err := exec(t, "sync", "--dir", t.TempDir(), "--salt", "s")
-	if err == nil || !strings.Contains(err.Error(), "not a git clone") {
+	if err == nil || !strings.Contains(err.Error(), "not the root of a git clone") {
 		t.Fatalf("expected a not-a-clone error, got %v", err)
 	}
 }

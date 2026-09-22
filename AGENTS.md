@@ -90,13 +90,22 @@ fleetd sync                     publish this machine's records, receive the othe
 fleetd where                    per machine, what it was last doing
 ```
 
-`fleetd sync` is what makes the answer cross-machine. The journal directory is a
-clone of one journal repository; sync commits only this machine's file, rebases
-onto the remote and pushes, retrying a push rejected by another machine at most
-three times. Since each machine writes only its own file, two machines can never
-conflict. The one exception is two machines deriving the same host id, which is
-reported as such, not merged. Every git call is bounded by `--timeout`, and
-credential prompts are disabled, so a sync never hangs waiting for input.
+`fleetd sync` is what makes the answer cross-machine. The journal directory is
+the root of a clone of one journal repository that fleetd owns. Sync never
+rebases, merges or stashes, and never writes this machine's own file, which
+`fleetd record` may be appending to at that moment. Instead it:
+
+- snapshots the file up to its last complete record;
+- builds a commit on top of the remote tip with git plumbing (`hash-object`,
+  `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
+  lost a race to another machine at most three times;
+- then writes the other machines' files into the working tree.
+
+Two machines can collide only by deriving the same host id. That is detected by
+content: the remote copy of this machine's file must be a prefix of the local one.
+A clone with commits fleetd did not make is refused, never pushed and never
+discarded. Every git call is bounded by `--timeout`. Prompts, hooks and commit
+signing are all disabled, so a sync never waits for input.
 
 Every command takes `--json`, so one surface serves a person and a program. The
 journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.

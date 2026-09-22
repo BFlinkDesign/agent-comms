@@ -265,9 +265,10 @@ fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
 fleetd where  [--json] [--dir D] [--limit N]
 ```
 
-`fleetd sync` requires the journal directory to be inside a git clone of the
-journal repository with an upstream branch. It stages and commits only this
-host's `<host-id>.jsonl`, then fetches, rebases and pushes. A push rejected
+`fleetd sync` requires the journal directory to be the root of a clone of the
+journal repository, with an upstream branch. It publishes only this host's
+`<host-id>.jsonl`, up to its last complete line, in a commit built directly on
+the remote tip. It never rebases and never writes that file. A push rejected
 because another machine pushed first is retried, up to three attempts.
 
 `fleetd` resolves its journal directory from `--dir`, else
