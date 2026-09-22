@@ -261,8 +261,14 @@ comms refute <belief_id> <reason> [correction] [channel]
 # Host attribution (fleetd — a separate single static binary, no runtime)
 fleetd host   [--json] [--salt S]
 fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
+fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
 fleetd where  [--json] [--dir D] [--limit N]
 ```
+
+`fleetd sync` requires the journal directory to be inside a git clone of the
+journal repository with an upstream branch. It stages and commits only this
+host's `<host-id>.jsonl`, then fetches, rebases and pushes. A push rejected
+because another machine pushed first is retried, up to three attempts.
 
 `fleetd` resolves its journal directory from `--dir`, else
 `$COMMS_CHANNELS/journal`, else `./channels/journal`. `fleetd where` reports an

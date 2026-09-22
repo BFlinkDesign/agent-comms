@@ -86,8 +86,17 @@ through the documented extension point — any process that can append a file.
 ```
 fleetd host                     what this machine is, and how much that is worth
 fleetd record --type T --note N append one host-attributed record
+fleetd sync                     publish this machine's records, receive the others'
 fleetd where                    per machine, what it was last doing
 ```
+
+`fleetd sync` is what makes the answer cross-machine. The journal directory is a
+clone of one journal repository; sync commits only this machine's file, rebases
+onto the remote and pushes, retrying a push rejected by another machine at most
+three times. Since each machine writes only its own file, two machines can never
+conflict. The one exception is two machines deriving the same host id, which is
+reported as such, not merged. Every git call is bounded by `--timeout`, and
+credential prompts are disabled, so a sync never hangs waiting for input.
 
 Every command takes `--json`, so one surface serves a person and a program. The
 journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.
