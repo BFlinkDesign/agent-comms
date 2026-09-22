@@ -240,6 +240,116 @@ func TestMalformedRecordIsDistinctFromTornAndNamesItsLine(t *testing.T) {
 	}
 }
 
+func TestMalformedLineDoesNotHideTheRecordsAfterIt(t *testing.T) {
+	// The defect this pins: returning at the first unparseable line discarded
+	// every valid record after it, so `fleetd where` reported a stale
+	// last-activity and an undercount with no signal but a warning. This bus is
+	// explicitly open to any process that can append, including a plane whose
+	// records this parser rejects, so such a line is an expected input.
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "first", 1, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	p := filepath.Join(dir, testStem+".jsonl")
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Terminated and well-formed JSON, but not a cell: no id, no from.
+	if _, err := f.WriteString("{\"note\":\"written by another writer\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if err := s.Append(testHost, mustCell(t, "third", 3, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Read(testHost)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want the bad line reported as ErrMalformed", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("read %d records, want both valid ones — the record after the bad line was dropped", len(got))
+	}
+	// Specifically the LAST record must survive: it is the one "where did I leave
+	// off" actually reports.
+	if got[len(got)-1].From != "fleet/third" {
+		t.Errorf("last record is %q, want fleet/third", got[len(got)-1].From)
+	}
+	if got[len(got)-1].Line != 3 {
+		t.Errorf("last record Line = %d, want 3 — line numbering must still count the skipped line", got[len(got)-1].Line)
+	}
+}
+
+func TestSeveralMalformedLinesAreAllReported(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "ok", 0, "")); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, testStem+".jsonl")
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("{\"no\":\"id\"}\n")
+	f.WriteString("not json at all\n")
+	f.Close()
+
+	got, err := s.Read(testHost)
+	if err == nil {
+		t.Fatal("two malformed lines were not reported")
+	}
+	if n := strings.Count(err.Error(), "line "); n < 2 {
+		t.Errorf("err mentions %d lines, want both: %v", n, err)
+	}
+	if len(got) != 1 {
+		t.Errorf("read %d records, want the 1 valid one", len(got))
+	}
+}
+
+func TestReadingAnAbsentStoreIsNotAnEmptyStore(t *testing.T) {
+	// A mistyped --dir used to create the directory, answer "no records" and exit
+	// zero, which is indistinguishable from a machine that genuinely recorded
+	// nothing. For a tool whose only job is saying which machine did something,
+	// that is the worst available answer.
+	missing := filepath.Join(t.TempDir(), "typo", "journal")
+	s, err := Open(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadAll(); !errors.Is(err, ErrNoStore) {
+		t.Fatalf("err = %v, want ErrNoStore", err)
+	}
+	if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+		t.Errorf("a read created %s; only Append may create the store", missing)
+	}
+}
+
+func TestAppendCreatesTheStoreOnDemand(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "journal")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "a", 0, "")); err != nil {
+		t.Fatalf("Append did not create the store: %v", err)
+	}
+	got, err := s.Read(testHost)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("read back %d records, err %v", len(got), err)
+	}
+}
+
 func TestRefusesSymlinkedTarget(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(t.TempDir(), "elsewhere.jsonl")

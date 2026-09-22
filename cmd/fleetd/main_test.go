@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -212,6 +215,225 @@ func TestRecordedLineCarriesHostAttribution(t *testing.T) {
 	if !strings.Contains(where, `"host_name"`) {
 		t.Errorf("where output carries no host_name: %s", where)
 	}
+}
+
+func TestMachinesAreOrderedByInstantNotByStringCompare(t *testing.T) {
+	// The wrong answer this pins: lexical comparison of RFC3339 is only correct
+	// when every timestamp is UTC "Z". Machine A at 10:00+05:00 is 05:00Z, which
+	// is EARLIER than machine B at 06:00Z, but sorts later as a string. That
+	// matters beyond --at: hive/cell.py writes every ts as
+	// datetime.now(UTC).astimezone().isoformat(), i.e. local time with an offset,
+	// so records from the existing Python bus sorted wrong by construction.
+	dir := t.TempDir()
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "machine-a", "--type", "note",
+		"--at", "2026-09-14T10:00:00+05:00", "--note", "actually older"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "machine-b", "--type", "note",
+		"--at", "2026-09-14T06:00:00Z", "--note", "actually newer"); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d machines, want 2", len(got))
+	}
+	if got[0].LastNote != "actually newer" {
+		t.Errorf("first entry is %q; 06:00Z is later than 10:00+05:00 (=05:00Z), so ordering is still lexical",
+			got[0].LastNote)
+	}
+}
+
+func TestTwoRecordsInTheSameSecondAreDistinct(t *testing.T) {
+	// At whole-second resolution two successive records produced byte-identical
+	// cells with the same content-derived id. Since a reader is documented to
+	// collapse colliding ids, one of two genuinely distinct events would simply
+	// disappear while `where` still counted both.
+	dir := t.TempDir()
+	ids := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		stdout, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "observation",
+			"--note", "same event twice in a second", "--json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var res struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+			t.Fatal(err)
+		}
+		ids[res.ID] = true
+	}
+	if len(ids) != 2 {
+		t.Fatalf("two records produced %d distinct id(s); a distinct event was silently merged away", len(ids))
+	}
+}
+
+func TestOSAccountIsNotPublishedUnlessAskedFor(t *testing.T) {
+	// internal/hostid deliberately publishes only a digest of the machine
+	// identifier. Emitting the OS account in the same record would undo that: on
+	// a domain-joined Windows host user.Current().Username is DOMAIN\account, so
+	// the default behaviour committed the AD domain and the operator's account
+	// name into a repository on every record.
+	dir := t.TempDir()
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
+		"--at", "2026-09-14T12:00:00Z", "--note", "n"); err != nil {
+		t.Fatal(err)
+	}
+	raw := readJournal(t, dir)
+	if strings.Contains(raw, `"user"`) {
+		t.Errorf("the OS account was published without --include-user: %s", raw)
+	}
+
+	dir2 := t.TempDir()
+	if _, _, err := exec(t, "record", "--dir", dir2, "--salt", "t", "--type", "note",
+		"--at", "2026-09-14T12:00:00Z", "--note", "n", "--include-user"); err != nil {
+		t.Fatal(err)
+	}
+	if raw2 := readJournal(t, dir2); !strings.Contains(raw2, `"user"`) {
+		t.Errorf("--include-user did not publish the account: %s", raw2)
+	}
+}
+
+func TestLimitAppliesToJSONAsWellAsTheTerminal(t *testing.T) {
+	// --limit used to be read only by the human branch, so a program asking for
+	// the last N entries silently received one and could not tell.
+	dir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
+			"--at", "2026-09-14T12:00:0"+strconv.Itoa(i)+"Z", "--note", "n"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json", "--limit", "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d machines, want 1", len(got))
+	}
+	// --limit counts total records shown per machine, so 3 means the last one
+	// (reported in last_*) plus the 2 before it in recent.
+	if len(got[0].Recent) != 2 {
+		t.Fatalf("recent has %d entries, want 2 — --limit was ignored in the JSON branch", len(got[0].Recent))
+	}
+	// Newest first, and excluding the one already reported as last_*.
+	if got[0].Recent[0].Note != "n3" {
+		t.Errorf("first recent entry is %q, want n3", got[0].Recent[0].Note)
+	}
+}
+
+func TestOutOfOrderTimestampsAreFlaggedNotHidden(t *testing.T) {
+	// Append order is what gets reported, because it is what actually happened
+	// and does not depend on a clock. When a host's own timestamps disagree with
+	// that order, presenting the file-order-last entry as "last" is still correct
+	// but reads wrong, so it is called out rather than left to confuse.
+	dir := t.TempDir()
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "handoff",
+		"--at", "2026-09-22T06:00:00Z", "--note", "written first, later timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "observation",
+		"--at", "2026-09-22T05:00:00Z", "--note", "written second, earlier timestamp"); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].TimestampsOutOfOrder {
+		t.Fatalf("out-of-order timestamps were not flagged: %+v", got)
+	}
+	// Append order still decides which record is "last".
+	if got[0].LastNote != "written second, earlier timestamp" {
+		t.Errorf("last is %q; append order must decide, not the clock", got[0].LastNote)
+	}
+
+	human, _, err := exec(t, "where", "--dir", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(human, "clock or write order is suspect") {
+		t.Errorf("terminal output does not mention the disagreement:\n%s", human)
+	}
+}
+
+func TestMonotonicTimestampsAreNotFlagged(t *testing.T) {
+	dir := t.TempDir()
+	for i, ts := range []string{"2026-09-22T05:00:00Z", "2026-09-22T06:00:00Z"} {
+		if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
+			"--at", ts, "--note", "n"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[0].TimestampsOutOfOrder {
+		t.Error("in-order timestamps were flagged as out of order")
+	}
+}
+
+func TestLimitBelowOneIsRejected(t *testing.T) {
+	if _, _, err := exec(t, "where", "--dir", t.TempDir(), "--limit", "0"); err == nil {
+		t.Error("--limit 0 was accepted")
+	}
+}
+
+func TestMistypedDirIsAnErrorNotAnEmptyAnswer(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "channles", "journal")
+	stdout, _, err := exec(t, "where", "--dir", missing)
+	if err == nil {
+		t.Fatalf("a nonexistent store answered successfully: %q", stdout)
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("err = %v, want it to say the store does not exist", err)
+	}
+	if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+		t.Errorf("the read created %s; only record may create the store", missing)
+	}
+}
+
+// readJournal returns the single journal file's contents from a store.
+func readJournal(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".jsonl") {
+			b, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			return string(b)
+		}
+	}
+	t.Fatalf("no journal file in %s", dir)
+	return ""
 }
 
 func TestPluralReadsLikeEnglish(t *testing.T) {

@@ -19,3 +19,18 @@ func openAppend(path string) (*os.File, error) {
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW,
 		0o600)
 }
+
+// syncDir flushes the directory entry for a newly created journal file. POSIX
+// requires this separately from fsyncing the file: the file's own sync persists
+// its contents and inode, but not the name that points at them.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return err
+	}
+	return d.Close()
+}

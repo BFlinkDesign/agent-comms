@@ -55,19 +55,27 @@ var (
 	ErrSymlink = errors.New("journal: refusing to write through a symlink")
 	// ErrTornRecord reports a trailing partial line, i.e. an interrupted append.
 	ErrTornRecord = errors.New("journal: trailing partial record")
+	// ErrNoStore reports that the journal directory does not exist. A read says
+	// this rather than inventing an empty store, so a mistyped path is
+	// distinguishable from a machine that has genuinely recorded nothing.
+	ErrNoStore = errors.New("journal: store directory does not exist")
 )
 
 // Store is a directory of per-host journal files.
 type Store struct{ dir string }
 
-// Open prepares dir as a journal store, creating it if needed.
+// Open resolves dir as a journal store. It does NOT create the directory:
+// creation happens in Append, when there is actually something to write.
+//
+// That split matters for a read. When Open created its target unconditionally, a
+// mistyped --dir produced an empty store, answered "no records", exited zero and
+// left a stray directory behind — an empty answer indistinguishable from a wrong
+// path, which for a tool whose whole purpose is answering "which machine did
+// that" is the worst output available. Reads now report ErrNoStore instead.
 func Open(dir string) (*Store, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("journal: resolving %q: %w", dir, err)
-	}
-	if err := os.MkdirAll(abs, 0o700); err != nil {
-		return nil, fmt.Errorf("journal: creating %q: %w", abs, err)
 	}
 	return &Store{dir: abs}, nil
 }
@@ -126,6 +134,16 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 		return fmt.Errorf("%w: %s", ErrSymlink, p)
 	}
 
+	// The store directory is created here rather than in Open, so that a read
+	// against a mistyped path fails instead of silently manufacturing an empty
+	// store. Whether this call created the file decides whether the directory
+	// needs syncing below.
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return fmt.Errorf("journal: creating %s: %w", s.dir, err)
+	}
+	_, statErr := os.Lstat(p)
+	isNew := errors.Is(statErr, os.ErrNotExist)
+
 	f, err := openAppend(p)
 	if err != nil {
 		return fmt.Errorf("journal: opening %s: %w", p, err)
@@ -138,7 +156,23 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("journal: syncing %s: %w", p, err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("journal: closing %s: %w", p, err)
+	}
+
+	if isNew {
+		// Syncing the file persists its data and inode but not the directory
+		// entry that names it. Without this, power loss just after the first
+		// record on a fresh machine leaves the journal file absent rather than
+		// merely short -- the record would not be truncated, it would never have
+		// existed, which is precisely what the package doc promises cannot
+		// happen. Only needed when the entry is new; later appends do not change
+		// the directory.
+		if err := syncDir(s.dir); err != nil {
+			return fmt.Errorf("journal: syncing directory %s: %w", s.dir, err)
+		}
+	}
+	return nil
 }
 
 // Record is one parsed journal line, kept as raw text plus the fields a reader
@@ -178,6 +212,9 @@ func (s *Store) Read(hostID string) ([]Record, error) {
 func (s *Store) Hosts() ([]string, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrNoStore, s.dir)
+		}
 		return nil, fmt.Errorf("journal: listing %s: %w", s.dir, err)
 	}
 	var out []string
@@ -234,10 +271,15 @@ func parseRecord(line string) (Record, error) {
 		return Record{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	// A record with no id cannot be deduplicated and a record with no timestamp
-	// cannot be placed, so neither is usable; say which is missing.
-	for name, v := range map[string]string{"id": envelope.ID, "ts": envelope.TS, "from": envelope.From} {
-		if strings.TrimSpace(v) == "" {
-			return Record{}, fmt.Errorf("%w: required field %q is empty", ErrMalformed, name)
+	// cannot be placed, so neither is usable; say which is missing. The fields are
+	// checked in a fixed order rather than by ranging a map, because Go randomises
+	// map iteration and an operator diagnosing a damaged journal would otherwise
+	// be told a different cause each time they re-ran the same command.
+	for _, f := range []struct{ name, value string }{
+		{"id", envelope.ID}, {"ts", envelope.TS}, {"from", envelope.From},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return Record{}, fmt.Errorf("%w: required field %q is empty", ErrMalformed, f.name)
 		}
 	}
 	return Record{
@@ -261,6 +303,15 @@ func (s *Store) readFile(p, stem string) ([]Record, error) {
 	defer f.Close()
 
 	var out []Record
+	// Defects are collected rather than returned at the first one. A malformed
+	// line in the middle of a file must not hide the records after it: this bus
+	// is explicitly open to any process that can append, including the raw uuid4
+	// plane whose records this parser rejects, so a line it cannot read is an
+	// expected input rather than proof the file is ruined. Returning early there
+	// made `fleetd where` report a stale last-activity and an undercount with no
+	// signal beyond a warning -- the exact "silently guesses" failure this package
+	// is written to avoid.
+	var defects []error
 	r := bufio.NewReaderSize(f, MaxRecordBytes)
 	for n := 1; ; n++ {
 		line, rerr := r.ReadString('\n')
@@ -270,10 +321,11 @@ func (s *Store) readFile(p, stem string) ([]Record, error) {
 		if trimmed != "" && complete {
 			rec, perr := parseRecord(trimmed)
 			if perr != nil {
-				return out, fmt.Errorf("journal: %s line %d: %w", p, n, perr)
+				defects = append(defects, fmt.Errorf("journal: %s line %d: %w", p, n, perr))
+			} else {
+				rec.Host, rec.Line = stem, n
+				out = append(out, rec)
 			}
-			rec.Host, rec.Line = stem, n
-			out = append(out, rec)
 		}
 
 		if rerr != nil {
@@ -281,12 +333,13 @@ func (s *Store) readFile(p, stem string) ([]Record, error) {
 				if trimmed != "" && !complete {
 					// The last append did not finish. Say so, and hand back
 					// everything that did.
-					return out, fmt.Errorf("journal: %s line %d: %w: %d bytes with no terminator",
-						p, n, ErrTornRecord, len(trimmed))
+					defects = append(defects, fmt.Errorf("journal: %s line %d: %w: %d bytes with no terminator",
+						p, n, ErrTornRecord, len(trimmed)))
 				}
-				return out, nil
+				return out, errors.Join(defects...)
 			}
-			return out, fmt.Errorf("journal: reading %s line %d: %w", p, n, rerr)
+			defects = append(defects, fmt.Errorf("journal: reading %s line %d: %w", p, n, rerr))
+			return out, errors.Join(defects...)
 		}
 	}
 }

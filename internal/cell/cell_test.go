@@ -1,9 +1,11 @@
 package cell
 
 import (
+	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -134,6 +136,17 @@ func TestPythonConformance(t *testing.T) {
 			data:     map[string]Value{"delta": I(-17), "zero": I(0), "off": B(false)},
 			dataJSON: `{"delta":-17,"zero":0,"off":false}`,
 		},
+		{
+			// U+FFFD. An earlier encoder special-cased this and emitted it raw,
+			// which was the single divergence from Python in the entire encoder
+			// and which this table did not cover. Ranging a Go string yields it
+			// for every invalid UTF-8 byte too, so a note carrying a stray cp1252
+			// byte took the same path.
+			name: "replacement character", typ: "note", from: "a/b",
+			ts: "2026-09-14T12:00:00Z", channel: "general",
+			data:     map[string]Value{"s": S("bad�end")},
+			dataJSON: `{"s":"bad�end"}`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -145,6 +158,112 @@ func TestPythonConformance(t *testing.T) {
 					got, want, CanonicalData(tc.data), canonicalFromPython(t, tc.dataJSON))
 			}
 		})
+	}
+}
+
+// TestEveryCodePointMatchesPython sweeps the Unicode space rather than trusting a
+// hand-picked table. The eight-case table above is a readable summary of the
+// encoder's decisions; it is not evidence, and it demonstrably missed U+FFFD. A
+// single escaping decision that differs for one character silently breaks the
+// only property this package promises, so the space is checked exhaustively
+// across the ranges that matter and by sampling the rest.
+func TestEveryCodePointMatchesPython(t *testing.T) {
+	if testing.Short() {
+		t.Skip("sweeps the Unicode space; runs in the full suite")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skipf("python3 not installed: %v", err)
+	}
+
+	var points []rune
+	// Exhaustive where escaping rules change: controls, ASCII, Latin-1, the
+	// 0x7f boundary, and the edges of the basic multilingual plane.
+	for r := rune(0); r <= 0x2FF; r++ {
+		points = append(points, r)
+	}
+	for r := rune(0xFF00); r <= 0xFFFF; r++ {
+		points = append(points, r)
+	}
+	// Sampled across the rest of the BMP and the astral planes, where the
+	// surrogate-pair path runs.
+	for r := rune(0x300); r < 0xFF00; r += 7 {
+		points = append(points, r)
+	}
+	for r := rune(0x10000); r <= 0x10FFFF; r += 401 {
+		points = append(points, r)
+	}
+
+	// Surrogate code points cannot appear in a Go string: the compiler and
+	// utf8 both render them as U+FFFD, which is covered by the table above.
+	filtered := points[:0]
+	for _, r := range points {
+		if r < 0xD800 || r > 0xDFFF {
+			filtered = append(filtered, r)
+		}
+	}
+	points = filtered
+
+	// Batched: one python3 process per batch rather than per code point, which
+	// keeps a sweep of this size to a few seconds.
+	const batch = 256
+	for start := 0; start < len(points); start += batch {
+		end := min(start+batch, len(points))
+		data := map[string]Value{}
+		obj := map[string]string{}
+		for i, r := range points[start:end] {
+			key := "k" + strconv.Itoa(i)
+			v := string(r)
+			data[key] = S(v)
+			obj[key] = v
+		}
+		encoded, err := json.Marshal(obj)
+		if err != nil {
+			t.Fatalf("encoding fixture for batch at %d: %v", start, err)
+		}
+
+		want := pythonID(t, "sweep", "a/b", "2026-09-14T12:00:00Z", "general", string(encoded))
+		if got := DeriveID("sweep", "a/b", "2026-09-14T12:00:00Z", "general", data); got != want {
+			// Narrow to the offending code point so the failure names it.
+			for i, r := range points[start:end] {
+				one := map[string]Value{"k": S(string(r))}
+				enc, _ := json.Marshal(map[string]string{"k": string(r)})
+				w := pythonID(t, "sweep", "a/b", "2026-09-14T12:00:00Z", "general", string(enc))
+				if g := DeriveID("sweep", "a/b", "2026-09-14T12:00:00Z", "general", one); g != w {
+					t.Fatalf("code point U+%04X (index %d) diverges: go %s (%s), python %s",
+						r, start+i, g, CanonicalData(one), w)
+				}
+			}
+			t.Fatalf("batch at %d diverges (%s vs %s) but no single code point did", start, got, want)
+		}
+	}
+	t.Logf("swept %d code points with no divergence", len(points))
+}
+
+func TestNewDoesNotAliasTheCallersData(t *testing.T) {
+	// The batching shape this guards against: one map reused across a loop. With
+	// the map aliased, every cell ends up sharing the final payload while each
+	// carries the id of the payload at its own construction, so no line's id
+	// hashes to its own data and content addressing silently stops working.
+	shared := map[string]Value{"n": I(1)}
+	refs := []string{"hive:aaa"}
+	tags := []string{"first"}
+
+	c1, err := New("note", "a/b", "2026-09-14T12:00:00Z", "general", shared, refs, tags, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared["n"] = I(2)
+	refs[0] = "hive:bbb"
+	tags[0] = "second"
+
+	if got := DeriveID("note", "a/b", "2026-09-14T12:00:00Z", "general", map[string]Value{"n": I(1)}); c1.ID != got {
+		t.Errorf("cell id changed meaning after the caller mutated its map: %s, want %s", c1.ID, got)
+	}
+	if !strings.Contains(c1.Marshal(), `"n":1`) {
+		t.Errorf("marshalled cell reflects the caller's later mutation: %s", c1.Marshal())
+	}
+	if !strings.Contains(c1.Marshal(), "hive:aaa") || !strings.Contains(c1.Marshal(), "first") {
+		t.Errorf("refs or tags reflect the caller's later mutation: %s", c1.Marshal())
 	}
 }
 

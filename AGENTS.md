@@ -91,6 +91,19 @@ fleetd where                    per machine, what it was last doing
 
 Every command takes `--json`, so one surface serves a person and a program. The
 journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.
+`PROTOCOL.md` carries the cell schema and the full command reference.
+
+Two defaults are deliberate and worth knowing before you use it:
+
+- **The OS account is not recorded unless you pass `--include-user`.** These
+  records are meant to be committed, and on a domain-joined Windows host
+  `user.Current().Username` is `DOMAIN\account` — publishing it by default would
+  put the AD domain and the operator's account name into the repository on every
+  record, which would undo the care taken not to publish the machine identifier.
+- **`fleetd where` fails on a directory that does not exist** rather than
+  answering "no records". An empty answer that is indistinguishable from a
+  mistyped path is the worst available output for a tool whose only job is
+  saying which machine did something.
 
 Three things about it are load-bearing, and each exists because the naive version
 was wrong:
@@ -114,7 +127,16 @@ was wrong:
   `Record.Line` is the position the append actually committed at, which is the same
   reason the board arbitrates races by `rowid` and never by `ts`: writer clocks
   cannot be trusted. Nothing in the journal proves machine A's entry happened before
-  machine B's, and `fleetd where` says so in its own output.
+  machine B's, and `fleetd where` says so in its own output. Where machines *are*
+  ranked for display, they are compared as instants rather than as strings —
+  lexical comparison of RFC3339 is only correct when every timestamp is UTC `Z`,
+  and `hive/cell.py` writes local time with an offset.
+
+- **A line this parser cannot read never hides the records after it.** The bus is
+  open to any process that can append, including the raw uuid4 plane whose
+  records this parser rejects, so an unreadable line is an expected input rather
+  than proof the file is ruined. Every defect is reported, and every intact
+  record is still returned.
 
 **Which plane `fleetd` writes to, and why it matters.** This bus has two documented
 planes over the same files: the raw plane is plain JSONL appends with uuid4 ids,

@@ -15,3 +15,8 @@ import "os"
 func openAppend(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 }
+
+// syncDir is a no-op on Windows. Opening a directory as a file and flushing it
+// is a POSIX construct; NTFS commits the directory entry as part of the metadata
+// journal, so there is no equivalent call to make here.
+func syncDir(string) error { return nil }

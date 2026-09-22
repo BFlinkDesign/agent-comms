@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -221,39 +222,74 @@ func TestSaltAndSourceSeparateTheKeyspace(t *testing.T) {
 func TestExternalCommandIsBounded(t *testing.T) {
 	// The failure this guards against is real and recent: a sibling tool in this
 	// fleet set a 15s deadline but applied it only after unbounded reads, and was
-	// observed still running at 18.02s. Here the deadline starts before the
-	// process does, so a child that never exits is still bounded.
-	o := baseOpts()
-	o.GOOS = "linux"
-	o.LinuxIDPaths = []string{filepath.Join(t.TempDir(), "absent")}
-	o.Timeout = 150 * time.Millisecond
+	// observed still running at 18.02s.
+	//
+	// An earlier version of this test proved nothing. It built an Options with
+	// Runner=nil and a comment saying "use the real exec path", then called
+	// probeWindows with a *different*, freshly-constructed Options carrying a mock
+	// Runner — so the first value was never read, and all that was exercised was
+	// that a Runner returning ctx.Err() yields a wrapped error. go vet does not
+	// flag an unused struct field assignment, so it passed silently. That is the
+	// same "gate that cannot fail" shape this package's own comments condemn.
+	//
+	// This version runs a real child process that ignores its input and sleeps far
+	// past the deadline, through Options.run with no Runner override, so what is
+	// measured is the actual context.WithTimeout + exec.CommandContext path.
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX sleep as the slow child")
+	}
 
+	o := Options{Salt: "bounded", Timeout: 200 * time.Millisecond}
 	start := time.Now()
-	// Probe windows explicitly so a real command runs under the deadline.
-	o.GOOS = "windows"
-	o.Runner = nil // use the real exec path
-	o.Timeout = 150 * time.Millisecond
-	_, _, err := probeWindows(Options{
-		Salt: o.Salt, GOOS: "windows", Timeout: 150 * time.Millisecond,
-		Runner: func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(10 * time.Second):
-				return []byte("never reached"), nil
-			}
-		},
-	})
+	out, err := o.run("sleep", "30")
 	elapsed := time.Since(start)
 
 	if err == nil {
-		t.Fatal("a command that outlives the deadline returned success")
+		t.Fatalf("a child that outlives the deadline returned success with %q", out)
 	}
+	// The deadline must be what stopped it, not the child exiting on its own.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("took %s against a 200ms deadline; the deadline was not enforced", elapsed)
+	}
+	t.Logf("a 30s child was stopped after %s", elapsed)
+}
+
+func TestProbeWrapsATimeoutAsNoStableSource(t *testing.T) {
+	// Separately from the real-exec test above: a caller must be able to classify
+	// a timeout as "no stable identifier" rather than having to match on strings.
+	_, _, err := probeWindows(Options{
+		Salt: "t", GOOS: "windows", Timeout: 100 * time.Millisecond,
+		Runner: func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
 	if !errors.Is(err, ErrNoStableSource) {
-		t.Errorf("err = %v, want it to wrap ErrNoStableSource so callers can classify it", err)
+		t.Errorf("err = %v, want it to wrap ErrNoStableSource", err)
 	}
-	if elapsed > 2*time.Second {
-		t.Errorf("took %s; the deadline was not enforced", elapsed)
+}
+
+func TestDeriveDegradesWhenTheRealCommandTimesOut(t *testing.T) {
+	// End to end: a probe that cannot finish in time must not stall Derive or
+	// panic, and must be reported as the weak identity it is.
+	o := Options{
+		Salt: "t", GOOS: "windows", Timeout: 100 * time.Millisecond,
+		Hostname: func() (string, error) { return "CNC-1", nil },
+		Username: func() string { return "u" },
+		Runner: func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	id := Derive(o)
+	if id.Stable || id.Source != "hostname-only" {
+		t.Errorf("Source=%q Stable=%v, want hostname-only/false", id.Source, id.Stable)
+	}
+	if id.ID == "" {
+		t.Error("ID is empty after a timeout; degradation must still produce an identifier")
 	}
 }
 

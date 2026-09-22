@@ -16,8 +16,8 @@
 // and a program reading structured output. That is what a later MCP server would
 // wrap; there is no second implementation to keep in sync.
 //
-// The journal directory is resolved from --dir, else COMMS_CHANNELS, else
-// ./channels, matching how the rest of this bus is configured.
+// The journal directory is resolved from --dir, else $COMMS_CHANNELS/journal,
+// else ./channels/journal, matching how the rest of this bus is configured.
 package main
 
 import (
@@ -41,13 +41,20 @@ const usage = `fleetd — record and answer what happened on which machine
 
 usage:
   fleetd host   [--json] [--salt S]
-  fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A]
+  fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd where  [--json] [--dir D] [--limit N]
 
-The journal directory is --dir, else $COMMS_CHANNELS, else ./channels.
---salt is --salt, else $FLEET_SALT. It separates this fleet's host digests from
-any other and must be the same on every machine, or one machine will appear as
-several. It is not a credential.
+The journal directory is --dir, else $COMMS_CHANNELS/journal, else ./channels/journal.
+The where command reports an error, rather than "no records", when that
+directory does not exist -- usually the sign of a mistyped path.
+
+The salt is --salt, else $FLEET_SALT. It separates this fleet's host digests
+from any other and must be the same on every machine, or one machine will appear
+as several. It is not a credential.
+
+The OS account name is recorded only with --include-user. These records are
+meant to be committed, and on a domain-joined host that name carries the domain
+with it.
 `
 
 func main() {
@@ -158,6 +165,8 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	branch := fs.String("branch", "", "branch the work was on")
 	agent := fs.String("agent", "", "which tool produced this, as name/role")
 	at := fs.String("at", "", "RFC3339 timestamp (default: now)")
+	includeUser := fs.Bool("include-user", false,
+		"publish the OS account name in clear; off by default because these records are committed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -173,7 +182,15 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 
 	ts := *at
 	if ts == "" {
-		ts = time.Now().UTC().Format(time.RFC3339)
+		// Nanosecond precision, not whole seconds. The cell id is derived from
+		// the content including this timestamp, so at second resolution two
+		// genuinely distinct records written in the same second produce
+		// byte-identical cells with the same id -- and since a reader is
+		// documented to collapse colliding ids, one of the two events would
+		// simply disappear while `where` still counted both. The Python writer
+		// uses isoformat(), which carries microseconds, and does not have this
+		// problem; fleetd introduced it.
+		ts = time.Now().UTC().Format(time.RFC3339Nano)
 	} else if _, err := time.Parse(time.RFC3339, ts); err != nil {
 		return fmt.Errorf("--at %q is not an RFC3339 timestamp: %w", ts, err)
 	}
@@ -189,10 +206,19 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		"host.source": cell.S(h.Source),
 		"host.stable": cell.B(h.Stable),
 	}
-	for k, v := range map[string]string{"note": *note, "repo": *repo, "branch": *branch, "user": h.User} {
+	for k, v := range map[string]string{"note": *note, "repo": *repo, "branch": *branch} {
 		if strings.TrimSpace(v) != "" {
 			data[k] = cell.S(v)
 		}
+	}
+	// The OS account is opt-in. internal/hostid goes to some length not to
+	// publish the machine's hardware identifier, and publishing the account name
+	// in the same record would undo that: on a domain-joined Windows host
+	// user.Current().Username is of the form DOMAIN\account, so the default
+	// behaviour would have committed the AD domain and the operator's account
+	// name into a repository on every record.
+	if *includeUser && strings.TrimSpace(h.User) != "" {
+		data["user"] = cell.S(h.User)
 	}
 
 	c, err := cell.New(*typ, from, ts, "journal", data, nil, nil, 0)
@@ -227,6 +253,28 @@ type whereEntry struct {
 	LastType string `json:"last_type,omitempty"`
 	LastRepo string `json:"last_repo,omitempty"`
 	LastNote string `json:"last_note,omitempty"`
+	// Recent is the entries before the last one, newest first, bounded by
+	// --limit. It is emitted in JSON as well as to a terminal, so a program and a
+	// person see the same history.
+	Recent []recentEntry `json:"recent,omitempty"`
+	// TimestampsOutOfOrder is set when this host's records were appended in an
+	// order its own timestamps disagree with. Append order is what is reported,
+	// because it is what actually happened and does not depend on a clock; when
+	// the two disagree that is worth saying rather than quietly presenting an
+	// older entry as the newest.
+	TimestampsOutOfOrder bool `json:"timestamps_out_of_order,omitempty"`
+
+	// lastAt is LastTS parsed to an instant, used for ordering. Unexported so it
+	// does not appear in the JSON: the timestamp is already there as last_ts, and
+	// a second rendering of the same fact could only disagree with it.
+	lastAt time.Time
+}
+
+type recentEntry struct {
+	TS   string `json:"ts"`
+	Type string `json:"type,omitempty"`
+	Repo string `json:"repo,omitempty"`
+	Note string `json:"note,omitempty"`
 }
 
 func cmdWhere(args []string, stdout, stderr io.Writer) error {
@@ -234,9 +282,14 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory")
-	limit := fs.Int("limit", 3, "recent records to show per machine")
+	limit := fs.Int("limit", 3,
+		"total records to show per machine, counting the most recent one (so 3 = last plus 2 before it)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if *limit < 1 {
+		return fmt.Errorf("--limit must be at least 1, got %d", *limit)
 	}
 
 	store, err := journal.Open(resolveDir(*dir))
@@ -244,6 +297,11 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	records, readErr := store.ReadAll()
+	// A store that does not exist is a different answer from a store with nothing
+	// in it, and the difference matters: the first usually means a mistyped path.
+	if errors.Is(readErr, journal.ErrNoStore) {
+		return readErr
+	}
 	// A damaged journal is reported and the intact records are still used. Refusing
 	// to answer at all because one machine's file was truncated would make a bad
 	// day worse.
@@ -265,20 +323,50 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 
 	var out []whereEntry
 	for host, recs := range byHost {
-		// File order is the ordering primitive within a host: it is the order the
-		// appends actually committed, and unlike a timestamp it cannot be wrong
-		// because a writer's clock was. Across hosts there is deliberately no total
-		// order; see the note printed below.
-		sort.SliceStable(recs, func(i, j int) bool { return recs[i].Line < recs[j].Line })
+		// Within a host the records already arrive in file order -- the order the
+		// appends actually committed -- because readFile numbers them as it reads
+		// and ReadAll keeps each host's slice contiguous. That is the ordering
+		// primitive here, and unlike a timestamp it cannot be wrong because a
+		// writer's clock was.
 		last := recs[len(recs)-1]
 		f := fieldsOf(last.Raw)
-		out = append(out, whereEntry{
+		e := whereEntry{
 			Host: host, HostName: f["host.name"], OS: f["host.os"],
 			Stable: f["host.stable"] == "true", Records: len(recs),
 			LastTS: last.TS, LastType: last.Type, LastRepo: f["repo"], LastNote: f["note"],
-		})
+			lastAt: parseTS(last.TS),
+		}
+		// --limit applies to both output forms. It used to be read only by the
+		// human branch, so a program asking --json --limit 10 silently received
+		// one entry and could not tell the flag had been ignored.
+		for i := len(recs) - 2; i >= 0 && i > len(recs)-1-*limit; i-- {
+			rf := fieldsOf(recs[i].Raw)
+			e.Recent = append(e.Recent, recentEntry{
+				TS: recs[i].TS, Type: recs[i].Type, Repo: rf["repo"], Note: rf["note"],
+			})
+		}
+		for _, r := range recs[:len(recs)-1] {
+			if parseTS(r.TS).After(e.lastAt) {
+				e.TimestampsOutOfOrder = true
+				break
+			}
+		}
+		out = append(out, e)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].LastTS > out[j].LastTS })
+	// Compared as instants, not as strings. Lexical comparison of RFC3339 is only
+	// correct when every timestamp is in UTC "Z" form, and it is not: --at accepts
+	// an offset, and hive/cell.py builds every cell's ts with
+	// datetime.now(UTC).astimezone().isoformat() -- local time with an offset --
+	// so records from the existing Python bus sorted wrong by construction. A
+	// machine could be presented as the most recent when it was in fact the
+	// oldest, which is a wrong answer to the only question this tool asks.
+	// SliceStable with a host tiebreak so equal instants do not reorder per run.
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].lastAt.Equal(out[j].lastAt) {
+			return out[i].lastAt.After(out[j].lastAt)
+		}
+		return out[i].Host < out[j].Host
+	})
 
 	if *asJSON {
 		return writeJSON(stdout, out)
@@ -288,30 +376,45 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		if name == "" {
 			name = e.Host
 		}
-		flag := ""
+		marker := ""
 		if !e.Stable {
-			flag = "  [attribution: hostname only]"
+			marker = "  [attribution: hostname only]"
 		}
-		fmt.Fprintf(stdout, "\n%s (%s, %s)%s\n", name, e.OS, plural(e.Records, "record"), flag)
+		fmt.Fprintf(stdout, "\n%s (%s, %s)%s\n", name, e.OS, plural(e.Records, "record"), marker)
 		fmt.Fprintf(stdout, "  last  %s  %s\n", e.LastTS, e.LastType)
+		if e.TimestampsOutOfOrder {
+			fmt.Fprintln(stdout, "        (appended last, but an earlier entry carries a later timestamp —")
+			fmt.Fprintln(stdout, "         append order is reported, so this machine's clock or write order is suspect)")
+		}
 		if e.LastRepo != "" {
 			fmt.Fprintf(stdout, "  repo  %s\n", e.LastRepo)
 		}
 		if e.LastNote != "" {
 			fmt.Fprintf(stdout, "  note  %s\n", e.LastNote)
 		}
-		recs := byHost[e.Host]
-		if n := *limit; n > 1 && len(recs) > 1 {
+		if len(e.Recent) > 0 {
 			fmt.Fprintln(stdout, "  before that:")
-			for i := len(recs) - 2; i >= 0 && i > len(recs)-1-n; i-- {
-				rf := fieldsOf(recs[i].Raw)
-				fmt.Fprintf(stdout, "    %s  %-12s %s\n", recs[i].TS, recs[i].Type, rf["note"])
+			for _, r := range e.Recent {
+				fmt.Fprintf(stdout, "    %s  %-12s %s\n", r.TS, r.Type, r.Note)
 			}
 		}
 	}
 	fmt.Fprintln(stdout, "\nRecords are ordered by each machine's own append order. There is no total order")
 	fmt.Fprintln(stdout, "across machines: nothing here proves machine A's entry happened before machine B's.")
 	return readErr
+}
+
+// parseTS turns a record's timestamp into an instant for comparison. A record
+// whose timestamp will not parse sorts as the zero time, i.e. last, rather than
+// being dropped: a record that arrived is evidence even when its clock field is
+// unusable, and hiding it would be the silent-guess failure again.
+func parseTS(s string) time.Time {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // fieldsOf pulls the flat string fields out of a record's data object. It reads

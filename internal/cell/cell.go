@@ -24,7 +24,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 )
 
 // Version is the cell schema version written into every cell.
@@ -105,6 +104,16 @@ func (v O) writeCanonical(b *strings.Builder) {
 	b.WriteByte('}')
 }
 
+// U+FFFD is deliberately not special-cased. An earlier version emitted it raw,
+// on the theory that Python would refuse undecodable input rather than
+// substitute; fuzzing 14,727 code points against the live hive.cell module found
+// it was the single point of divergence in the whole encoder, and the eight-case
+// conformance table did not cover it. Ranging a Go string also yields
+// utf8.RuneError for each invalid UTF-8 byte, so any note carrying a stray
+// cp1252 byte -- routine on the Windows hosts this targets -- took that path.
+// Falling through to the default branch renders it �, which is what Python
+// emits for the same character.
+//
 // writeJSONString emits a JSON string escaped the way Python's json.dumps does
 // with its default ensure_ascii=True: every non-ASCII rune becomes a \uXXXX
 // escape, and astral-plane runes become a surrogate pair. Matching this exactly
@@ -134,12 +143,6 @@ func writeJSONString(b *strings.Builder, s string) {
 				fmt.Fprintf(b, `\u%04x`, r)
 			case r < 0x7f:
 				b.WriteRune(r)
-			case r == utf8.RuneError:
-				// An invalid UTF-8 byte decodes to RuneError. Python would raise
-				// on undecodable input rather than silently substitute, so
-				// encode the replacement character explicitly and let the
-				// conformance test surface any divergence.
-				b.WriteString(`�`)
 			case r > 0xffff:
 				r -= 0x10000
 				fmt.Fprintf(b, `\u%04x\u%04x`, 0xd800+(r>>10), 0xdc00+(r&0x3ff))
@@ -172,24 +175,37 @@ var ErrEmptyField = errors.New("cell: required field is empty")
 // the caller supplies it so that callers which need a deterministic cell (tests,
 // replay, re-derivation from an existing record) can produce one.
 func New(typ, from, ts, channel string, data map[string]Value, refs, tags []string, ttl int) (Cell, error) {
-	for name, v := range map[string]string{"type": typ, "from": from, "ts": ts, "channel": channel} {
-		if strings.TrimSpace(v) == "" {
-			return Cell{}, fmt.Errorf("%w: %s", ErrEmptyField, name)
+	// An ordered slice rather than a map: Go randomises map iteration, so
+	// validating over a map would name a different missing field on each run and
+	// hand an operator a different cause every time they re-ran the same command.
+	for _, f := range []struct{ name, value string }{
+		{"type", typ}, {"from", from}, {"ts", ts}, {"channel", channel},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			return Cell{}, fmt.Errorf("%w: %s", ErrEmptyField, f.name)
 		}
 	}
-	if data == nil {
-		data = map[string]Value{}
+	// The caller's map and slices are copied, not aliased. A cell's ID is derived
+	// once at construction and the cell is documented immutable, so retaining a
+	// reference would let a caller that reuses one map across a loop -- the
+	// obvious way to write a batch -- end up with N cells that all share the final
+	// payload while each carries the ID of the payload as it stood at its own New
+	// call. Every one of those lines would then have an id that does not hash to
+	// its own data, defeating content addressing with no error raised anywhere.
+	cloned := make(map[string]Value, len(data))
+	for k, v := range data {
+		cloned[k] = v
 	}
 	return Cell{
-		ID:      DeriveID(typ, from, ts, channel, data),
+		ID:      DeriveID(typ, from, ts, channel, cloned),
 		V:       Version,
 		Type:    typ,
 		From:    from,
 		TS:      ts,
 		Channel: channel,
-		Data:    data,
-		Refs:    refs,
-		Tags:    tags,
+		Data:    cloned,
+		Refs:    append([]string(nil), refs...),
+		Tags:    append([]string(nil), tags...),
 		TTL:     ttl,
 	}, nil
 }
