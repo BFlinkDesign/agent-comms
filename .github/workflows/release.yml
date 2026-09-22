@@ -1,0 +1,107 @@
+# release — publish fleetd binaries for every machine in the fleet.
+#
+# Two ways to cut a release, both ending in the same GitHub release:
+#   - Actions > release > Run workflow on main, with a version such as
+#     fleetd-v0.1.0. The tag is created on the commit that was tested.
+#   - git tag fleetd-v0.1.0 && git push origin fleetd-v0.1.0
+#
+# The tests run first against the exact commit being released; a commit whose
+# tests fail publishes nothing. A Windows PC then installs with the published
+# script, which checks the binary against SHA256SUMS before installing it:
+#   gh release download fleetd-v0.1.0 -R BFlinkDesign/agent-comms -p install-fleetd.ps1 -D $env:TEMP --clobber
+#   powershell -ExecutionPolicy Bypass -File "$env:TEMP\install-fleetd.ps1" -Version fleetd-v0.1.0
+# After publishing, the install job does exactly that on a Windows runner.
+name: release
+
+on:
+  push:
+    tags: ["fleetd-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, e.g. fleetd-v0.1.0"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # A hand-started release is cut only from main, so a release is always a
+    # commit that passed review and CI.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+    steps:
+      - name: Check the version
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^fleetd-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like fleetd-v1.2.3, got '$TAG'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test the commit being released
+        run: go test -count=1 ./...
+
+      - name: Build every fleet target
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = "windows" ] && ext=".exe"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.version=$TAG" \
+              -o "dist/fleetd-$os-$arch$ext" ./cmd/fleetd
+          done
+          ./dist/fleetd-linux-amd64 version
+          cp scripts/install-fleetd.ps1 dist/
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "fleetd built from ${GITHUB_SHA} after its tests passed. On Windows, download install-fleetd.ps1 from this release and run it with -Version ${TAG}; it checks the binary against SHA256SUMS before installing. Elsewhere, download the binary for your platform and run sha256sum --check --ignore-missing SHA256SUMS. \`fleetd version\` prints ${TAG}."
+
+  install:
+    # The release is not done until a Windows PC can install it the way the
+    # runbook says, from the published assets.
+    needs: release
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+    steps:
+      - name: Install the published release as a person would
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern install-fleetd.ps1 --dir $env:RUNNER_TEMP --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not download install-fleetd.ps1 ($LASTEXITCODE)" }
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\install-fleetd.ps1" -Version $env:TAG -Repo $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP\bin"
+          if ($LASTEXITCODE -ne 0) { throw "install-fleetd.ps1 failed ($LASTEXITCODE)" }
+          & "$env:RUNNER_TEMP\bin\fleetd.exe" version

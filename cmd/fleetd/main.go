@@ -6,12 +6,13 @@
 // signal separating one workstation from another, so "which PC did I do that on"
 // was never answerable after the fact. fleetd records it at the time.
 //
-// Four commands, deliberately:
+// Four commands, deliberately, plus version:
 //
 //	fleetd host            what this machine is, and how confident that is
 //	fleetd record ...      append one host-attributed record
 //	fleetd sync            publish this machine's records, receive the others'
 //	fleetd where           per machine, what it was last doing
+//	fleetd version         which build this is
 //
 // Every command takes --json, so the same surface serves a person at a terminal
 // and a program reading structured output. That is what a later MCP server would
@@ -30,6 +31,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -47,6 +50,7 @@ usage:
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
   fleetd where  [--json] [--dir D] [--limit N]
+  fleetd version
 
 The journal directory is --dir, else $COMMS_CHANNELS/journal, else ./channels/journal.
 The where command reports an error, rather than "no records", when that
@@ -68,6 +72,41 @@ The OS account name is recorded only with --include-user. These records are
 meant to be committed, and on a domain-joined host that name carries the domain
 with it.
 `
+
+// version is set by the release build (-ldflags "-X main.version=fleetd-v1.2.3").
+// Any other build reports "dev" and, when Go recorded it, the commit it was
+// built from, so two machines can always tell whether they run the same fleetd.
+var version = "dev"
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	rev, dirty := "", false
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	switch {
+	case rev == "":
+		return version
+	case dirty:
+		return version + "-" + rev + "-modified"
+	default:
+		return version + "-" + rev
+	}
+}
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -93,6 +132,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdSync(args[1:], stdout, stderr)
 	case "where":
 		return cmdWhere(args[1:], stdout, stderr)
+	case "version", "--version":
+		fmt.Fprintln(stdout, "fleetd", buildVersion(), runtime.GOOS+"/"+runtime.GOARCH)
+		return nil
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return nil

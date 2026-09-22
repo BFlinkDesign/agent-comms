@@ -1,0 +1,258 @@
+# auto-merge — ask GitHub to squash-merge each ready pull request once its
+# required checks pass.
+#
+# GitHub enforces the requirement. This workflow never decides that a PR is green:
+# it turns on GitHub's native auto-merge, and GitHub merges only after every check
+# the default branch's rules require has passed on the PR's exact head commit. If
+# the default branch requires nothing, auto-merge would merge at once, so this
+# workflow refuses and says so instead.
+#
+# It runs on pull_request_target, so the logic below always comes from the default
+# branch and a pull request cannot change how it is judged here. It never checks
+# out or runs code from the pull request, and it decides from the pull request as
+# it is now, never from the event that started the run. A pull request that changes
+# which checks exist or how they are configured (.github/workflows, .github/actions,
+# .pre-commit-config.yaml, semgrep configuration) is never auto-merged: a person
+# merges it, and it gets one comment saying so.
+#
+# Known limit: the checks run the pull request's own tests and tool settings. A
+# change that weakens a test together with the code it tests, or that changes how
+# a check behaves through test-runner or linter settings (package.json scripts,
+# pyproject.toml, .flake8 and the like), still passes; nothing short of a human
+# review of every change catches that.
+#
+# The requirement is configured once per repository by dev-setup's
+# scripts/auto-merge/apply.ts. This file is identical in every repository;
+# dev-setup holds the canonical copy and apply.ts reports any copy that drifts.
+#
+# To stop a merge, add the `hold` (or `do-not-merge`) label, in any letter case.
+# Removing it turns auto-merge back on.
+#
+# Merges made this way are attributed to github-actions[bot], and GitHub starts no
+# workflow runs for events caused by the workflow token — so `push` workflows on
+# the default branch do not run after these merges. The required checks already
+# ran on the exact tree that lands, because the rules require the branch to be up
+# to date before merging.
+name: auto-merge
+
+on: # zizmor: ignore[dangerous-triggers] never checks out or executes pull request code
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize, edited, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    # Same-repository PRs only: fork PRs are never merged automatically, and
+    # Dependabot-triggered runs get a read-only token. A draft runs only to switch
+    # auto-merge off, an edit only when the base branch changed, and a label change
+    # only when it is a hold label; skipped jobs cost no Actions minutes.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event.pull_request.draft == false || github.event.action == 'converted_to_draft') &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
+      (
+        !contains(fromJSON('["labeled","unlabeled"]'), github.event.action) ||
+        contains(fromJSON('["hold","do-not-merge"]'), github.event.label.name)
+      )
+    # Per pull request, the newest event wins. Declared on the job rather than the
+    # workflow so that a run whose job is skipped cannot cancel one that is running.
+    concurrency:
+      group: auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      checks: read
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: read
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const HOLD_LABELS = ['hold', 'do-not-merge'];
+            // Files that decide which checks run and how. Compared in lower case.
+            const GUARDED = ['.github/workflows/', '.github/actions/', '.pre-commit-config.yaml', '.semgrepignore', '.semgrep.yml', '.semgrep.yaml', '.semgrep/'];
+            const GUARD_MARKER = '<!-- auto-merge:guarded -->';
+            const GREEN = new Set(['success', 'neutral', 'skipped']);
+            const POLL_MS = 20000;
+            const MAX_POLLS = 30;
+            const ENABLE = `mutation($id: ID!) {
+              enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: SQUASH }) { clientMutationId }
+            }`;
+            const DISABLE = `mutation($id: ID!) {
+              disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId }
+            }`;
+
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            const defaultBranch = context.payload.repository.default_branch;
+            const held = (labels) => labels.some((label) => HOLD_LABELS.includes(label.name.toLowerCase()));
+            // Runs can start in a different order than their events happened, so
+            // decide from the pull request as it is now, not from the event payload.
+            const { data: pr } = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+              owner, repo, pull_number: number,
+            });
+            if (pr.state !== 'open') return core.info(`#${number} is ${pr.state}.`);
+
+            async function switchOff(reason) {
+              try {
+                await github.graphql(DISABLE, { id: pr.node_id });
+                core.notice(`Auto-merge is off for #${number}: ${reason}.`);
+              } catch (error) {
+                core.info(`Auto-merge was not on for #${number} (${reason}): ${error.message}`);
+              }
+            }
+
+            if (pr.draft) return switchOff('it is a draft');
+            if (pr.base.ref !== defaultBranch) return switchOff(`it targets ${pr.base.ref}, not ${defaultBranch}`);
+            if (held(pr.labels)) return switchOff('it carries a hold label');
+
+            // A person merges a change to the checks themselves: it changes what
+            // "green" means. So does a PR too large for its file list to be read whole.
+            async function needsPerson(reason, detail) {
+              await switchOff(reason);
+              const comments = await github.paginate('GET /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              if (!comments.some((comment) => (comment.body ?? '').includes(GUARD_MARKER))) {
+                await github.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+                  owner, repo, issue_number: number,
+                  body: `${GUARD_MARKER}\n${detail} Review it and merge it by hand.`,
+                });
+              }
+            }
+            const files = await github.paginate('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            if (files.length < pr.changed_files) {
+              return needsPerson('its file list is too long to check',
+                `This pull request changes ${pr.changed_files} files and GitHub lists only ${files.length}, ` +
+                'so it cannot be checked for changes to CI and is not merged automatically.');
+            }
+            const guarded = [...new Set(files
+              .flatMap((file) => [file.filename, file.previous_filename])
+              .filter((path) => typeof path === 'string' && GUARDED.some((prefix) => path.toLowerCase().startsWith(prefix))))];
+            if (guarded.length > 0) {
+              return needsPerson('it changes CI',
+                `This pull request changes CI (${guarded.join(', ')}), so it is not merged automatically: ` +
+                'a change to the checks changes what "green" means.');
+            }
+
+            // Never ask GitHub to merge into a branch that requires no checks:
+            // with nothing to wait for, auto-merge would merge at once.
+            const required = new Set();
+            const rules = await github.paginate('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+              owner, repo, branch: defaultBranch, per_page: 100,
+            });
+            for (const rule of rules) {
+              if (rule.type !== 'required_status_checks') continue;
+              for (const check of rule.parameters?.required_status_checks ?? []) required.add(check.context);
+            }
+            try {
+              const { data: branch } = await github.request('GET /repos/{owner}/{repo}/branches/{branch}', {
+                owner, repo, branch: defaultBranch,
+              });
+              const classic = branch.protection?.required_status_checks;
+              if (classic && classic.enforcement_level !== 'off') {
+                for (const name of classic.contexts ?? []) required.add(name);
+              }
+            } catch (error) {
+              core.info(`Classic branch protection is not readable here: ${error.message}`);
+            }
+            if (required.size === 0) {
+              core.warning(
+                `${defaultBranch} requires no status checks, so GitHub would merge #${number} without waiting for CI. ` +
+                'Auto-merge stays off. Configure the gate with dev-setup scripts/auto-merge/apply.ts.',
+              );
+              return;
+            }
+            const requiredList = [...required].sort().join(', ');
+
+            try {
+              await github.graphql(ENABLE, { id: pr.node_id });
+              core.notice(`Auto-merge is on: GitHub will squash-merge #${number} once ${requiredList} pass.`);
+              return;
+            } catch (error) {
+              if (/not allowed for this repository/i.test(error.message)) {
+                core.warning(
+                  'Auto-merge is switched off in this repository\'s settings. ' +
+                  'Run dev-setup scripts/auto-merge/apply.ts to switch it on.',
+                );
+                return;
+              }
+              // GitHub refuses to enable auto-merge on a PR that is already
+              // mergeable. Anything else is unexpected and must be visible.
+              if (!/(clean|unstable|has_hooks) status/i.test(error.message)) throw error;
+            }
+
+            // The branch rules are already satisfied. Merge now, but only when every
+            // check and status on the head commit is green — not merely the required
+            // ones — and has stayed the same across two reads, so a check that starts
+            // late is seen. Every read also re-checks draft, base and hold labels.
+            let previous = '';
+            for (let poll = 1; ; poll++) {
+              const { data: fresh } = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                owner, repo, pull_number: number,
+              });
+              if (fresh.state !== 'open' || fresh.draft || fresh.base.ref !== defaultBranch || held(fresh.labels)) {
+                core.info(`#${number} is no longer an open, ready, unheld pull request into ${defaultBranch}.`);
+                return;
+              }
+              const sha = fresh.head.sha;
+              const runs = await github.paginate('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+                owner, repo, ref: sha, per_page: 100,
+              });
+              const statuses = await github.paginate('GET /repos/{owner}/{repo}/commits/{ref}/statuses', {
+                owner, repo, ref: sha, per_page: 100,
+              });
+              // The statuses list is newest first and keeps every update; the first
+              // entry for each context is its current state.
+              const current = new Map();
+              for (const status of statuses) if (!current.has(status.context)) current.set(status.context, status.state);
+              const red = [
+                ...runs.filter((run) => run.status === 'completed' && !GREEN.has(run.conclusion)).map((run) => run.name),
+                ...[...current].filter(([, state]) => state === 'failure' || state === 'error').map(([context]) => context),
+              ];
+              const running = [
+                ...runs.filter((run) => run.status !== 'completed').map((run) => run.name),
+                ...[...current].filter(([, state]) => state === 'pending').map(([context]) => context),
+              ];
+              if (red.length > 0) {
+                core.warning(`Not merging #${number}: ${red.join(', ')} did not pass on ${sha.slice(0, 7)}.`);
+                return;
+              }
+              const seen = JSON.stringify([sha, runs.map((run) => run.name).sort(), [...current.keys()].sort()]);
+              if (running.length > 0 || seen !== previous) {
+                if (poll >= MAX_POLLS) {
+                  core.warning(`Not merging #${number}: ${running.join(', ') || 'its checks'} still changing on ${sha.slice(0, 7)}.`);
+                  return;
+                }
+                if (running.length > 0) core.info(`Waiting for ${running.join(', ')} (${poll}/${MAX_POLLS}).`);
+                previous = running.length > 0 ? '' : seen;
+                await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+                continue;
+              }
+              try {
+                await github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', {
+                  owner, repo, pull_number: number, sha, merge_method: 'squash',
+                });
+                core.notice(`Squash-merged #${number} at ${sha.slice(0, 7)}: every check passed.`);
+                return;
+              } catch (error) {
+                // 409: the head moved after it was read. 405: GitHub's rules
+                // refused the merge. Either way the PR now has checks to wait
+                // for, so hand it to auto-merge rather than stopping here.
+                if (error.status !== 409 && error.status !== 405) throw error;
+                try {
+                  await github.graphql(ENABLE, { id: pr.node_id });
+                  core.notice(`#${number} changed while merging; auto-merge is on instead.`);
+                } catch (retry) {
+                  core.warning(`Could not merge #${number} or turn auto-merge on: ${retry.message}`);
+                }
+                return;
+              }
+            }
