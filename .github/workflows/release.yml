@@ -34,8 +34,10 @@ jobs:
       contents: write
     env:
       TAG: ${{ inputs.version }}
-    # The token is given only to the steps that call GitHub, never to the steps
-    # that run the repository's own code.
+    # The token is given only to the steps that call GitHub; the test and build
+    # steps, which run the repository's Go code, do not get it. The last step
+    # does run install-fleetd.ps1 with it, and every step here runs code from
+    # main, which only reviewed changes reach.
     steps:
       - name: Check the version is well formed and new
         shell: bash

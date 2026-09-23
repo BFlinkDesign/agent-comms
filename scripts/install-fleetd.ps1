@@ -87,19 +87,25 @@ $exe = Join-Path $Destination 'fleetd.exe'
 
 # Check the very file that will be installed, and replace the working copy only
 # once it has passed. The .exe extension lets it run for the version check.
+# A fleetd.exe that is running cannot be replaced; the move then fails and the
+# running copy stays installed.
 $staged = Join-Path $Destination 'fleetd.new.exe'
-Copy-Item -Force -Path (Join-Path $work $asset) -Destination $staged
-$have = Get-Sha256 $staged
-if ($have -ne $want) {
-    Remove-Item -Force -Path $staged
-    throw "checksum mismatch for ${asset}: SHA256SUMS says $want, the downloaded file is $have. Nothing was installed."
+try {
+    Copy-Item -Force -Path (Join-Path $work $asset) -Destination $staged
+    $have = Get-Sha256 $staged
+    if ($have -ne $want) {
+        throw "checksum mismatch for ${asset}: SHA256SUMS says $want, the downloaded file is $have. Nothing was installed."
+    }
+    $reported = & $staged version
+    if ($LASTEXITCODE -ne 0 -or "$reported" -notlike "fleetd $Version *") {
+        throw "the downloaded fleetd reports '$reported', expected $Version. Nothing was installed."
+    }
+    Move-Item -Force -Path $staged -Destination $exe
+} finally {
+    # Whatever stopped the install, including App Control refusing to run the
+    # staged file, it is not left behind.
+    Remove-Item -Force -Path $staged -ErrorAction SilentlyContinue
 }
-$reported = & $staged version
-if ($LASTEXITCODE -ne 0 -or "$reported" -notlike "fleetd $Version *") {
-    Remove-Item -Force -Path $staged
-    throw "the downloaded fleetd reports '$reported', expected $Version. Nothing was installed."
-}
-Move-Item -Force -Path $staged -Destination $exe
 
 # The user PATH, exactly as stored: reg.exe does not expand %VARIABLES%.
 $kind = 'REG_EXPAND_SZ'
@@ -120,7 +126,8 @@ if ($found) {
 }
 $present = $false
 foreach ($entry in $raw -split ';') {
-    $expanded = $entry -replace '%USERPROFILE%', $env:USERPROFILE
+    # "$$" is how a replacement string spells a literal "$".
+    $expanded = $entry -replace '%USERPROFILE%', $env:USERPROFILE.Replace('$', '$$')
     if ($expanded.TrimEnd('\') -eq $Destination) { $present = $true }
 }
 if (-not $present) {
