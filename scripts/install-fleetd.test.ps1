@@ -1,7 +1,10 @@
 # Tests install-fleetd.ps1 on Windows the way a person runs it: in a fresh
 # Windows PowerShell, in full language mode and in the constrained language mode
-# App Control applies to unsigned scripts. Run from the repository root, after
-# building dist\fleetd-windows-amd64.exe stamped fleetd-v0.0.0 and its SHA256SUMS.
+# App Control applies to unsigned scripts. The runner has no App Control policy,
+# so the constrained runs switch the session into that mode first, the way
+# about_Language_Modes describes, and a probe proves the mode really restricts.
+# Run from the repository root, after building dist\fleetd-windows-amd64.exe
+# stamped fleetd-v0.0.0 and its SHA256SUMS.
 
 $ErrorActionPreference = 'Stop'
 $installer = Join-Path $PSScriptRoot 'install-fleetd.ps1'
@@ -26,29 +29,33 @@ function Get-UserPath {
     return @{ Kind = $kind; Value = $value }
 }
 
+$constrain = "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'"
+
 # Runs the installer in a fresh Windows PowerShell and returns its exit code. What
 # it printed is shown and kept in $script:lastOutput.
 function Invoke-Installer([string]$from, [string]$destination, [bool]$constrained) {
     # The installer reports failure on stderr; that is output to check here, not
     # a reason for this script to stop.
     $ErrorActionPreference = 'Continue'
-    if ($constrained) { $env:__PSLockdownPolicy = '4' }
-    try {
+    if ($constrained) {
+        $command = "$constrain; & '$installer' -Version 'fleetd-v0.0.0' -From '$from' -Destination '$destination'"
+        $output = powershell -NoProfile -ExecutionPolicy Bypass -Command $command 2>&1
+    } else {
         $output = powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Version 'fleetd-v0.0.0' -From $from -Destination $destination 2>&1
-        $code = $LASTEXITCODE
-    } finally {
-        Remove-Item Env:__PSLockdownPolicy -ErrorAction SilentlyContinue
     }
+    $code = $LASTEXITCODE
     $script:lastOutput = $output | Out-String
     Write-Host $script:lastOutput
     return $code
 }
 
-# The constrained run proves something only if constrained mode really engages.
-$env:__PSLockdownPolicy = '4'
-$mode = powershell -NoProfile -Command '$ExecutionContext.SessionState.LanguageMode'
-Remove-Item Env:__PSLockdownPolicy
-if ("$mode".Trim() -ne 'ConstrainedLanguage') { Fail "could not simulate constrained language mode (got '$mode')" }
+# The constrained runs prove something only if the mode engages and restricts:
+# arbitrary C# through Add-Type is one of the things it forbids.
+$probe = powershell -NoProfile -Command "$constrain; `$ExecutionContext.SessionState.LanguageMode; try { Add-Type -TypeDefinition 'public class FleetdProbe {}' -ErrorAction Stop; 'Add-Type allowed' } catch { 'Add-Type blocked' }"
+Write-Output "constrained probe: $probe"
+if ("$probe" -notmatch 'ConstrainedLanguage' -or "$probe" -notmatch 'Add-Type blocked') {
+    Fail "could not put Windows PowerShell into a restricting constrained language mode (probe said '$probe')"
+}
 
 $before = Get-UserPath
 Write-Output "user PATH before: $($before.Kind) $($before.Value)"
