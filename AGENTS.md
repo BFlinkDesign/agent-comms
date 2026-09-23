@@ -86,8 +86,33 @@ through the documented extension point — any process that can append a file.
 ```
 fleetd host                     what this machine is, and how much that is worth
 fleetd record --type T --note N append one host-attributed record
+fleetd sync                     publish this machine's records, receive the others'
 fleetd where                    per machine, what it was last doing
 ```
+
+`fleetd sync` is what makes the answer cross-machine. The journal directory is
+the root of a clone of one journal repository that fleetd owns. Sync never
+rebases, merges or stashes, and never writes this machine's own file, which
+`fleetd record` may be appending to at that moment. Instead it:
+
+- snapshots the file up to its last complete record;
+- builds a commit on top of the remote tip with git plumbing (`hash-object`,
+  `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
+  lost a race to another machine at most three times;
+- then brings in every file the remote changed or deleted. A file with changes
+  the remote does not have (another identity's unpublished records on this
+  machine, or an edit made by hand) is never overwritten; sync names it.
+
+Two machines can collide only by deriving the same host id. That is detected by
+content: the remote copy of this machine's file must be a prefix of the local one,
+ignoring the CRLF line endings git for Windows checks files out with; records are
+always published with LF. A clone with commits fleetd did not make is refused,
+never pushed and never discarded; the error names
+`git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
+Every git call is bounded by `--timeout`. Prompts, hooks and commit signing are
+all disabled, so a sync never waits for input. ssh runs in batch mode unless you
+chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
+which is used as is.
 
 Every command takes `--json`, so one surface serves a person and a program. The
 journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.

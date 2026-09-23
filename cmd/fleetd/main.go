@@ -6,10 +6,11 @@
 // signal separating one workstation from another, so "which PC did I do that on"
 // was never answerable after the fact. fleetd records it at the time.
 //
-// Three commands, deliberately:
+// Four commands, deliberately:
 //
 //	fleetd host            what this machine is, and how confident that is
 //	fleetd record ...      append one host-attributed record
+//	fleetd sync            publish this machine's records, receive the others'
 //	fleetd where           per machine, what it was last doing
 //
 // Every command takes --json, so the same surface serves a person at a terminal
@@ -21,6 +22,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,6 +35,7 @@ import (
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/cell"
+	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 	"github.com/BFlinkDesign/agent-comms/internal/hostid"
 	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
@@ -42,6 +45,7 @@ const usage = `fleetd — record and answer what happened on which machine
 usage:
   fleetd host   [--json] [--salt S]
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
+  fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
   fleetd where  [--json] [--dir D] [--limit N]
 
 The journal directory is --dir, else $COMMS_CHANNELS/journal, else ./channels/journal.
@@ -51,6 +55,14 @@ directory does not exist -- usually the sign of a mistyped path.
 The salt is --salt, else $FLEET_SALT. It separates this fleet's host digests
 from any other and must be the same on every machine, or one machine will appear
 as several. It is not a credential.
+
+sync needs the journal directory to be the root of a clone of the journal
+repository, used for nothing else. It publishes only this machine's file, as of
+its last complete record, in a commit built on top of the remote; it never
+rebases and never writes this machine's file, so a record written during a sync
+is never lost. Each machine writes only its own file, so machines never
+conflict. A file with changes the remote does not have is never overwritten;
+sync names it instead.
 
 The OS account name is recorded only with --include-user. These records are
 meant to be committed, and on a domain-joined host that name carries the domain
@@ -77,6 +89,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdHost(args[1:], stdout, stderr)
 	case "record":
 		return cmdRecord(args[1:], stdout, stderr)
+	case "sync":
+		return cmdSync(args[1:], stdout, stderr)
 	case "where":
 		return cmdWhere(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
@@ -240,6 +254,48 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		})
 	}
 	fmt.Fprintf(stdout, "%s  recorded on %s\n", c.ID, h.Name)
+	return nil
+}
+
+func cmdSync(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	asJSON := fs.Bool("json", false, "emit JSON")
+	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ./channels/journal)")
+	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *timeout <= 0 {
+		return errors.New("--timeout must be positive")
+	}
+	h := identity(resolveSalt(*salt, stderr))
+	store, err := journal.Open(resolveDir(*dir))
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	res, err := gitsync.Sync(ctx, gitsync.Options{
+		Dir:     store.Dir(),
+		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
+		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(stdout, res)
+	}
+	fmt.Fprintf(stdout, "published %s from %s; received %s from other machines; journal at %.7s\n",
+		plural(res.Published, "record"), h.Name, plural(res.Received, "commit"), res.Head)
+	if len(res.Kept) > 0 {
+		fmt.Fprintf(stdout, "kept this machine's copy of %s: it has changes the remote does not have.\n"+
+			"  Another identity's journal file is published by syncing with that identity's salt. For anything else,\n"+
+			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
+			strings.Join(res.Kept, ", "), store.Dir())
+	}
 	return nil
 }
 
