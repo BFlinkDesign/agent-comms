@@ -86,5 +86,12 @@ if ($code -eq 0) { Fail 'a binary that does not match SHA256SUMS was accepted' }
 if ($script:lastOutput -notmatch 'checksum mismatch') { Fail 'the refusal does not say the checksum did not match' }
 if (Test-Path (Join-Path $destination 'fleetd.exe')) { Fail 'a binary that does not match SHA256SUMS was installed' }
 
-if ($failures) { throw "$failures install check(s) failed" }
+# The exit code is this script's verdict. GitHub's powershell shell otherwise ends
+# with the exit code of the last native command, which here is the tampered
+# install that is meant to fail.
+if ($failures) {
+    Write-Output "$failures install check(s) failed"
+    exit 1
+}
 Write-Output 'install-fleetd.ps1: all checks passed in full and constrained language mode'
+exit 0
