@@ -35,6 +35,23 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# SHA-256 of a file. Windows PowerShell 5.1 implements Get-FileHash in script,
+# and that script cannot create its hasher in constrained language mode; certutil
+# is a signed Windows tool that works in any mode.
+function Get-Sha256([string]$Path) {
+    try {
+        return (Get-FileHash -Path $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch {
+        $out = certutil -hashfile $Path SHA256
+        if ($LASTEXITCODE -ne 0) { throw "could not hash ${Path}: $out" }
+        foreach ($line in $out) {
+            $hex = $line -replace '\s', ''
+            if ($hex -match '^[0-9a-fA-F]{64}$') { return $hex }
+        }
+        throw "certutil printed no SHA-256 for ${Path}: $out"
+    }
+}
+
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 $asset = "fleetd-windows-$arch.exe"
 
@@ -57,7 +74,7 @@ foreach ($line in Get-Content -Path (Join-Path $work 'SHA256SUMS')) {
     if ($fields.Count -eq 2 -and ($fields[1] -replace '^\*', '') -eq $asset) { $want = $fields[0] }
 }
 if (-not $want) { throw "SHA256SUMS in $work has no line for $asset. Nothing was installed." }
-$have = (Get-FileHash -Path (Join-Path $work $asset) -Algorithm SHA256).Hash
+$have = Get-Sha256 (Join-Path $work $asset)
 if ($have -ne $want) {
     throw "checksum mismatch for ${asset}: SHA256SUMS says $want, the downloaded file is $have. Nothing was installed."
 }
