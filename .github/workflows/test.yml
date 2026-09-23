@@ -124,3 +124,36 @@ jobs:
             fi
           done
           exit "$failed"
+
+  install-script:
+    # install-fleetd.ps1 is what a person runs on each PC, so it is tested where
+    # it runs: Windows PowerShell on Windows, in full language mode and in the
+    # constrained language mode App Control applies to unsigned scripts, against
+    # a stand-in release built from this commit.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build a stand-in release
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir dist
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-X main.version=fleetd-v0.0.0" \
+            -o dist/fleetd-windows-amd64.exe ./cmd/fleetd
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          # A correctly summed binary that reports another version, which the
+          # installer must refuse without disturbing the installed copy.
+          mkdir dist-wrong
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-X main.version=fleetd-v9.9.9" \
+            -o dist-wrong/fleetd-windows-amd64.exe ./cmd/fleetd
+          (cd dist-wrong && sha256sum -- * > SHA256SUMS)
+      - name: Install in each language mode; refuse tampered and wrong-version binaries
+        shell: powershell
+        run: ./scripts/install-fleetd.test.ps1

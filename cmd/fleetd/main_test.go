@@ -443,3 +443,24 @@ func TestPluralReadsLikeEnglish(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionNamesTheBuildAndPlatform(t *testing.T) {
+	stdout, _, err := exec(t, "version")
+	if err != nil {
+		t.Fatalf("version failed: %v", err)
+	}
+	fields := strings.Fields(stdout)
+	if len(fields) != 3 || fields[0] != "fleetd" || !strings.HasPrefix(fields[1], "dev") || !strings.Contains(fields[2], "/") {
+		t.Errorf("version printed %q, want \"fleetd dev[-<commit>] <os>/<arch>\"", stdout)
+	}
+}
+
+func TestAReleaseBuildReportsItsTag(t *testing.T) {
+	old := version
+	version = "fleetd-v9.8.7"
+	defer func() { version = old }()
+	stdout, _, err := exec(t, "--version")
+	if err != nil || !strings.HasPrefix(stdout, "fleetd fleetd-v9.8.7 ") {
+		t.Errorf("--version printed %q (err %v), want the tag the release build set", stdout, err)
+	}
+}
