@@ -4,11 +4,13 @@
 # so the constrained runs switch the session into that mode first, the way
 # about_Language_Modes describes, and a probe proves the mode really restricts.
 # Run from the repository root, after building dist\fleetd-windows-amd64.exe
-# stamped fleetd-v0.0.0 and its SHA256SUMS.
+# stamped fleetd-v0.0.0 with its SHA256SUMS, and the same in dist-wrong stamped
+# with another version.
 
 $ErrorActionPreference = 'Stop'
 $installer = Join-Path $PSScriptRoot 'install-fleetd.ps1'
 $dist = Resolve-Path 'dist'
+$wrong = Resolve-Path 'dist-wrong'
 $failures = 0
 
 function Fail([string]$message) {
@@ -85,6 +87,27 @@ $code = Invoke-Installer $tampered $destination $false
 if ($code -eq 0) { Fail 'a binary that does not match SHA256SUMS was accepted' }
 if ($script:lastOutput -notmatch 'checksum mismatch') { Fail 'the refusal does not say the checksum did not match' }
 if (Test-Path (Join-Path $destination 'fleetd.exe')) { Fail 'a binary that does not match SHA256SUMS was installed' }
+
+# A download that reports the wrong version must leave the working fleetd.exe as
+# it was, not replace it with one that failed its check.
+$destination = Join-Path $env:RUNNER_TEMP 'fleetd-bin-full'
+$code = Invoke-Installer $wrong $destination $false
+if ($code -eq 0) { Fail 'a binary reporting the wrong version was accepted' }
+$reported = & (Join-Path $destination 'fleetd.exe') version
+if ("$reported" -notlike 'fleetd fleetd-v0.0.0 windows/*') { Fail "a failed install replaced the working fleetd.exe; it now reports '$reported'" }
+if (Test-Path (Join-Path $destination 'fleetd.new.exe')) { Fail 'a failed install left fleetd.new.exe behind' }
+
+# A PATH entry written with %USERPROFILE% is the same directory as its expansion,
+# so installing there must not add a second, expanded copy.
+$entry = @(((Get-UserPath).Value -split ';') | Where-Object { $_ -like '%USERPROFILE%\*' }) | Select-Object -First 1
+if ($entry) {
+    $before = (Get-UserPath).Value
+    $code = Invoke-Installer $dist ($entry -replace '%USERPROFILE%', $env:USERPROFILE) $false
+    if ($code -ne 0) { Fail "installing into the existing PATH entry $entry exited $code" }
+    if ((Get-UserPath).Value -ne $before) { Fail "installing into the existing PATH entry $entry changed the user PATH" }
+} else {
+    Write-Output 'skipped the %USERPROFILE% check: the user PATH has no such entry here'
+}
 
 # The exit code is this script's verdict. GitHub's powershell shell otherwise ends
 # with the exit code of the last native command, which here is the tampered

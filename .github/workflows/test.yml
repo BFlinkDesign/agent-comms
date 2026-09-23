@@ -148,6 +148,12 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-X main.version=fleetd-v0.0.0" \
             -o dist/fleetd-windows-amd64.exe ./cmd/fleetd
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
-      - name: Install twice in each language mode, and refuse a tampered binary
+          # A correctly summed binary that reports another version, which the
+          # installer must refuse without disturbing the installed copy.
+          mkdir dist-wrong
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-X main.version=fleetd-v9.9.9" \
+            -o dist-wrong/fleetd-windows-amd64.exe ./cmd/fleetd
+          (cd dist-wrong && sha256sum -- * > SHA256SUMS)
+      - name: Install in each language mode; refuse tampered and wrong-version binaries
         shell: powershell
         run: ./scripts/install-fleetd.test.ps1

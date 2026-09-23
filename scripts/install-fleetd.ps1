@@ -3,9 +3,12 @@
 Installs one fleetd release on this PC, after checking it against the release's SHA256SUMS.
 
 .DESCRIPTION
-Downloads fleetd for this PC's architecture with gh, refuses it unless its SHA-256
-matches SHA256SUMS, copies it to -Destination as fleetd.exe, checks that it reports
-the requested version, and adds -Destination to the user PATH once.
+Downloads fleetd for this PC's architecture with gh, stages it next to the
+installed copy, and only if the staged file matches SHA256SUMS and reports the
+requested version does it replace fleetd.exe in -Destination; a failed install
+leaves the previous fleetd.exe as it was. It then adds -Destination to the user
+PATH once, and sets FLEETD_HOME with setx, which also tells running programs that
+the environment changed.
 
 The PATH is read and written with reg.exe so its registry type is kept: a PATH of
 type REG_EXPAND_SZ holding %USERPROFILE% entries stays that way, where
@@ -52,7 +55,8 @@ function Get-Sha256([string]$Path) {
     }
 }
 
-$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+# PROCESSOR_ARCHITEW6432 is set when an emulated x64 PowerShell runs on ARM64.
+$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'arm64' } else { 'amd64' }
 $asset = "fleetd-windows-$arch.exe"
 
 if ($From) {
@@ -74,18 +78,28 @@ foreach ($line in Get-Content -Path (Join-Path $work 'SHA256SUMS')) {
     if ($fields.Count -eq 2 -and ($fields[1] -replace '^\*', '') -eq $asset) { $want = $fields[0] }
 }
 if (-not $want) { throw "SHA256SUMS in $work has no line for $asset. Nothing was installed." }
-$have = Get-Sha256 (Join-Path $work $asset)
+
+# An absolute path with no trailing backslash: it is written into PATH, and a
+# trailing backslash before a closing quote would break the reg.exe command line.
+New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+$Destination = (Convert-Path -LiteralPath $Destination).TrimEnd('\')
+$exe = Join-Path $Destination 'fleetd.exe'
+
+# Check the very file that will be installed, and replace the working copy only
+# once it has passed. The .exe extension lets it run for the version check.
+$staged = Join-Path $Destination 'fleetd.new.exe'
+Copy-Item -Force -Path (Join-Path $work $asset) -Destination $staged
+$have = Get-Sha256 $staged
 if ($have -ne $want) {
+    Remove-Item -Force -Path $staged
     throw "checksum mismatch for ${asset}: SHA256SUMS says $want, the downloaded file is $have. Nothing was installed."
 }
-
-New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-$exe = Join-Path $Destination 'fleetd.exe'
-Copy-Item -Force -Path (Join-Path $work $asset) -Destination $exe
-$reported = & $exe version
+$reported = & $staged version
 if ($LASTEXITCODE -ne 0 -or "$reported" -notlike "fleetd $Version *") {
-    throw "the installed fleetd reports '$reported', expected $Version"
+    Remove-Item -Force -Path $staged
+    throw "the downloaded fleetd reports '$reported', expected $Version. Nothing was installed."
 }
+Move-Item -Force -Path $staged -Destination $exe
 
 # The user PATH, exactly as stored: reg.exe does not expand %VARIABLES%.
 $kind = 'REG_EXPAND_SZ'
@@ -106,9 +120,16 @@ if ($found) {
 }
 $present = $false
 foreach ($entry in $raw -split ';') {
-    if ($entry.TrimEnd('\') -eq $Destination.TrimEnd('\')) { $present = $true }
+    $expanded = $entry -replace '%USERPROFILE%', $env:USERPROFILE
+    if ($expanded.TrimEnd('\') -eq $Destination) { $present = $true }
 }
 if (-not $present) {
+    # reg.exe output passes through the console code page, which shows what it
+    # cannot represent as "?", and Windows PowerShell passes quotes to native
+    # programs unreliably. Rather than risk writing a damaged PATH, stop.
+    if ($raw -match '["?]') {
+        throw "your user PATH holds a character this script cannot rewrite safely. fleetd is installed at $exe; add $Destination to your user PATH by hand."
+    }
     $new = if (-not $raw) { $Destination } elseif ($raw.EndsWith(';')) { "$raw$Destination" } else { "$raw;$Destination" }
     reg add 'HKCU\Environment' /v Path /t $kind /d $new /f | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not add $Destination to the user PATH (reg add exit $LASTEXITCODE)" }
