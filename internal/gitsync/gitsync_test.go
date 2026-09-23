@@ -621,3 +621,92 @@ func TestASyncInterruptedWhileBringingFilesInIsRepairedByTheNext(t *testing.T) {
 		t.Fatalf("the next sync did not bring in what the interrupted one missed: %q", got)
 	}
 }
+
+func TestARemoteLinkCannotMakeASyncDeleteOutsideTheClone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	write(t, victim, "not the journal's\n")
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	commitByHand(t, admin, func(dir string) {
+		if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(dir, "d", "victim.txt"), "tracked\n")
+	})
+	mustSync(t, options(a, "host-a"))
+	// The remote replaces the directory with a link to somewhere else and
+	// deletes the file that was in it.
+	commitByHand(t, admin, func(dir string) {
+		run(t, dir, "rm", "-r", "--quiet", "d")
+		if err := os.Symlink(outside, filepath.Join(dir, "d")); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	mustSync(t, options(a, "host-a"))
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "not the journal's\n" {
+		t.Fatalf("a file outside the clone was changed or deleted: %q, %v", got, err)
+	}
+}
+
+func TestALinkMadeInTheCloneCannotRedirectARemoval(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	write(t, victim, "not the journal's\n")
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	commitByHand(t, admin, func(dir string) {
+		if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(dir, "d", "victim.txt"), "tracked\n")
+	})
+	mustSync(t, options(a, "host-a"))
+	if err := os.RemoveAll(filepath.Join(a, "d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(a, "d")); err != nil {
+		t.Fatal(err)
+	}
+	commitByHand(t, admin, func(dir string) { run(t, dir, "rm", "--quiet", "d/victim.txt") })
+
+	mustSync(t, options(a, "host-a"))
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "not the journal's\n" {
+		t.Fatalf("a removal followed a link out of the clone: %q, %v", got, err)
+	}
+}
+
+func TestARemovalAnInterruptedSyncMissedIsDoneByTheNext(t *testing.T) {
+	_, m := fleet(t, 3)
+	a, b, admin := m[0], m[1], m[2]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
+	mustSync(t, options(a, "host-a"))
+	mustSync(t, options(b, "host-b"))
+	commitByHand(t, admin, func(dir string) { run(t, dir, "rm", "--quiet", "host-a.jsonl") })
+
+	o := options(b, "host-b")
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		// The branch has moved; nothing has been brought in yet.
+		if slices.Contains(args, "diff-index") {
+			return "", errors.New("interrupted")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Sync(context.Background(), o); err == nil {
+		t.Fatal("the injected interruption should surface")
+	}
+	res := mustSync(t, options(b, "host-b"))
+	if _, err := os.Stat(filepath.Join(b, "host-a.jsonl")); !errors.Is(err, os.ErrNotExist) || len(res.Kept) != 0 {
+		t.Fatalf("the next sync should finish the removal without reporting it as kept (%v): %+v", err, res)
+	}
+	if status := run(t, b, "status", "--porcelain"); status != "" {
+		t.Fatalf("git status says:\n%s", status)
+	}
+}

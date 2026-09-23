@@ -337,7 +337,10 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			continue
 		}
 		paths = append(paths, path)
-		if status == "A" { // in the index only: the remote deleted it
+		// In the index but not at tip: the remote deleted it. A clean one goes,
+		// even if it was staged here by hand, since the clone is fleetd's; git
+		// still holds its content.
+		if status == "A" {
 			remove = append(remove, path)
 		} else {
 			update = append(update, path)
@@ -349,18 +352,10 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		synced, err := g.raw(nil, "ls-tree", "-r", "-z", "--name-only", local)
-		if err != nil {
-			return nil, err
-		}
-		fromRemote := map[string]bool{}
-		for _, path := range strings.Split(synced, "\x00") {
-			fromRemote[path] = true
-		}
-		keep := func(list []string, needsSynced bool) []string {
+		keep := func(list []string) []string {
 			var out []string
 			for _, path := range list {
-				if changed[path] || (needsSynced && !fromRemote[path]) {
+				if changed[path] {
 					kept = append(kept, path)
 				} else {
 					out = append(out, path)
@@ -368,21 +363,21 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			}
 			return out
 		}
-		update, remove = keep(update, false), keep(remove, true)
+		update, remove = keep(update), keep(remove)
+	}
+	// git does both the removing and the writing, never Go's os package: git will
+	// not follow a symbolic link out of the clone, so a remote commit that turns a
+	// directory into a link cannot make a sync touch anything outside it.
+	// Removals go first, so a directory the remote replaced with a file is gone
+	// before the file is written.
+	if len(remove) > 0 {
+		if _, err := g.raw(nulList(remove), "checkout", "--no-overlay", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
+			return nil, err
+		}
 	}
 	if len(update) > 0 {
 		if _, err := g.raw(nulList(update), "checkout", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
 			return nil, err
-		}
-	}
-	if len(remove) > 0 {
-		if _, err := g.raw(nulList(remove), "update-index", "-z", "--force-remove", "--stdin"); err != nil {
-			return nil, err
-		}
-		for _, path := range remove {
-			if err := os.Remove(filepath.Join(g.dir, filepath.FromSlash(path))); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, err
-			}
 		}
 	}
 	// Keep this host's index entry equal to the remote's, so `git status` shows
