@@ -61,12 +61,12 @@ foreach ($constrained in @($false, $true)) {
         if ($code -ne 0) { Fail "$label language mode, run ${run}: installer exited $code" }
     }
     $reported = & (Join-Path $destination 'fleetd.exe') version
-    if ("$reported" -notlike 'fleetd fleetd-v0.0.0 windows/*') { Fail "$label: installed fleetd reports '$reported'" }
+    if ("$reported" -notlike 'fleetd fleetd-v0.0.0 windows/*') { Fail "${label}: installed fleetd reports '$reported'" }
     $after = Get-UserPath
-    if ($before.Kind -and $after.Kind -ne $before.Kind) { Fail "$label: the user PATH changed type from $($before.Kind) to $($after.Kind)" }
+    if ($before.Kind -and $after.Kind -ne $before.Kind) { Fail "${label}: the user PATH changed type from $($before.Kind) to $($after.Kind)" }
     $count = @(($after.Value -split ';') | Where-Object { $_ -eq $destination }).Count
-    if ($count -ne 1) { Fail "$label: $destination is on the user PATH $count times after two installs, want once" }
-    if ($before.Value -and -not $after.Value.StartsWith($before.Value)) { Fail "$label: the existing user PATH entries were not kept as they were" }
+    if ($count -ne 1) { Fail "${label}: $destination is on the user PATH $count times after two installs, want once" }
+    if ($before.Value -and -not $after.Value.StartsWith($before.Value)) { Fail "${label}: the existing user PATH entries were not kept as they were" }
 }
 
 # A download that does not match SHA256SUMS must install nothing.

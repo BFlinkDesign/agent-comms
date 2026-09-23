@@ -49,10 +49,12 @@ if ($From) {
     }
 }
 
+# Each line is "<hash>  <name>", or "<hash> *<name>" when sha256sum ran in
+# binary mode, as it does on Windows.
 $want = ''
 foreach ($line in Get-Content -Path (Join-Path $work 'SHA256SUMS')) {
     $fields = -split $line
-    if ($fields.Count -eq 2 -and $fields[1] -eq $asset) { $want = $fields[0] }
+    if ($fields.Count -eq 2 -and ($fields[1] -replace '^\*', '') -eq $asset) { $want = $fields[0] }
 }
 if (-not $want) { throw "SHA256SUMS in $work has no line for $asset. Nothing was installed." }
 $have = (Get-FileHash -Path (Join-Path $work $asset) -Algorithm SHA256).Hash
