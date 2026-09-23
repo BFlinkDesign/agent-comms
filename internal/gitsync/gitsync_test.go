@@ -710,3 +710,55 @@ func TestARemovalAnInterruptedSyncMissedIsDoneByTheNext(t *testing.T) {
 		t.Fatalf("git status says:\n%s", status)
 	}
 }
+
+func TestAKeptFileSurvivesTheRemoteSwappingADirectoryAndAFile(t *testing.T) {
+	cases := map[string]struct {
+		before func(t *testing.T, dir string) // what the remote starts with
+		edit   string                         // the file edited on this machine
+		after  func(t *testing.T, dir string) // how the remote reshapes it
+	}{
+		"directory becomes a file": {
+			before: func(t *testing.T, dir string) {
+				if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(dir, "d", "k"), "remote\n")
+			},
+			edit: filepath.Join("d", "k"),
+			after: func(t *testing.T, dir string) {
+				run(t, dir, "rm", "-r", "--quiet", "d")
+				write(t, filepath.Join(dir, "d"), "now a file\n")
+			},
+		},
+		"file becomes a directory": {
+			before: func(t *testing.T, dir string) { write(t, filepath.Join(dir, "f"), "remote\n") },
+			edit:   "f",
+			after: func(t *testing.T, dir string) {
+				run(t, dir, "rm", "--quiet", "f")
+				if err := os.Mkdir(filepath.Join(dir, "f"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(dir, "f", "y"), "now inside a directory\n")
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, m := fleet(t, 2)
+			a, admin := m[0], m[1]
+			commitByHand(t, admin, func(dir string) { c.before(t, dir) })
+			mustSync(t, options(a, "host-a"))
+			write(t, filepath.Join(a, c.edit), "edited on this machine\n")
+			commitByHand(t, admin, func(dir string) { c.after(t, dir) })
+
+			res := mustSync(t, options(a, "host-a"))
+			got, err := os.ReadFile(filepath.Join(a, c.edit))
+			if err != nil || string(got) != "edited on this machine\n" {
+				t.Fatalf("a file reported as kept was lost (%v, %q): %+v", err, got, res)
+			}
+			if !slices.Contains(res.Kept, filepath.ToSlash(c.edit)) {
+				t.Fatalf("the edited file must be reported as kept: %+v", res)
+			}
+		})
+	}
+}

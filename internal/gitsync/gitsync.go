@@ -364,6 +364,17 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			return out
 		}
 		update, remove = keep(update), keep(remove)
+		// Writing a path the remote turned from a directory into a file, or back,
+		// replaces everything under it or above it; a kept file there would go too.
+		var safe []string
+		for _, path := range update {
+			if nests(path, kept) {
+				kept = append(kept, path)
+			} else {
+				safe = append(safe, path)
+			}
+		}
+		update = safe
 	}
 	// git does both the removing and the writing, never Go's os package: git will
 	// not follow a symbolic link out of the clone, so a remote commit that turns a
@@ -409,6 +420,16 @@ func locallyChanged(g git, paths []string) (map[string]bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+// nests reports whether path is a directory above one of others, or inside one.
+func nests(path string, others []string) bool {
+	for _, other := range others {
+		if strings.HasPrefix(other, path+"/") || strings.HasPrefix(path, other+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func nulList(paths []string) []byte {
