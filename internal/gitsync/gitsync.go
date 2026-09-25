@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +58,13 @@ var (
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
 )
 
+// gitConfig is the configuration every git command runs with. core.fsmonitor
+// is emptied rather than set to false: git before 2.36 reads it only as a hook's
+// path, so "false" would name a hook to run, while every version reads an empty
+// value as no fsmonitor at all.
+var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
+	"-c", "core.fsmonitor="}
+
 // Runner runs git with args in dir, feeding it stdin, and returns its standard
 // output exactly as written.
 type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error)
@@ -69,8 +77,7 @@ type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) 
 // Windows. A child that still holds git's output open is cut off after a short
 // delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
-		"-c", "core.fsmonitor=false"}, args...)
+	full := append(slices.Clone(gitConfig), args...)
 	var stdout, stderr bytes.Buffer
 	// A fresh command each time runTree asks, with fresh input and empty output:
 	// on Windows git may have to be started a second time.

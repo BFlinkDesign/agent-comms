@@ -783,3 +783,19 @@ func TestASyncNeverConsultsAnFsmonitor(t *testing.T) {
 		t.Fatal("git consulted core.fsmonitor during a sync")
 	}
 }
+
+// Before git 2.36, core.fsmonitor was read only as a hook's path, so "false"
+// would name a hook to run; an empty value means no hook on every git version
+// (config.c at v2.35.0, fsmonitor-settings.c at v2.43.0). The test above shows
+// the empty value turns fsmonitor off on the git installed here.
+func TestFsmonitorIsTurnedOffInAWayOldGitUnderstands(t *testing.T) {
+	for i := 0; i+1 < len(gitConfig); i += 2 {
+		if gitConfig[i] == "-c" && strings.HasPrefix(gitConfig[i+1], "core.fsmonitor=") {
+			if v := strings.TrimPrefix(gitConfig[i+1], "core.fsmonitor="); v != "" {
+				t.Fatalf("core.fsmonitor=%q: git before 2.36 runs that as a hook", v)
+			}
+			return
+		}
+	}
+	t.Fatalf("git is run without core.fsmonitor turned off: %q", gitConfig)
+}
