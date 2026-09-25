@@ -762,3 +762,23 @@ func TestAKeptFileSurvivesTheRemoteSwappingADirectoryAndAFile(t *testing.T) {
 		})
 	}
 }
+
+// git must not start anything meant to outlive the command, such as an
+// fsmonitor daemon, since on Windows everything git leaves running is ended
+// with it. A hook stands in for the daemon: it records that git consulted it.
+func TestASyncNeverConsultsAnFsmonitor(t *testing.T) {
+	_, m := fleet(t, 1)
+	a := m[0]
+	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
+	hook := filepath.Join(t.TempDir(), "fsmonitor-hook")
+	write(t, hook, "#!/bin/sh\n: > '"+filepath.ToSlash(marker)+"'\nexit 1\n")
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, a, "config", "core.fsmonitor", filepath.ToSlash(hook))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("git consulted core.fsmonitor during a sync")
+	}
+}

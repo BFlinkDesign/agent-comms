@@ -63,12 +63,14 @@ type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) 
 
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
 // terminal and credential prompts are off, hooks do not run, and commits are
-// never signed, since a signer can prompt. When the context ends, git and every
+// never signed, since a signer can prompt. Nothing it runs may outlive it
+// either: core.fsmonitor is off, so git starts no fsmonitor daemon. When the context ends, git and every
 // process it started are killed: a process group on Unix, a job object on
 // Windows. A child that still holds git's output open is cut off after a short
 // delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.fsmonitor=false"}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = dir
 	cmd.WaitDelay = waitDelay
