@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null | tr -d '\\r'); case \"$f\" in *.go) command -v gofmt >/dev/null 2>&1 && gofmt -w \"$f\" 2>/dev/null ;; esac; exit 0",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

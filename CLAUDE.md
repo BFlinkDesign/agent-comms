@@ -14,11 +14,16 @@ behavior, and read `FLEET-OPS.md` for the postmortem behind the "never-again" ru
 ## Commands
 
 ```bash
-# The four CI gates — all must pass before pushing (.github/workflows/test.yml)
+# CI gates — all must pass before pushing (.github/workflows/test.yml)
 python -m pytest tests/ --timeout=30 -q   # full suite
 mypy                                      # strict, scoped to hive/ via pyproject
 ruff check .                              # lint (E,F,W,I,UP,B,SIM @ 120 cols)
 bash -n comms.sh agent-runner.sh          # shell syntax
+gofmt -l ./cmd ./internal                 # fleetd: must print nothing (gofmt exits 0 either way)
+go vet ./... && GOOS=windows go vet ./... # CI also vets and tests on a real windows-latest runner
+go test ./... -count=1 -race              # real git, real bare remote; -race needs cgo (a C compiler)
+# CI also cross-compiles fleetd for linux/amd64, linux/arm64, windows/amd64, windows/arm64 and
+# darwin/arm64, and runs scripts/install-fleetd.test.ps1 in Windows PowerShell (no local equivalent).
 
 # Single test file / single test
 python -m pytest tests/test_leases.py -v
@@ -102,6 +107,50 @@ directly in `tests/test_mcp_server.py` without subprocess overhead. Available to
 | `hive_evolve` | Emit evolution signals based on failure rates and refuted beliefs |
 | `hive_reputation` | Compute exponential-decay reputation score for an agent |
 | `hive_route` | Score candidate agents for a task (capability × reputation / cost) |
+
+**fleetd** (Go: `cmd/fleetd`, `internal/{cell,hostid,journal,gitsync}`) is a separate static binary
+that records which machine did the work. Its spec is the "fleetd — the native writer" section of
+`AGENTS.md` plus the `internal/gitsync` package comment. Sync rules (read `gitsync_test.go` before
+changing any of them):
+
+- Sync never writes this host's own journal file (`fleetd record` may be appending to it) and never
+  rebases, merges or stashes: it commits a snapshot cut at the last newline onto the remote tip with
+  plumbing, pushes that commit, and only then brings in the other hosts' files.
+- git removes and writes the other files, never Go's `os` package, so a remote symlink cannot lead a
+  sync outside the clone. Removals go first. A file with unstaged changes, or an untracked or ignored
+  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. The
+  clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
+  staged new file, even one the remote never had. `git fsck --lost-found` recovers such content.
+- Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
+  user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
+  is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces.
+- Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
+
+**Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:
+
+- `"$name: text"` is a parse error, because the colon makes `name:` a scope or drive qualifier. Write
+  `"${name}: text"`.
+- `sha256sum` on Windows writes `<hash> *<name>`, so parsers must accept the `*`.
+- `Get-FileHash` fails in constrained language mode; `install-fleetd.ps1` falls back to `certutil`.
+- Setting `__PSLockdownPolicy` does not constrain a runner. Tests set
+  `$ExecutionContext.SessionState.LanguageMode` and prove it took effect with an `Add-Type` probe.
+- With `$ErrorActionPreference = 'Stop'`, a native command's redirected stderr aborts the script.
+- A `shell: powershell` step exits with the last native `$LASTEXITCODE`, so test scripts end with an
+  explicit `exit`.
+- `[Environment]::SetEnvironmentVariable` rewrites a `REG_EXPAND_SZ` PATH as `REG_SZ`, which breaks its
+  `%USERPROFILE%` entries. The installer writes PATH with `reg.exe` instead.
+
+## Working here
+
+- Review: before merging, have `.claude/agents/refuter.md` (fresh context) try to refute the diff.
+  After a DO NOT MERGE verdict, re-plan in plan mode before patching again.
+- Every fix lands with a test shown failing before it and passing after.
+- `.claude/settings.json` formats each `.go` file Claude edits. It needs `jq` and `gofmt` on PATH and
+  does nothing without them.
+- It pre-allows no commands, on purpose. A `*` rule also matches flags such as `go test -exec` or
+  `bash -n +n -c`, which run arbitrary programs. Even an exact rule is not safe: Claude Code strips a
+  bare `xargs` before matching, so `... | xargs go test ./... -count=1` would match with extra flags
+  appended.
 
 ## Deployment facts that bite
 
