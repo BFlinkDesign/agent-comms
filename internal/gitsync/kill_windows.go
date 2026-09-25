@@ -4,6 +4,7 @@ package gitsync
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -56,11 +57,13 @@ var (
 	procNtResumeProcess          = ntdll.NewProc("NtResumeProcess")
 )
 
-// createJob, assignJob and resumeGit are variables so tests can make them fail.
+// createJob, assignJob, resumeGit and killGit are variables so tests can make
+// them fail.
 var (
 	createJob = newKillOnCloseJob
 	assignJob = assignToJob
 	resumeGit = resumeProcess
+	killGit   = (*os.Process).Kill
 )
 
 // jobFallbacks counts the git commands that ran outside a job because the job
@@ -128,7 +131,12 @@ func runTree(newCmd func() *exec.Cmd) error {
 	if err := t.adopt(); err != nil {
 		// git is still suspended, so it has run no code and started nothing:
 		// kill it and run git again, outside any job, as if there were none.
-		_ = cmd.Process.Kill()
+		if kerr := killGit(cmd.Process); kerr != nil {
+			// Wait would last as long as git stays suspended, which may be
+			// forever, so return now. If git joined the job, closing the job
+			// below ends it; otherwise it is left suspended, having run nothing.
+			return fmt.Errorf("git could not be resumed (%v) or killed: %w", err, kerr)
+		}
 		_ = cmd.Wait()
 		resumeFallbacks.Add(1)
 		jobFallbacks.Add(1)
@@ -208,8 +216,9 @@ func newKillOnCloseJob() (syscall.Handle, error) {
 }
 
 // assignToJob puts a process in the job. The process is opened by its id, which
-// cannot have been reused: it is suspended, so it cannot exit on its own, and
-// the only thing that kills it, cancel, waits for the caller's lock.
+// cannot have been reused, even if something outside fleetd has killed it: the
+// caller's exec.Cmd holds a handle to the process until Wait, and Windows does
+// not give a process's id to another while a handle to it is open.
 func assignToJob(job syscall.Handle, pid int) error {
 	h, err := syscall.OpenProcess(processSetQuota|processTerminate, false, uint32(pid))
 	if err != nil {
@@ -224,8 +233,8 @@ func assignToJob(job syscall.Handle, pid int) error {
 }
 
 // resumeProcess resumes a process created suspended. It resumes the process as
-// a whole, through a handle opened by id (safe for the reason assignToJob
-// gives), so it needs no snapshot of the system's threads. Each thread's
+// a whole, through a handle opened by id (the id cannot have been reused, for
+// the reason assignToJob gives), so it needs no snapshot of the system's threads. Each thread's
 // suspend count drops by one: if something else suspended git as well, git runs
 // once that has resumed it too.
 func resumeProcess(pid int) error {

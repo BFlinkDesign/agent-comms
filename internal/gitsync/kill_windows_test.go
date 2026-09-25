@@ -119,6 +119,28 @@ func TestARetriedGitIsStillCutOffNearTheDeadline(t *testing.T) {
 	fallbackDeadline(t)
 }
 
+// If git can be neither resumed nor killed (endpoint software that filters both,
+// say), waiting for it would last forever; the command must fail instead.
+func TestAGitThatCanBeNeitherResumedNorKilledFailsInsteadOfHanging(t *testing.T) {
+	savedResume, savedKill := resumeGit, killGit
+	t.Cleanup(func() { resumeGit, killGit = savedResume, savedKill })
+	resumeGit = func(int) error { return errors.New("cannot resume for this test") }
+	killGit = func(*os.Process) error { return errors.New("cannot kill for this test") }
+	done := make(chan error, 1)
+	go func() {
+		_, err := Git(context.Background(), t.TempDir(), nil, "version")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("git ran although it could be neither resumed nor killed")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("git could be neither resumed nor killed, and the command waited for it")
+	}
+}
+
 // The negative control for TestCancellingASyncKillsEveryProcessGitStarted: with
 // git kept out of its job, the same cancelled sync leaves the sleeper running.
 // So the job, not some side effect of cancelling, is what ends git's tree, and
