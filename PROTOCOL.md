@@ -275,10 +275,14 @@ local changes the remote does not have, which it leaves alone and reports
 (`kept` in `--json`). Anything staged with `git add` and not committed is the
 exception: sync resets a staged edit to the remote's version and deletes a
 staged new file (`git fsck --lost-found` recovers either). A git lock file older
-than ten minutes, left by a git command a timeout killed, is removed (`cleared` in
-`--json`). Journal commits are by `fleetd <fleetd@fleetd.invalid>`, and git's
-repository variables (`GIT_DIR` and the rest of `git rev-parse --local-env-vars`)
-are ignored, so a sync run from a git hook still syncs the journal clone.
+than ten minutes is removed, as left by a git command a timeout killed
+(`cleared` in `--json`, and on stderr when the sync then fails). Once the clone
+holds a thousand loose objects, a sync that did its work runs `git gc` (`packed`
+in `--json`). Journal commits are by `fleetd <fleetd@fleetd.invalid>`, dated when
+the sync runs. git's repository variables (`GIT_DIR` and the rest of
+`git rev-parse --local-env-vars`, except `GIT_CONFIG_COUNT`) and the commit
+dates a git hook exports are ignored, so a sync run from a git hook still syncs
+the journal clone.
 
 `fleetd` resolves its journal directory from `--dir`, else
 `$COMMS_CHANNELS/journal`, else `~/.ai/channels/journal` (never the current

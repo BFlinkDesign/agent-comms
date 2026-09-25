@@ -127,8 +127,11 @@ changing any of them):
   git outside a job object because Windows refused one is a fallback, not a failure, and is not reported.
 - git runs only on the journal clone, as fleetd: `gitEnv` drops every variable
   `git rev-parse --local-env-vars` lists (a git hook exports `GIT_DIR`, which once sent the journal
-  into the hook's repository) and sets a fixed author and committer. Automatic gc and maintenance are
-  off, and git lock files older than `staleLock` are cleared, because a killed git leaves them.
+  into the hook's repository) except `GIT_CONFIG_COUNT`, which git itself keeps and which carries
+  configuration set on purpose. It also drops the hook's commit dates and sets a fixed author and
+  committer. Automatic gc and maintenance are off inside a sync; `pack` runs `git gc` at the end
+  once the clone holds `packLimit` loose objects. Git lock files older than `staleLock` are cleared,
+  because a killed git leaves them.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:
