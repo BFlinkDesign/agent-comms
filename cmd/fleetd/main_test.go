@@ -485,3 +485,16 @@ func TestTheJournalDefaultsToTheHomeDirectoryNotTheCurrentOne(t *testing.T) {
 		t.Fatalf("a journal was written into the current directory (%v)", err)
 	}
 }
+
+// --json is for programs; an empty journal is an empty list to them, not a
+// sentence.
+func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
+	stdout, _, err := exec(t, "where", "--json", "--dir", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []any
+	if jerr := json.Unmarshal([]byte(stdout), &entries); jerr != nil || entries == nil || len(entries) != 0 {
+		t.Fatalf("stdout = %q, want an empty JSON list (%v)", stdout, jerr)
+	}
+}

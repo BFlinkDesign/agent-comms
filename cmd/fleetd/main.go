@@ -431,7 +431,14 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "fleetd: warning:", readErr)
 	}
 	if len(records) == 0 {
-		fmt.Fprintf(stdout, "no records in %s\n", store.Dir())
+		if *asJSON {
+			// A program asked: an empty journal is an empty list, not a sentence.
+			if err := writeJSON(stdout, []whereEntry{}); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintf(stdout, "no records in %s\n", store.Dir())
+		}
 		if readErr != nil {
 			return readErr
 		}
