@@ -63,9 +63,49 @@ var (
 // gitConfig is the configuration every git command runs with. core.fsmonitor
 // is emptied rather than set to false: git before 2.36 reads it only as a hook's
 // path, so "false" would name a hook to run, while every version reads an empty
-// value as no fsmonitor at all.
+// value as no fsmonitor at all. Automatic gc and maintenance are off: a fetch
+// would otherwise start them inside the sync's deadline, and one killed partway
+// leaves lock files that fail every later sync until someone deletes them.
 var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.fsmonitor="}
+	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false"}
+
+// repositoryVariables are the variables git reads to find a repository, its
+// index or its objects, as `git rev-parse --local-env-vars` lists them. git
+// exports some of them to its hooks, so fleetd run from a hook, or from anything
+// a hook starts, would otherwise point every command below at the hook's
+// repository: publishing the journal into it, or refusing to sync at all.
+var repositoryVariables = []string{
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+	"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+	"GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+	"GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+}
+
+// identity is who fleetd's journal commits are by. It is not the person's: a
+// PC's git identity may be missing, which fails commit-tree, or a private
+// address GitHub refuses to publish (push declined, GH007), and it does not
+// belong in a journal every machine reads. The host is in each commit's message
+// and file already.
+var identity = []string{"GIT_AUTHOR_NAME=fleetd", "GIT_AUTHOR_EMAIL=fleetd@fleetd.invalid",
+	"GIT_COMMITTER_NAME=fleetd", "GIT_COMMITTER_EMAIL=fleetd@fleetd.invalid"}
+
+// gitEnv is the environment every git command runs with: this process's, less
+// the variables that would point git at another repository or name another
+// author, plus fleetd's own settings. Names are compared ignoring case, as
+// Windows does.
+func gitEnv() []string {
+	env := make([]string, 0, len(os.Environ())+8)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.ContainsFunc(repositoryVariables, func(v string) bool { return strings.EqualFold(v, name) }) ||
+			slices.ContainsFunc(identity, func(v string) bool { return strings.EqualFold(v[:strings.IndexByte(v, '=')], name) }) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+	return append(env, identity...)
+}
 
 // Runner runs git with args in dir, feeding it stdin, and returns its standard
 // output exactly as written.
@@ -89,7 +129,7 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		cmd := exec.CommandContext(ctx, "git", full...)
 		cmd.Dir = dir
 		cmd.WaitDelay = waitDelay
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+		cmd.Env = gitEnv()
 		if stdin != nil {
 			cmd.Stdin = bytes.NewReader(stdin)
 		}

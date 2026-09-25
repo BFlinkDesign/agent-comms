@@ -803,3 +803,95 @@ func TestFsmonitorIsTurnedOffInAWayOldGitUnderstands(t *testing.T) {
 	}
 	t.Fatalf("git is run without core.fsmonitor turned off: %q", gitConfig)
 }
+
+// A git hook, or anything run from one, has GIT_DIR and friends in its
+// environment, pointing at the repository the hook belongs to. fleetd run there
+// must still sync its own journal clone and nothing else.
+func TestTheCallersGitEnvironmentCannotRedirectASync(t *testing.T) {
+	for _, withWorkTree := range []bool{false, true} {
+		t.Run(fmt.Sprintf("work tree set too: %v", withWorkTree), func(t *testing.T) {
+			journalRemote, m := fleet(t, 1)
+			a := m[0]
+			projectRemote, p := fleet(t, 1)
+			t.Setenv("GIT_DIR", filepath.Join(p[0], ".git"))
+			if withWorkTree {
+				t.Setenv("GIT_WORK_TREE", p[0])
+				t.Setenv("GIT_INDEX_FILE", filepath.Join(p[0], ".git", "index"))
+			}
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+			res, err := Sync(context.Background(), options(a, "host-a"))
+			if got := remoteFile(t, projectRemote, "host-a.jsonl"); got != "" {
+				t.Fatalf("the journal was pushed into the repository GIT_DIR names (sync returned %+v, %v)", res, err)
+			}
+			if err != nil || res.Published != 1 || remoteFile(t, journalRemote, "host-a.jsonl") == "" {
+				t.Fatalf("the record did not reach the journal's own remote: %+v, %v", res, err)
+			}
+		})
+	}
+}
+
+// Every variable git itself counts as local to a repository is cleared, so a
+// newer git that adds one fails here rather than in the field.
+func TestEveryRepositoryVariableGitKnowsIsCleared(t *testing.T) {
+	requireGit(t)
+	out, err := exec.Command("git", "rev-parse", "--local-env-vars").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range strings.Fields(string(out)) {
+		if !slices.Contains(repositoryVariables, name) {
+			t.Errorf("git reports %s as local to a repository, and fleetd would pass it on", name)
+		}
+	}
+}
+
+// Journal commits are fleetd's, not the person's: a PC's git identity may be a
+// private address GitHub refuses to publish (GH007), may be missing altogether,
+// and does not belong in a shared journal's history either way.
+func TestJournalCommitsCarryFleetdsIdentityNotThePCs(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "--unset", "user.name")
+	run(t, a, "config", "--unset", "user.email")
+	t.Setenv("GIT_AUTHOR_NAME", "Someone Private")
+	t.Setenv("GIT_AUTHOR_EMAIL", "someone@example.com")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	out, err := exec.Command("git", "--git-dir", remote, "log", "-1", "--format=%an <%ae>|%cn <%ce>", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(out)), "fleetd <fleetd@fleetd.invalid>|fleetd <fleetd@fleetd.invalid>"; got != want {
+		t.Fatalf("journal commit identity = %q, want %q", got, want)
+	}
+}
+
+// git's automatic gc and maintenance can take longer than a sync's deadline, and
+// one killed partway leaves lock files that fail every later sync. A sync never
+// starts them; git's own trace shows whether it did.
+func TestASyncNeverStartsGitsAutomaticMaintenance(t *testing.T) {
+	remote, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	// The stand-in remote is a local repository, so its own receive-pack would
+	// start its own gc after a push, which a real remote does on its server.
+	run(t, a, "--git-dir", remote, "config", "receive.autogc", "false")
+	run(t, a, "config", "gc.auto", "1")
+	run(t, a, "config", "maintenance.auto", "true")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
+	mustSync(t, options(b, "host-b"))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	t.Setenv("GIT_TRACE2_EVENT", trace)
+	if res := mustSync(t, options(a, "host-a")); res.Received != 1 {
+		t.Fatalf("expected to receive b's record: %+v", res)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatalf("git wrote no trace, so this test proves nothing: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, `"event":"child_start"`) && (strings.Contains(line, `"maintenance"`) || strings.Contains(line, `"gc"`)) {
+			t.Fatalf("a sync started git's automatic maintenance: %s", line)
+		}
+	}
+}
