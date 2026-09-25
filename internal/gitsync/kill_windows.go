@@ -30,7 +30,10 @@ import (
 // If the job cannot be created, or git cannot be put in it (an outer job that
 // forbids nesting, say), git runs as it did before job objects were used: the
 // context kills git itself, and cmd.WaitDelay still returns control to the
-// caller. That is counted in jobFallbacks so tests can see it happen.
+// caller. That is counted in jobFallbacks so tests can see it happen. If git
+// cannot be resumed (endpoint software that filters access to other processes,
+// say), the suspended git, which has run no code, is killed and git is started
+// again the same way outside any job; that is counted in resumeFallbacks too.
 
 // Values from the Win32 documentation.
 const (
@@ -39,9 +42,7 @@ const (
 	jobObjectLimitKillOnJobClose      = 0x00002000 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	processSetQuota                   = 0x0100     // PROCESS_SET_QUOTA
 	processTerminate                  = 0x0001     // PROCESS_TERMINATE
-	threadSuspendResume               = 0x0002     // THREAD_SUSPEND_RESUME
-	th32csSnapThread                  = 0x00000004 // TH32CS_SNAPTHREAD
-	resumeThreadFailed                = 0xFFFFFFFF // (DWORD)-1
+	processSuspendResume              = 0x0800     // PROCESS_SUSPEND_RESUME
 	killExitCode                      = 1          // the exit code os.Process.Kill uses
 )
 
@@ -51,22 +52,21 @@ var (
 	procSetInformationJobObject  = kernel32.NewProc("SetInformationJobObject")
 	procAssignProcessToJobObject = kernel32.NewProc("AssignProcessToJobObject")
 	procTerminateJobObject       = kernel32.NewProc("TerminateJobObject")
-	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
-	procThread32First            = kernel32.NewProc("Thread32First")
-	procThread32Next             = kernel32.NewProc("Thread32Next")
-	procOpenThread               = kernel32.NewProc("OpenThread")
-	procResumeThread             = kernel32.NewProc("ResumeThread")
+	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
+	procNtResumeProcess          = ntdll.NewProc("NtResumeProcess")
 )
 
-// createJob and assignJob are variables so tests can make them fail.
+// createJob, assignJob and resumeGit are variables so tests can make them fail.
 var (
 	createJob = newKillOnCloseJob
 	assignJob = assignToJob
+	resumeGit = resumeProcess
 )
 
 // jobFallbacks counts the git commands that ran outside a job because the job
-// could not be created or joined.
-var jobFallbacks atomic.Int64
+// could not be created or joined, or git could not be resumed in it.
+// resumeFallbacks counts, among those, the ones git could not be resumed for.
+var jobFallbacks, resumeFallbacks atomic.Int64
 
 // ioCounters mirrors IO_COUNTERS.
 type ioCounters struct {
@@ -89,19 +89,6 @@ type extendedLimitInformation struct {
 	PeakJobMemoryUsed     uintptr
 }
 
-// threadEntry32 mirrors THREADENTRY32.
-type threadEntry32 struct {
-	Size           uint32
-	CntUsage       uint32
-	ThreadID       uint32
-	OwnerProcessID uint32
-	BasePri        int32
-	DeltaPri       int32
-	Flags          uint32
-}
-
-var _ [0]struct{} = [unsafe.Sizeof(threadEntry32{}) - 28]struct{}{}
-
 // tree is one git command and the job it runs in. mu keeps cancel from running
 // between putting git in the job and resuming it.
 type tree struct {
@@ -114,14 +101,16 @@ type tree struct {
 	closed   bool
 }
 
-// runTree runs git in a kill-on-close job and, when the context ends, terminates
-// the job, so a child such as ssh cannot keep the sync waiting.
-func runTree(cmd *exec.Cmd) error {
+// runTree runs the git command newCmd makes in a kill-on-close job and, when the
+// context ends, terminates the job, so a child such as ssh cannot keep the sync
+// waiting. newCmd is called again only if git has to be started a second time.
+func runTree(newCmd func() *exec.Cmd) error {
 	job, err := createJob()
 	if err != nil {
 		jobFallbacks.Add(1)
-		return cmd.Run()
+		return newCmd().Run()
 	}
+	cmd := newCmd()
 	t := &tree{cmd: cmd, job: job}
 	defer t.close()
 
@@ -137,10 +126,13 @@ func runTree(cmd *exec.Cmd) error {
 		return err
 	}
 	if err := t.adopt(); err != nil {
-		// git is still suspended, so it has started nothing that could outlive it.
+		// git is still suspended, so it has run no code and started nothing:
+		// kill it and run git again, outside any job, as if there were none.
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return err
+		resumeFallbacks.Add(1)
+		jobFallbacks.Add(1)
+		return newCmd().Run()
 	}
 	return cmd.Wait()
 }
@@ -155,11 +147,19 @@ func (t *tree) adopt() error {
 		return nil
 	}
 	if err := assignJob(t.job, t.cmd.Process.Pid); err != nil {
+		if err := resumeGit(t.cmd.Process.Pid); err != nil {
+			return err
+		}
 		jobFallbacks.Add(1)
-	} else {
-		t.inJob = true
+		return nil
 	}
-	return resumeProcess(uint32(t.cmd.Process.Pid))
+	t.inJob = true
+	if err := resumeGit(t.cmd.Process.Pid); err != nil {
+		// Not yet running, so cancel must kill git alone, not the job.
+		t.inJob = false
+		return err
+	}
+	return nil
 }
 
 // cancel is the command's Cancel, called once when the context ends.
@@ -223,50 +223,23 @@ func assignToJob(job syscall.Handle, pid int) error {
 	return nil
 }
 
-// resumeProcess resumes the suspended primary thread of a process. os/exec
-// closes the thread handle CreateProcess returns, so the thread is found in a
-// snapshot of the system's threads and opened again.
-func resumeProcess(pid uint32) error {
-	snap, _, e := procCreateToolhelp32Snapshot.Call(th32csSnapThread, 0)
-	if syscall.Handle(snap) == syscall.InvalidHandle {
-		return fmt.Errorf("CreateToolhelp32Snapshot: %w", e)
+// resumeProcess resumes a process created suspended. It resumes the process as
+// a whole, through a handle opened by id (safe for the reason assignToJob
+// gives), so it needs no snapshot of the system's threads. Each thread's
+// suspend count drops by one: if something else suspended git as well, git runs
+// once that has resumed it too.
+func resumeProcess(pid int) error {
+	if err := procNtResumeProcess.Find(); err != nil {
+		return err
 	}
-	defer syscall.CloseHandle(syscall.Handle(snap))
-
-	te := threadEntry32{Size: uint32(unsafe.Sizeof(threadEntry32{}))}
-	r, _, e := procThread32First.Call(snap, uintptr(unsafe.Pointer(&te)))
-	if r == 0 {
-		return fmt.Errorf("Thread32First: %w", e)
+	h, err := syscall.OpenProcess(processSuspendResume, false, uint32(pid))
+	if err != nil {
+		return fmt.Errorf("OpenProcess: %w", err)
 	}
-	resumed := 0
-	for {
-		if te.OwnerProcessID == pid {
-			th, _, e := procOpenThread.Call(threadSuspendResume, 0, uintptr(te.ThreadID))
-			if th == 0 {
-				return fmt.Errorf("OpenThread: %w", e)
-			}
-			prev, _, e := procResumeThread.Call(th)
-			_ = syscall.CloseHandle(syscall.Handle(th))
-			switch {
-			case uint32(prev) == resumeThreadFailed:
-				return fmt.Errorf("ResumeThread: %w", e)
-			case prev == 1:
-				resumed++
-			case prev > 1:
-				return fmt.Errorf("gitsync: git's thread %d is still suspended", te.ThreadID)
-			}
-		}
-		te.Size = uint32(unsafe.Sizeof(threadEntry32{}))
-		r, _, e = procThread32Next.Call(snap, uintptr(unsafe.Pointer(&te)))
-		if r == 0 {
-			if e == syscall.ERROR_NO_MORE_FILES {
-				break
-			}
-			return fmt.Errorf("Thread32Next: %w", e)
-		}
-	}
-	if resumed == 0 {
-		return fmt.Errorf("gitsync: no suspended thread found for git (pid %d)", pid)
+	defer syscall.CloseHandle(h)
+	status, _, _ := procNtResumeProcess.Call(uintptr(h))
+	if int32(uint32(status)) < 0 { // !NT_SUCCESS
+		return fmt.Errorf("NtResumeProcess: NTSTATUS %#08x", uint32(status))
 	}
 	return nil
 }

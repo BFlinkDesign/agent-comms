@@ -71,17 +71,24 @@ type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) 
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
 	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
 		"-c", "core.fsmonitor=false"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir = dir
-	cmd.WaitDelay = waitDelay
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := runTree(cmd); err != nil {
+	// A fresh command each time runTree asks, with fresh input and empty output:
+	// on Windows git may have to be started a second time.
+	newCmd := func() *exec.Cmd {
+		stdout.Reset()
+		stderr.Reset()
+		cmd := exec.CommandContext(ctx, "git", full...)
+		cmd.Dir = dir
+		cmd.WaitDelay = waitDelay
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+		if stdin != nil {
+			cmd.Stdin = bytes.NewReader(stdin)
+		}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		return cmd
+	}
+	if err := runTree(newCmd); err != nil {
 		if ctx.Err() != nil {
 			return stdout.String(), fmt.Errorf("git %s: %w", strings.Join(args, " "), ctx.Err())
 		}

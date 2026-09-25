@@ -7,9 +7,11 @@ import (
 	"syscall"
 )
 
-// runTree runs git in a process group of its own and, when the context ends,
-// kills the whole group, so a child such as ssh cannot keep the sync waiting.
-func runTree(cmd *exec.Cmd) error {
+// runTree runs the git command newCmd makes in a process group of its own and,
+// when the context ends, kills the whole group, so a child such as ssh cannot
+// keep the sync waiting.
+func runTree(newCmd func() *exec.Cmd) error {
+	cmd := newCmd()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
