@@ -272,7 +272,9 @@ the remote tip. It never rebases and never writes that file. A push rejected
 because another machine pushed first is retried, up to three attempts. It then
 brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
-(`kept` in `--json`).
+(`kept` in `--json`). Anything staged with `git add` and not committed is the
+exception: sync resets a staged edit to the remote's version and deletes a
+staged new file (`git fsck --lost-found` recovers either).
 
 `fleetd` resolves its journal directory from `--dir`, else
 `$COMMS_CHANNELS/journal`, else `./channels/journal`. `fleetd where` reports an

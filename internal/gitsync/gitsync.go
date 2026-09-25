@@ -8,7 +8,9 @@
 // from a snapshot of the file cut at its last complete line, pushes exactly that
 // commit, and only then brings the other hosts' files into the working tree. A
 // file with changes that are not on the remote, such as another identity's
-// unpublished records on this machine, is left as it is and reported.
+// unpublished records on this machine, is left as it is and reported. Only
+// working-tree changes count: the clone is fleetd's, so an edit staged with
+// `git add` and not changed since is reset to the remote's version.
 //
 // Because each host owns one file, the only way two hosts can collide is by
 // deriving the same host id. That is detected by content rather than by reading
@@ -335,7 +337,10 @@ func blobAt(g git, commit, name string) (string, bool, error) {
 // does not already hold at tip's version into the working tree. This host's file
 // is never written. Neither is a file with changes the remote does not have,
 // such as another identity's records on this machine or an edit made by hand:
-// it is returned, left as it is.
+// it is returned, left as it is. Only the working tree is compared with the
+// index, so an edit staged with `git add` and not changed since is reset to tip,
+// and such a new file that tip lacks is removed; git keeps their content until it
+// prunes unreachable objects.
 func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 	if _, err := g.line("update-ref", "-m", "fleetd sync", localRef, tip, local); err != nil {
 		return nil, err
