@@ -356,13 +356,13 @@ func TestAFileGitCallsBinaryIsStillPublished(t *testing.T) {
 }
 
 func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the process-group kill this proves is the Unix path; Windows relies on WaitDelay alone")
-	}
 	_, m := fleet(t, 1)
 	a := m[0]
 	// An ssh that never answers and leaves a child holding its output open: the
 	// case that kept the first version waiting eight times past its deadline.
+	// git runs this through sh on every platform, Git for Windows' bundled sh
+	// included, and each sleep is a process of its own: the background one is a
+	// grandchild of git that nothing but a whole-tree kill ends.
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
 	t.Setenv("GIT_SSH_COMMAND", "sleep 30 & sleep 30; true")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)

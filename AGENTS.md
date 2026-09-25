@@ -109,8 +109,11 @@ ignoring the CRLF line endings git for Windows checks files out with; records ar
 always published with LF. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
-Every git call is bounded by `--timeout`. Prompts, hooks and commit signing are
-all disabled, so a sync never waits for input. ssh runs in batch mode unless you
+Every git call is bounded by `--timeout`, and when it runs out git and every
+process it started (ssh, a remote helper) are killed: a process group on Unix, a
+job object on Windows. If Windows will not give git a job, git alone is killed and
+the sync still returns within two seconds of the deadline. Prompts, hooks and
+commit signing are all disabled, so a sync never waits for input. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
 which is used as is.
 
