@@ -341,6 +341,12 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
 	})
 	if err != nil {
+		// Lock files removed before the sync failed are still worth knowing
+		// about: the next sync would otherwise not mention them at all.
+		if len(res.Cleared) > 0 {
+			fmt.Fprintf(stderr, "fleetd: removed %s older than ten minutes from the clone: %s\n",
+				plural(len(res.Cleared), "git lock file"), strings.Join(res.Cleared, ", "))
+		}
 		return err
 	}
 	if *asJSON {
@@ -355,8 +361,8 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 			strings.Join(res.Kept, ", "), store.Dir())
 	}
 	if len(res.Cleared) > 0 {
-		fmt.Fprintf(stdout, "removed %s that a killed git command left in the clone: %s\n",
-			plural(len(res.Cleared), "stale lock file"), strings.Join(res.Cleared, ", "))
+		fmt.Fprintf(stdout, "removed %s older than ten minutes from the clone: %s\n",
+			plural(len(res.Cleared), "git lock file"), strings.Join(res.Cleared, ", "))
 	}
 	return nil
 }

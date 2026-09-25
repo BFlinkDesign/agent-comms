@@ -41,6 +41,10 @@ const MaxAttempts = 3
 // when a child such as ssh keeps its output pipes open.
 const waitDelay = 2 * time.Second
 
+// packLimit is how many loose objects a journal clone may hold before a sync
+// packs it: every sync adds a few, and git's automatic gc is off inside one.
+var packLimit = 1000
+
 // staleLock is how old a sync lock must be before another sync may break it.
 const staleLock = 10 * time.Minute
 
@@ -70,16 +74,25 @@ var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" +
 	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false"}
 
 // repositoryVariables are the variables git reads to find a repository, its
-// index or its objects, as `git rev-parse --local-env-vars` lists them. git
-// exports some of them to its hooks, so fleetd run from a hook, or from anything
-// a hook starts, would otherwise point every command below at the hook's
-// repository: publishing the journal into it, or refusing to sync at all.
+// index or its objects, and a git command's own -c settings, as
+// `git rev-parse --local-env-vars` lists them. git exports some of them to its
+// hooks, so fleetd run from a hook, or from anything a hook starts, would
+// otherwise point every command below at the hook's repository: publishing the
+// journal into it, or refusing to sync at all. GIT_CONFIG_COUNT is not among
+// them, as git itself keeps it for a command it runs in another repository:
+// git never sets it, so it is configuration the environment sets on purpose,
+// such as a URL rewrite, a trusted directory or an ssh command.
 var repositoryVariables = []string{
-	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
 	"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
 	"GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
 	"GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
 }
+
+// commitDates are dropped too: git exports the dates of the commit it is making
+// to its hooks, and an amend carries the original commit's, so a sync run from a
+// hook would otherwise date its journal commit years back.
+var commitDates = []string{"GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"}
 
 // identity is who fleetd's journal commits are by. It is not the person's: a
 // PC's git identity may be missing, which fails commit-tree, or a private
@@ -98,6 +111,7 @@ func gitEnv() []string {
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
 		if slices.ContainsFunc(repositoryVariables, func(v string) bool { return strings.EqualFold(v, name) }) ||
+			slices.ContainsFunc(commitDates, func(v string) bool { return strings.EqualFold(v, name) }) ||
 			slices.ContainsFunc(identity, func(v string) bool { return strings.EqualFold(v[:strings.IndexByte(v, '=')], name) }) {
 			continue
 		}
@@ -146,7 +160,9 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		switch {
 		case ctxErr == nil:
 			return stdout.String(), fmt.Errorf("git %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
-		case errors.Is(err, ctxErr):
+		case errors.Is(err, ctxErr), isExit(err):
+			// Killing git is how the context's end stops it, and a killed git
+			// exits unsuccessfully: that is all the timeout, not a second problem.
 			return stdout.String(), fmt.Errorf("git %s: %w", name, ctxErr)
 		default:
 			// The context ended and something more went wrong, such as a git
@@ -155,6 +171,13 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		}
 	}
 	return stdout.String(), nil
+}
+
+// isExit reports whether err is git exiting unsuccessfully, as opposed to git
+// not starting or not being ended.
+func isExit(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit)
 }
 
 // Options says what to publish.
@@ -185,6 +208,8 @@ type Result struct {
 	// Cleared lists git lock files, relative to the git directory, that were
 	// older than staleLock and removed: left by a git command that was killed.
 	Cleared []string `json:"cleared,omitempty"`
+	// Packed is set when the sync packed the clone's loose objects.
+	Packed bool `json:"packed,omitempty"`
 }
 
 type git struct {
@@ -295,7 +320,32 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		return res, err
 	}
 	res.Head = tip
+	res.Packed = pack(g)
 	return res, nil
+}
+
+// pack packs the clone once it holds packLimit loose objects. Every sync adds a
+// few, and every fetch of fewer than a hundred objects adds them loose, so a
+// clone nothing packs grows without end. git's automatic gc is off for every
+// command above, so that none starts inside a fetch; this runs gc at the end
+// instead, once the sync has done its work, with what is left of its deadline.
+// It is best effort: a clone that is not packed still syncs, and a gc the
+// deadline kills leaves lock files that a later sync clears.
+func pack(g git) bool {
+	out, err := g.line("count-objects", "-v")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "count: "); ok {
+			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose < packLimit {
+				return false
+			}
+			_, err := g.line("gc", "--quiet")
+			return err == nil
+		}
+	}
+	return false
 }
 
 // lostRace reports whether push's porcelain output says the push lost a race

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -379,6 +380,11 @@ func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected the deadline, got %v", err)
+	}
+	// A plain timeout says so and nothing more: the git that was killed for it
+	// exits unsuccessfully, which is not a second problem.
+	if !strings.HasSuffix(err.Error(), ": "+context.DeadlineExceeded.Error()) {
+		t.Fatalf("a plain timeout reads as more than one: %v", err)
 	}
 	if elapsed > time.Second+waitDelay+2*time.Second {
 		t.Fatalf("a hung remote held the sync for %v", elapsed)
@@ -839,10 +845,86 @@ func TestEveryRepositoryVariableGitKnowsIsCleared(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range strings.Fields(string(out)) {
+		if name == "GIT_CONFIG_COUNT" {
+			// Kept on purpose, as git itself keeps it for a command it runs in
+			// another repository: see TestConfigurationTheEnvironmentSetsOnPurposeStillApplies.
+			continue
+		}
 		if !slices.Contains(repositoryVariables, name) {
 			t.Errorf("git reports %s as local to a repository, and fleetd would pass it on", name)
 		}
 	}
+}
+
+// Configuration the environment sets on purpose, through GIT_CONFIG_COUNT and
+// its GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n, still applies: IT policy, CI or a
+// sandbox may rewrite a URL, trust a directory or name an ssh command that way,
+// and git never sets GIT_CONFIG_COUNT itself (a parent git's -c travels in
+// GIT_CONFIG_PARAMETERS, which is dropped).
+func TestConfigurationTheEnvironmentSetsOnPurposeStillApplies(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "remote", "set-url", "origin", "journal-by-policy:journal")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url."+remote+".insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "journal-by-policy:journal")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	if res := mustSync(t, options(a, "host-a")); res.Published != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	if remoteFile(t, remote, "host-a.jsonl") == "" {
+		t.Fatal("the record was not published through the URL the environment rewrote")
+	}
+}
+
+// git exports the dates of the commit it is making to its hooks, and an amend
+// carries the original commit's. A sync run from such a hook dates its journal
+// commit when the sync ran, not with the hook's dates.
+func TestJournalCommitsAreDatedWhenTheSyncRan(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	t.Setenv("GIT_AUTHOR_DATE", "@1009843200 +0000")
+	t.Setenv("GIT_COMMITTER_DATE", "@1009843200 +0000")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	before := time.Now().Add(-time.Minute).Unix()
+	mustSync(t, options(a, "host-a"))
+	out, err := exec.Command("git", "--git-dir", remote, "log", "-1", "--format=%at %ct", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range strings.Fields(string(out)) {
+		if at, _ := strconv.ParseInt(field, 10, 64); at < before {
+			t.Fatalf("the journal commit is dated %s (Unix seconds), not when the sync ran", out)
+		}
+	}
+}
+
+// A clone that nothing packs grows without end: every sync adds loose objects,
+// and git's automatic gc is off for every command a sync runs, so that none
+// starts inside a fetch. Once the clone holds packLimit loose objects, a
+// successful sync packs it.
+func TestAJournalCloneIsPackedOnceItHoldsPackLimitLooseObjects(t *testing.T) {
+	saved := packLimit
+	t.Cleanup(func() { packLimit = saved })
+	packLimit = 12
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	for i := range 6 {
+		appendLines(t, filepath.Join(b, "host-b.jsonl"), fmt.Sprintf(`{"id":"hive:b%d"}`, i))
+		mustSync(t, options(b, "host-b"))
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), fmt.Sprintf(`{"id":"hive:a%d"}`, i))
+		mustSync(t, options(a, "host-a"))
+	}
+	out := run(t, a, "count-objects", "-v")
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "count: "); ok {
+			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose >= packLimit {
+				t.Fatalf("machine a's clone holds %d loose objects after 12 syncs; it should have been packed at %d", loose, packLimit)
+			}
+			return
+		}
+	}
+	t.Fatalf("count-objects said %q", out)
 }
 
 // Journal commits are fleetd's, not the person's: a PC's git identity may be a
@@ -890,7 +972,8 @@ func TestASyncNeverStartsGitsAutomaticMaintenance(t *testing.T) {
 		t.Fatalf("git wrote no trace, so this test proves nothing: %v", err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, `"event":"child_start"`) && (strings.Contains(line, `"maintenance"`) || strings.Contains(line, `"gc"`)) {
+		if strings.Contains(line, `"event":"child_start"`) && strings.Contains(line, `"--auto"`) &&
+			(strings.Contains(line, `"maintenance"`) || strings.Contains(line, `"gc"`)) {
 			t.Fatalf("a sync started git's automatic maintenance: %s", line)
 		}
 	}
