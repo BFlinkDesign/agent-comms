@@ -111,9 +111,14 @@ never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
 Every git call is bounded by `--timeout`, and when it runs out git and every
 process it started (ssh, a remote helper) are killed: a process group on Unix, a
-job object on Windows. If Windows will not give git a job, git alone is killed and
-the sync still returns within two seconds of the deadline. Prompts, hooks and
-commit signing are all disabled, so a sync never waits for input. ssh runs in batch mode unless you
+job object on Windows. On Windows the job also ends anything git leaves running
+when each git command returns, not only on timeout, so an ssh ControlPersist
+master or a credential-helper daemon does not survive from one git command to
+the next, and if fleetd itself dies mid-command git dies with it. If Windows will
+not give git a job, or will not let fleetd resume git inside one, git runs outside
+any job, git alone is killed on timeout, and the sync still returns within two
+seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
+all disabled, so a sync never waits for input and starts no daemon. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
 which is used as is.
 
