@@ -19,7 +19,7 @@
 // wrap; there is no second implementation to keep in sync.
 //
 // The journal directory is resolved from --dir, else $COMMS_CHANNELS/journal,
-// else ./channels/journal, matching how the rest of this bus is configured.
+// else ~/.ai/channels/journal, where the rest of this bus keeps its channels.
 package main
 
 import (
@@ -52,7 +52,7 @@ usage:
   fleetd where  [--json] [--dir D] [--limit N]
   fleetd version
 
-The journal directory is --dir, else $COMMS_CHANNELS/journal, else ./channels/journal.
+The journal directory is --dir, else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal.
 The where command reports an error, rather than "no records", when that
 directory does not exist -- usually the sign of a mistyped path.
 
@@ -158,14 +158,22 @@ func resolveSalt(flagValue string, stderr io.Writer) string {
 	return ""
 }
 
-func resolveDir(flagValue string) string {
+// resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,
+// else .ai/channels/journal under the home directory, where the rest of this bus
+// keeps its channels. Never the current directory: a hook runs fleetd from
+// whatever project it fires in, and a journal written there is never synced.
+func resolveDir(flagValue string) (string, error) {
 	if flagValue != "" {
-		return flagValue
+		return flagValue, nil
 	}
 	if v := os.Getenv("COMMS_CHANNELS"); v != "" {
-		return filepath.Join(v, "journal")
+		return filepath.Join(v, "journal"), nil
 	}
-	return filepath.Join("channels", "journal")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("no --dir, no COMMS_CHANNELS and no home directory to find the journal in: %w", err)
+	}
+	return filepath.Join(home, ".ai", "channels", "journal"), nil
 }
 
 type hostOut struct {
@@ -213,7 +221,7 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("record", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ./channels/journal)")
+	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
 	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
 	typ := fs.String("type", "", "record type, e.g. observation, handoff, note (required)")
 	note := fs.String("note", "", "what happened, in your own words")
@@ -282,7 +290,11 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	store, err := journal.Open(resolveDir(*dir))
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	store, err := journal.Open(journalDir)
 	if err != nil {
 		return err
 	}
@@ -303,7 +315,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ./channels/journal)")
+	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
 	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
 	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long")
 	if err := fs.Parse(args); err != nil {
@@ -313,7 +325,11 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		return errors.New("--timeout must be positive")
 	}
 	h := identity(resolveSalt(*salt, stderr))
-	store, err := journal.Open(resolveDir(*dir))
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	store, err := journal.Open(journalDir)
 	if err != nil {
 		return err
 	}
@@ -390,7 +406,11 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("--limit must be at least 1, got %d", *limit)
 	}
 
-	store, err := journal.Open(resolveDir(*dir))
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	store, err := journal.Open(journalDir)
 	if err != nil {
 		return err
 	}

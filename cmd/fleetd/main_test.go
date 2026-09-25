@@ -464,3 +464,24 @@ func TestAReleaseBuildReportsItsTag(t *testing.T) {
 		t.Errorf("--version printed %q (err %v), want the tag the release build set", stdout, err)
 	}
 }
+
+// A hook runs fleetd from whatever project it fires in. With no --dir and no
+// COMMS_CHANNELS the journal goes where the bus keeps its channels, under the
+// home directory, never into the current directory.
+func TestTheJournalDefaultsToTheHomeDirectoryNotTheCurrentOne(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("COMMS_CHANNELS", "")
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	if _, _, err := exec(t, "record", "--salt", "t", "--type", "note", "--note", "where does this land"); err != nil {
+		t.Fatal(err)
+	}
+	if found, _ := filepath.Glob(filepath.Join(home, ".ai", "channels", "journal", "*.jsonl")); len(found) != 1 {
+		t.Fatalf("found %v under the home directory, want one journal file", found)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "channels")); !os.IsNotExist(err) {
+		t.Fatalf("a journal was written into the current directory (%v)", err)
+	}
+}
