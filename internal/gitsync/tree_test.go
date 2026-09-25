@@ -71,7 +71,13 @@ func TestCancellingASyncKillsEveryProcessGitStarted(t *testing.T) {
 	default:
 		t.Fatalf("the stand-in ssh never started the sleeper; sync returned %v", err)
 	}
+	// On failure, do not leave the sleeper running. Once it is proven gone its
+	// id may belong to another process, so it is not killed then.
+	gone := false
 	t.Cleanup(func() {
+		if gone {
+			return
+		}
 		if p, err := os.FindProcess(sleeper); err == nil {
 			_ = p.Kill()
 			_ = p.Release()
@@ -89,4 +95,5 @@ func TestCancellingASyncKillsEveryProcessGitStarted(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	gone = true
 }
