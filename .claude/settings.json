@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest *)",
+      "Bash(mypy)",
+      "Bash(ruff check *)",
+      "Bash(bash -n *)",
+      "Bash(gofmt -l *)",
+      "Bash(go vet *)",
+      "Bash(go test *)",
+      "Bash(go build *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v gofmt >/dev/null 2>&1 && gofmt -w \"$CLAUDE_PROJECT_DIR/cmd\" \"$CLAUDE_PROJECT_DIR/internal\" 2>/dev/null; exit 0",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
