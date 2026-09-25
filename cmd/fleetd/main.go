@@ -6,12 +6,13 @@
 // signal separating one workstation from another, so "which PC did I do that on"
 // was never answerable after the fact. fleetd records it at the time.
 //
-// Four commands, deliberately, plus version:
+// Five commands, deliberately, plus version:
 //
+//	fleetd init URL        set up this machine's journal, once
 //	fleetd host            what this machine is, and how confident that is
 //	fleetd record ...      append one host-attributed record
 //	fleetd sync            publish this machine's records, receive the others'
-//	fleetd where           per machine, what it was last doing
+//	fleetd where           per machine, what it was last doing, and how fresh that is
 //	fleetd version         which build this is
 //
 // Every command takes --json, so the same surface serves a person at a terminal
@@ -46,7 +47,8 @@ import (
 const usage = `fleetd — record and answer what happened on which machine
 
 usage:
-  fleetd host   [--json] [--salt S]
+  fleetd init   [--json] [--dir D] [--salt S] [--timeout 2m] URL
+  fleetd host   [--json] [--dir D] [--salt S]
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
   fleetd where  [--json] [--dir D] [--limit N]
@@ -56,7 +58,13 @@ The journal directory is --dir, else $COMMS_CHANNELS/journal, else ~/.ai/channel
 The where command reports an error, rather than "no records", when that
 directory does not exist -- usually the sign of a mistyped path.
 
-The salt is --salt, else $FLEET_SALT. It separates this fleet's host digests
+init clones the journal repository URL into the journal directory, once per
+machine. An empty repository gets its first commit, holding fleetd.json with a
+salt for the fleet; records written before init are kept, for sync to publish.
+
+The salt is the one in the journal's fleetd.json, so every machine that clones the
+journal uses the same one. --salt or $FLEET_SALT may repeat it but not contradict
+it; without fleetd.json they supply it. It separates this fleet's host digests
 from any other and must be the same on every machine, or one machine will appear
 as several. It is not a credential.
 
@@ -124,6 +132,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return flag.ErrHelp
 	}
 	switch args[0] {
+	case "init":
+		return cmdInit(args[1:], stdout, stderr)
 	case "host":
 		return cmdHost(args[1:], stdout, stderr)
 	case "record":
@@ -144,18 +154,31 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-// salt resolves the fleet salt. An empty salt still produces stable digests; it
-// just does not separate this fleet from another using the same scheme, so the
-// caller is told rather than silently given a weaker identity.
-func resolveSalt(flagValue string, stderr io.Writer) string {
-	if flagValue != "" {
-		return flagValue
+// resolveSalt finds the fleet salt: the one in the journal's fleetd.json, which
+// --salt or $FLEET_SALT may repeat but not contradict, else --salt, else
+// $FLEET_SALT. A contradiction is an error, not a choice: either salt would file
+// this machine's records under an id the other machines' records do not share.
+// An empty salt still produces stable digests; it just does not separate this
+// fleet from another using the same scheme, so the caller is told rather than
+// silently given a weaker identity.
+func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error) {
+	given, from := flagValue, "--salt"
+	if given == "" {
+		given, from = os.Getenv("FLEET_SALT"), "FLEET_SALT"
 	}
-	if v := os.Getenv("FLEET_SALT"); v != "" {
-		return v
+	fleet, ok, err := gitsync.ReadFleet(journalDir)
+	switch {
+	case err != nil:
+		return "", err
+	case ok && given != "" && given != fleet.Salt:
+		return "", saltMismatch(from, journalDir)
+	case ok:
+		return fleet.Salt, nil
+	case given != "":
+		return given, nil
 	}
-	fmt.Fprintln(stderr, "fleetd: warning: no --salt and no FLEET_SALT; host digests are unseparated")
-	return ""
+	fmt.Fprintln(stderr, "fleetd: warning: no fleetd.json in the journal, no --salt and no FLEET_SALT; host digests are unseparated")
+	return "", nil
 }
 
 // resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,
@@ -195,12 +218,21 @@ func cmdHost(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("host", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	dir := fs.String("dir", "", "journal directory, whose fleetd.json holds the salt")
+	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
+	if err != nil {
+		return err
+	}
 
-	h := identity(resolveSalt(*salt, stderr))
+	h := identity(fleetSalt)
 	if *asJSON {
 		return writeJSON(stdout, h)
 	}
@@ -222,7 +254,7 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
 	typ := fs.String("type", "", "record type, e.g. observation, handoff, note (required)")
 	note := fs.String("note", "", "what happened, in your own words")
 	repo := fs.String("repo", "", "repository the work was in")
@@ -237,8 +269,16 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	if strings.TrimSpace(*typ) == "" {
 		return errors.New("--type is required")
 	}
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
+	if err != nil {
+		return err
+	}
 
-	h := identity(resolveSalt(*salt, stderr))
+	h := identity(fleetSalt)
 	from := *agent
 	if strings.TrimSpace(from) == "" {
 		from = "fleetd/" + h.Name
@@ -290,10 +330,6 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	journalDir, err := resolveDir(*dir)
-	if err != nil {
-		return err
-	}
 	store, err := journal.Open(journalDir)
 	if err != nil {
 		return err
@@ -316,7 +352,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
 	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -324,11 +360,15 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	if *timeout <= 0 {
 		return errors.New("--timeout must be positive")
 	}
-	h := identity(resolveSalt(*salt, stderr))
 	journalDir, err := resolveDir(*dir)
 	if err != nil {
 		return err
 	}
+	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
+	if err != nil {
+		return err
+	}
+	h := identity(fleetSalt)
 	store, err := journal.Open(journalDir)
 	if err != nil {
 		return err
@@ -340,6 +380,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
 		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
 	})
+	noteSync(store.Dir(), res, err, stderr)
 	if err != nil {
 		// Lock files removed before the sync failed are still worth knowing
 		// about: the next sync would otherwise not mention them at all.
@@ -377,6 +418,14 @@ type whereEntry struct {
 	LastType string `json:"last_type,omitempty"`
 	LastRepo string `json:"last_repo,omitempty"`
 	LastNote string `json:"last_note,omitempty"`
+	// LastPublished is when the remote, as of this clone's last sync, last took
+	// a record from this host, by the publishing machine's clock. Absent when the
+	// remote never had this host's file, or the journal is not a clone.
+	LastPublished string `json:"last_published,omitempty"`
+	// Unpublished counts this host's records here that the remote lacks: this
+	// machine's work not yet synced, or records under a second identity of this
+	// machine that no sync publishes.
+	Unpublished int `json:"unpublished,omitempty"`
 	// Recent is the entries before the last one, newest first, bounded by
 	// --limit. It is emitted in JSON as well as to a terminal, so a program and a
 	// person see the same history.
@@ -488,6 +537,15 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		}
 		out = append(out, e)
 	}
+	stems := make([]string, 0, len(out))
+	for _, e := range out {
+		stems = append(stems, e.Host)
+	}
+	pubs, cloned := publications(store.Dir(), stems)
+	for i := range out {
+		p := pubs[out[i].Host]
+		out[i].LastPublished, out[i].Unpublished = p.At, p.Unpublished
+	}
 	// Compared as instants, not as strings. Lexical comparison of RFC3339 is only
 	// correct when every timestamp is in UTC "Z" form, and it is not: --at accepts
 	// an offset, and hive/cell.py builds every cell's ts with
@@ -505,6 +563,21 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 
 	if *asJSON {
 		return writeJSON(stdout, out)
+	}
+	if cloned {
+		// How fresh the answer below is: it holds the other machines' records as
+		// of this machine's last successful sync.
+		switch st, ok := readSyncStatus(store.Dir()); {
+		case !ok:
+			fmt.Fprintln(stdout, "this machine has not synced this journal yet; the other machines' records may be missing")
+		case st.LastAttempt != nil && st.LastAttempt.Error != "":
+			fmt.Fprintf(stdout, "this machine's last sync, %s, FAILED: %s\n", ago(st.LastAttempt.At), st.LastAttempt.Error)
+			if st.LastSuccess != nil {
+				fmt.Fprintf(stdout, "the records below are as of its last successful sync, %s\n", ago(st.LastSuccess.At))
+			}
+		case st.LastSuccess != nil:
+			fmt.Fprintf(stdout, "the records below are as of this machine's last sync, %s\n", ago(st.LastSuccess.At))
+		}
 	}
 	for _, e := range out {
 		name := e.HostName
@@ -526,6 +599,16 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		}
 		if e.LastNote != "" {
 			fmt.Fprintf(stdout, "  note  %s\n", e.LastNote)
+		}
+		if cloned {
+			if e.LastPublished != "" {
+				fmt.Fprintf(stdout, "  published  %s\n", ago(e.LastPublished))
+			} else {
+				fmt.Fprintln(stdout, "  published  never")
+			}
+			if e.Unpublished > 0 {
+				fmt.Fprintf(stdout, "  NOT PUBLISHED: %s here that the remote does not have\n", plural(e.Unpublished, "record"))
+			}
 		}
 		if len(e.Recent) > 0 {
 			fmt.Fprintln(stdout, "  before that:")
