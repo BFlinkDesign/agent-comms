@@ -123,7 +123,8 @@ changing any of them):
   staged new file, even one the remote never had. `git fsck --lost-found` recovers such content.
 - Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
-  is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces.
+  is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces. On Windows, running
+  git outside a job object because Windows refused one is a fallback, not a failure, and is not reported.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:

@@ -361,10 +361,14 @@ func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
 	// An ssh that never answers and leaves a child holding its output open: the
 	// case that kept the first version waiting eight times past its deadline.
 	// git runs this through sh on every platform, Git for Windows' bundled sh
-	// included. This test proves only the deadline bound, which WaitDelay meets
-	// even if git alone is killed; TestCancellingASyncKillsEveryProcessGitStarted
-	// is the one that proves the whole tree is killed.
+	// included. The simple variant makes git run it once, for the connection,
+	// with git's own output; otherwise git first probes it with -G and output
+	// that goes nowhere. This test proves only the deadline bound, which
+	// WaitDelay meets even if git alone is killed;
+	// TestCancellingASyncKillsEveryProcessGitStarted is the one that proves the
+	// whole tree is killed.
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
+	t.Setenv("GIT_SSH_VARIANT", "simple")
 	t.Setenv("GIT_SSH_COMMAND", "sleep 30 & sleep 30; true")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
 

@@ -5,7 +5,9 @@ package gitsync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -84,12 +86,13 @@ func fallbackDeadline(t *testing.T) {
 		}
 	})
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
-	// sh accepts a forward-slashed Windows path. git's check of whether this
-	// is OpenSSH passes -G, which the test binary refuses at once; the real
-	// connection then starts the sleeper.
+	// sh accepts a forward-slashed Windows path. The simple variant makes git
+	// start the stand-in once, for the real connection, holding git's output.
+	t.Setenv("GIT_SSH_VARIANT", "simple")
 	t.Setenv("GIT_SSH_COMMAND", "'"+filepath.ToSlash(exe)+"' -test.run='^TestSleeperHelper$'")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	const deadline = 3 * time.Second // long enough to reach ssh even when every git command runs twice
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 	start := time.Now()
 	_, err = Sync(ctx, options(a, "host-a"))
@@ -98,7 +101,10 @@ func fallbackDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected the deadline, got %v", err)
 	}
-	if elapsed > time.Second+waitDelay+2*time.Second {
+	if _, serr := os.Stat(pidfile); serr != nil {
+		t.Fatalf("the sync never reached the hung remote, so this proves nothing: %v", serr)
+	}
+	if elapsed > deadline+waitDelay+2*time.Second {
 		t.Fatalf("a hung remote held the sync for %v", elapsed)
 	}
 }
@@ -165,5 +171,93 @@ func TestWithoutTheJobTheSleeperOutlivesTheCancelledSync(t *testing.T) {
 	time.Sleep(time.Second) // as long as a kill could take to land
 	if processGone(t, s.pid) {
 		t.Fatalf("process %d ended although git ran outside any job: the tree-kill test cannot tell a job from no job", s.pid)
+	}
+}
+
+// If the context ends after git is started, suspended, but before it joins its
+// job, cancel can only kill git alone. When that kill is refused (by endpoint
+// software, say), Wait would last as long as git stays suspended, which may be
+// forever, so the command returns at once instead.
+func TestACancelBeforeGitJoinsItsJobDoesNotWaitWhenGitCannotBeKilled(t *testing.T) {
+	releaseTempDirs(t)
+	requireGit(t)
+	dir := t.TempDir()
+	savedKill, savedAfter := killGit, afterStart
+	var started *os.Process
+	t.Cleanup(func() {
+		killGit, afterStart = savedKill, savedAfter
+		if started != nil {
+			_ = started.Kill() // the real kill, so the suspended git does not outlive the test
+			for deadline := time.Now().Add(10 * time.Second); !processGone(t, started.Pid) && time.Now().Before(deadline); {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	})
+	killGit = func(*os.Process) error { return errors.New("cannot kill for this test") }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterStart = func(tr *tree) {
+		started = tr.cmd.Process
+		cancel()
+		for deadline := time.Now().Add(10 * time.Second); !tr.isCanceled() && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	newCmd := func() *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "git", "version")
+		cmd.Dir = dir
+		cmd.WaitDelay = waitDelay
+		return cmd
+	}
+	start := time.Now()
+	err := runTree(newCmd)
+	if !errors.Is(err, errUnkillable) {
+		t.Fatalf("err = %v, want errUnkillable", err)
+	}
+	if elapsed := time.Since(start); elapsed >= waitDelay {
+		t.Fatalf("waited %v for a git that could not be killed", elapsed)
+	}
+}
+
+// Kill-on-close ends what git leaves running when a git command returns, not
+// only when it is cancelled: here a daemon detached from git's output, as an ssh
+// ControlPersist master or a credential helper would be.
+func TestTheJobEndsWhatGitLeavesRunningWhenItReturns(t *testing.T) {
+	releaseTempDirs(t)
+	_, m := fleet(t, 1)
+	a := m[0]
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidfile := filepath.Join(t.TempDir(), "sleeper.pid")
+	t.Setenv(sleeperEnv, pidfile)
+	t.Setenv("GIT_SSH_VARIANT", "simple")
+	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
+	// The stand-in starts the sleeper detached from its output, waits until it
+	// has written its id, and ends, so git returns while the sleeper runs on.
+	t.Setenv("GIT_SSH_COMMAND", fmt.Sprintf(
+		"'%s' -test.run='^TestSleeperHelper$' </dev/null >/dev/null 2>&1 & while [ ! -s '%s' ]; do sleep 0.1; done; true",
+		filepath.ToSlash(exe), filepath.ToSlash(pidfile)))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, _ = Sync(ctx, options(a, "host-a")) // the stand-in speaks no git protocol, so the fetch fails
+	if ctx.Err() != nil {
+		t.Fatal("the sync ran into its deadline, so this does not show a normal return")
+	}
+	data, err := os.ReadFile(pidfile)
+	if err != nil {
+		t.Fatalf("the sleeper never started: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { killSleeper(t, pid) })
+	for deadline := time.Now().Add(10 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, left running by the git command, outlived it", pid)
+		}
 	}
 }

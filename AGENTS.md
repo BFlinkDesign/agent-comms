@@ -116,9 +116,10 @@ ignoring the CRLF line endings git for Windows checks files out with; records ar
 always published with LF. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
-Every git call is bounded by `--timeout`, and when it runs out git and every
-process it started (ssh, a remote helper) are killed: a process group on Unix, a
-job object on Windows. On Windows the job also ends anything git leaves running
+Every git call is bounded by `--timeout`, and when it runs out git and the
+processes it started (ssh, a remote helper) are killed: on Unix every process
+still in git's process group (one that starts a session of its own, as `setsid`
+does, leaves it), on Windows every process in git's job object. On Windows the job also ends anything git leaves running
 when each git command returns, not only on timeout, so an ssh ControlPersist
 master or a credential-helper daemon does not survive from one git command to
 the next, and if fleetd itself dies mid-command git dies with it. The job is

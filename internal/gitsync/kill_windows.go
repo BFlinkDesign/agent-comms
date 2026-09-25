@@ -3,6 +3,7 @@
 package gitsync
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,13 +59,20 @@ var (
 )
 
 // createJob, assignJob, resumeGit and killGit are variables so tests can make
-// them fail.
+// them fail, and afterStart so a test can end the context between starting git
+// and putting it in its job.
 var (
-	createJob = newKillOnCloseJob
-	assignJob = assignToJob
-	resumeGit = resumeProcess
-	killGit   = (*os.Process).Kill
+	createJob  = newKillOnCloseJob
+	assignJob  = assignToJob
+	resumeGit  = resumeProcess
+	killGit    = (*os.Process).Kill
+	afterStart = func(*tree) {}
 )
+
+// errUnkillable is returned when the context ended before git, still suspended,
+// was put in its job, and git could not be killed: Wait would then last as long
+// as git stays suspended, which may be forever.
+var errUnkillable = errors.New("the context ended before git ran, and git could not be killed")
 
 // jobFallbacks counts the git commands that ran outside a job because the job
 // could not be created or joined, or git could not be resumed in it.
@@ -101,6 +109,7 @@ type tree struct {
 	mu       sync.Mutex
 	inJob    bool // git is in the job, so cancelling terminates the job
 	canceled bool
+	killErr  error // what killing git alone returned, when cancel had to
 	closed   bool
 }
 
@@ -128,7 +137,13 @@ func runTree(newCmd func() *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	if err := t.adopt(); err != nil {
+	afterStart(t)
+	err = t.adopt()
+	if errors.Is(err, errUnkillable) {
+		// Closing the job below does not end git: it never joined it.
+		return err
+	}
+	if err != nil {
 		// git is still suspended, so it has run no code and started nothing:
 		// kill it and run git again, outside any job, as if there were none.
 		if kerr := killGit(cmd.Process); kerr != nil {
@@ -151,7 +166,12 @@ func (t *tree) adopt() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.canceled {
-		// cancel has already killed it; Wait reports the context's error.
+		// cancel has already tried to kill git. If that worked, Wait reports
+		// the context's error; if not, git is still suspended and Wait would
+		// never return.
+		if t.killErr != nil {
+			return fmt.Errorf("%w: %v", errUnkillable, t.killErr)
+		}
 		return nil
 	}
 	if err := assignJob(t.job, t.cmd.Process.Pid); err != nil {
@@ -179,13 +199,21 @@ func (t *tree) cancel() error {
 		r, _, e := procTerminateJobObject.Call(uintptr(t.job), killExitCode)
 		if r == 0 {
 			// Fall back to killing git alone rather than nothing.
-			if err := t.cmd.Process.Kill(); err != nil {
+			if err := killGit(t.cmd.Process); err != nil {
 				return fmt.Errorf("TerminateJobObject: %w", e)
 			}
 		}
 		return nil
 	}
-	return t.cmd.Process.Kill()
+	t.killErr = killGit(t.cmd.Process)
+	return t.killErr
+}
+
+// isCanceled reports whether cancel has run.
+func (t *tree) isCanceled() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.canceled
 }
 
 // close closes the job's only handle, which ends anything still in it.
