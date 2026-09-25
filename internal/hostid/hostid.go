@@ -219,10 +219,17 @@ func probeLinux(opt Options) (string, string, error) {
 }
 
 func probeWindows(opt Options) (string, string, error) {
-	// reg.exe is used rather than a registry binding so that the collector stays
-	// dependency-free and cross-compiles from any host. Output looks like:
+	// On Windows itself the value is read in this process, through the
+	// standard library's registry calls: no dependency, no child process and no
+	// deadline to miss. reg.exe remains the fallback, and the path tests drive
+	// through Options.Runner. Its output looks like:
 	//     HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography
 	//         MachineGuid    REG_SZ    4f2a...-...
+	if opt.Runner == nil && opt.goos() == runtime.GOOS {
+		if guid, err := machineGUID(); err == nil && strings.TrimSpace(guid) != "" {
+			return guid, "windows:MachineGuid", nil
+		}
+	}
 	out, err := opt.run("reg", "query",
 		`HKLM\SOFTWARE\Microsoft\Cryptography`, "/v", "MachineGuid")
 	if err != nil {
