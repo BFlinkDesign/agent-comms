@@ -356,14 +356,19 @@ func TestAFileGitCallsBinaryIsStillPublished(t *testing.T) {
 }
 
 func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the process-group kill this proves is the Unix path; Windows relies on WaitDelay alone")
-	}
 	_, m := fleet(t, 1)
 	a := m[0]
 	// An ssh that never answers and leaves a child holding its output open: the
 	// case that kept the first version waiting eight times past its deadline.
+	// git runs this through sh on every platform, Git for Windows' bundled sh
+	// included. The simple variant makes git run it once, for the connection,
+	// with git's own output; otherwise git first probes it with -G and output
+	// that goes nowhere. This test proves only the deadline bound, which
+	// WaitDelay meets even if git alone is killed;
+	// TestCancellingASyncKillsEveryProcessGitStarted is the one that proves the
+	// whole tree is killed.
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
+	t.Setenv("GIT_SSH_VARIANT", "simple")
 	t.Setenv("GIT_SSH_COMMAND", "sleep 30 & sleep 30; true")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
 
@@ -761,4 +766,40 @@ func TestAKeptFileSurvivesTheRemoteSwappingADirectoryAndAFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// git must not start anything meant to outlive the command, such as an
+// fsmonitor daemon, since on Windows everything git leaves running is ended
+// with it. A hook stands in for the daemon: it records that git consulted it.
+func TestASyncNeverConsultsAnFsmonitor(t *testing.T) {
+	_, m := fleet(t, 1)
+	a := m[0]
+	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
+	hook := filepath.Join(t.TempDir(), "fsmonitor-hook")
+	write(t, hook, "#!/bin/sh\n: > '"+filepath.ToSlash(marker)+"'\nexit 1\n")
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, a, "config", "core.fsmonitor", filepath.ToSlash(hook))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("git consulted core.fsmonitor during a sync")
+	}
+}
+
+// Before git 2.36, core.fsmonitor was read only as a hook's path, so "false"
+// would name a hook to run; an empty value means no hook on every git version
+// (config.c at v2.35.0, fsmonitor-settings.c at v2.43.0). The test above shows
+// the empty value turns fsmonitor off on the git installed here.
+func TestFsmonitorIsTurnedOffInAWayOldGitUnderstands(t *testing.T) {
+	for i := 0; i+1 < len(gitConfig); i += 2 {
+		if gitConfig[i] == "-c" && strings.HasPrefix(gitConfig[i+1], "core.fsmonitor=") {
+			if v := strings.TrimPrefix(gitConfig[i+1], "core.fsmonitor="); v != "" {
+				t.Fatalf("core.fsmonitor=%q: git before 2.36 runs that as a hook", v)
+			}
+			return
+		}
+	}
+	t.Fatalf("git is run without core.fsmonitor turned off: %q", gitConfig)
 }

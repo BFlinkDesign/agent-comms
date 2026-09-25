@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -59,28 +60,44 @@ var (
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
 )
 
+// gitConfig is the configuration every git command runs with. core.fsmonitor
+// is emptied rather than set to false: git before 2.36 reads it only as a hook's
+// path, so "false" would name a hook to run, while every version reads an empty
+// value as no fsmonitor at all.
+var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
+	"-c", "core.fsmonitor="}
+
 // Runner runs git with args in dir, feeding it stdin, and returns its standard
 // output exactly as written.
 type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error)
 
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
 // terminal and credential prompts are off, hooks do not run, and commits are
-// never signed, since a signer can prompt. A child that outlives the context is
-// cut off after a short delay rather than holding the sync open.
+// never signed, since a signer can prompt. Nothing it runs may outlive it
+// either: core.fsmonitor is off, so git starts no fsmonitor daemon. When the context ends, git and every
+// process it started are killed: a process group on Unix, a job object on
+// Windows. A child that still holds git's output open is cut off after a short
+// delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-	full := append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir = dir
-	cmd.WaitDelay = waitDelay
-	killTree(cmd)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
-	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
-	}
+	full := append(slices.Clone(gitConfig), args...)
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	// A fresh command each time runTree asks, with fresh input and empty output:
+	// on Windows git may have to be started a second time.
+	newCmd := func() *exec.Cmd {
+		stdout.Reset()
+		stderr.Reset()
+		cmd := exec.CommandContext(ctx, "git", full...)
+		cmd.Dir = dir
+		cmd.WaitDelay = waitDelay
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+		if stdin != nil {
+			cmd.Stdin = bytes.NewReader(stdin)
+		}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		return cmd
+	}
+	if err := runTree(newCmd); err != nil {
 		if ctx.Err() != nil {
 			return stdout.String(), fmt.Errorf("git %s: %w", strings.Join(args, " "), ctx.Err())
 		}

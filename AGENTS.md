@@ -116,8 +116,25 @@ ignoring the CRLF line endings git for Windows checks files out with; records ar
 always published with LF. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
-Every git call is bounded by `--timeout`. Prompts, hooks and commit signing are
-all disabled, so a sync never waits for input. ssh runs in batch mode unless you
+Every git call is bounded by `--timeout`, and when it runs out git and the
+processes it started (ssh, a remote helper) are killed: on Unix every process
+still in git's process group (one that starts a session of its own, as `setsid`
+does, leaves it), on Windows every process in git's job object. On Windows the job also ends anything git leaves running
+when each git command returns, not only on timeout, so an ssh ControlPersist
+master or a credential-helper daemon does not survive from one git command to
+the next, and if fleetd itself dies mid-command git dies with it. The job is
+closed only once git's output has been read to the end, so a leftover that still
+holds that output open still costs a two-second wait, as on Unix, before it is
+ended, and that git command counts as failed. On Windows git cannot move automatic
+`gc`/`maintenance` into the background, so when a fetch starts one it runs inside
+the job and is ended with it on timeout. That can leave a lock file in the clone
+(`packed-refs.lock`, or a `.lock` under `refs/` or `objects/`); later syncs then
+fail with `Unable to create '...lock': File exists` until you delete the file the
+error names, once no git is running in that clone. If Windows will
+not give git a job, or will not let fleetd resume git inside one, git runs outside
+any job, git alone is killed on timeout, and the sync still returns within two
+seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
+all disabled, so a sync never waits for input and starts no daemon. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
 which is used as is.
 
