@@ -118,8 +118,9 @@ changing any of them):
   plumbing, pushes that commit, and only then brings in the other hosts' files.
 - git removes and writes the other files, never Go's `os` package, so a remote symlink cannot lead a
   sync outside the clone. Removals go first. A file with unstaged changes, or an untracked or ignored
-  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. A
-  staged, uncommitted edit is not protected yet: sync overwrites it.
+  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. The
+  clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
+  staged new file, even one the remote never had. `git fsck --lost-found` recovers such content.
 - Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
   is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces.
@@ -144,9 +145,12 @@ changing any of them):
 - Review: before merging, have `.claude/agents/refuter.md` (fresh context) try to refute the diff.
   After a DO NOT MERGE verdict, re-plan in plan mode before patching again.
 - Every fix lands with a test shown failing before it and passing after.
-- `.claude/settings.json` formats each `.go` file Claude edits (it needs `jq` and `gofmt` on PATH and
-  does nothing without them) and allows the exact gate commands above. Keep allow rules exact: a `*`
-  also matches flags such as `go test -exec` or `bash -n +n -c`, which run arbitrary programs.
+- `.claude/settings.json` formats each `.go` file Claude edits. It needs `jq` and `gofmt` on PATH and
+  does nothing without them.
+- It pre-allows no commands, on purpose. A `*` rule also matches flags such as `go test -exec` or
+  `bash -n +n -c`, which run arbitrary programs. Even an exact rule is not safe: Claude Code strips a
+  bare `xargs` before matching, so `... | xargs go test ./... -count=1` would match with extra flags
+  appended.
 
 ## Deployment facts that bite
 

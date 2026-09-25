@@ -1,17 +1,5 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "permissions": {
-    "allow": [
-      "Bash(python -m pytest tests/ --timeout=30 -q)",
-      "Bash(mypy)",
-      "Bash(ruff check .)",
-      "Bash(bash -n comms.sh agent-runner.sh)",
-      "Bash(gofmt -l ./cmd ./internal)",
-      "Bash(go vet ./...)",
-      "Bash(go test ./... -count=1)",
-      "Bash(go test ./... -count=1 -race)"
-    ]
-  },
   "hooks": {
     "PostToolUse": [
       {
@@ -19,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); case \"$f\" in *.go) command -v gofmt >/dev/null 2>&1 && gofmt -w \"$f\" 2>/dev/null ;; esac; exit 0",
+            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null | tr -d '\\r'); case \"$f\" in *.go) command -v gofmt >/dev/null 2>&1 && gofmt -w \"$f\" 2>/dev/null ;; esac; exit 0",
             "timeout": 30
           }
         ]

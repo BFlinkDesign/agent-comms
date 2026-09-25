@@ -105,8 +105,10 @@ rebases, merges or stashes, and never writes this machine's own file, which
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (another identity's unpublished records on this
   machine, or an edit made by hand) is never overwritten; sync names it. The
-  exception, not yet fixed: an edit staged with `git add` but not committed is
-  overwritten.
+  exception is anything staged with `git add` and not committed: the clone is
+  fleetd's, so sync resets a staged edit to the remote's version and deletes a
+  staged new file, even one the remote never had. `git fsck --lost-found`
+  recovers such content until git's garbage collection prunes it.
 
 Two machines can collide only by deriving the same host id. That is detected by
 content: the remote copy of this machine's file must be a prefix of the local one,
