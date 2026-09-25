@@ -5,9 +5,10 @@ package gitsync
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -53,46 +54,51 @@ func TestAProcessThatCannotJoinTheJobFallsBackAndTheSyncStillWorks(t *testing.T)
 // Outside a job, cancelling still kills git itself, as before job objects were
 // used, and WaitDelay still returns control.
 func TestAFallbackSyncIsStillCutOffNearTheDeadline(t *testing.T) {
-	saved := assignJob
-	t.Cleanup(func() { assignJob = saved })
-	assignJob = func(syscall.Handle, int) error { return errors.New("cannot join for this test") }
+	releaseTempDirs(t)
+	outsideFleetdsJob(t)
 	fallbackDeadline(t)
 }
 
-// fallbackDeadline syncs against a remote whose ssh hangs past the deadline and
-// checks that the sync returns near it. Outside a job, what git started is not
-// killed: the real git.exe behind Git for Windows' launcher keeps its working
-// directory in the clone, inside the test's TempDir, which Windows will not
-// delete while a process uses it. So the stand-in ssh outlives the deadline
-// bound, which only WaitDelay can then meet, but ends soon after, and the test
-// waits for it before its TempDir is removed.
+// fallbackDeadline syncs against a remote whose ssh is the sleeper, which
+// outlasts any deadline, and checks that the sync returns near the deadline.
+// Outside a job, cancelling kills only Git for Windows' launcher: the real git
+// behind it, its sh and the sleeper keep running, which only WaitDelay can cut
+// the sync loose from. They keep their working directory in the clone, so the
+// sleeper is killed when the test ends, which ends the rest, before the TempDirs
+// are removed.
 func fallbackDeadline(t *testing.T) {
 	t.Helper()
-	const hang = 8 * time.Second // longer than the bound checked below
 	_, m := fleet(t, 1)
 	a := m[0]
-	done := filepath.Join(t.TempDir(), "ssh-done")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidfile := filepath.Join(t.TempDir(), "sleeper.pid")
+	t.Setenv(sleeperEnv, pidfile)
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(pidfile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				killSleeper(t, pid)
+			}
+		}
+	})
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
-	t.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("sleep %d; : > '%s'; false", int(hang/time.Second), filepath.ToSlash(done)))
+	// sh accepts a forward-slashed Windows path. git's check of whether this
+	// is OpenSSH passes -G, which the test binary refuses at once; the real
+	// connection then starts the sleeper.
+	t.Setenv("GIT_SSH_COMMAND", "'"+filepath.ToSlash(exe)+"' -test.run='^TestSleeperHelper$'")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	start := time.Now()
-	_, err := Sync(ctx, options(a, "host-a"))
+	_, err = Sync(ctx, options(a, "host-a"))
 	elapsed := time.Since(start)
-
-	// Let the orphans finish whatever the result, so TempDir can be removed.
-	for wait := time.Now().Add(hang + 10*time.Second); time.Now().Before(wait); time.Sleep(100 * time.Millisecond) {
-		if _, err := os.Stat(done); err == nil {
-			break
-		}
-	}
-	time.Sleep(time.Second) // for git to exit after its ssh has
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected the deadline, got %v", err)
 	}
-	if bound := time.Second + waitDelay + 2*time.Second; bound >= hang || elapsed > bound {
+	if elapsed > time.Second+waitDelay+2*time.Second {
 		t.Fatalf("a hung remote held the sync for %v", elapsed)
 	}
 }
@@ -111,8 +117,10 @@ func TestAGitThatCannotBeResumedIsRunAgainAndTheSyncStillWorks(t *testing.T) {
 }
 
 // The first resume can fail after git joined the job; the retry must still be
-// cut off at the deadline.
+// cut off at the deadline. The retried git runs outside any job, so what it
+// leaves running ends only when the sleeper is killed.
 func TestARetriedGitIsStillCutOffNearTheDeadline(t *testing.T) {
+	releaseTempDirs(t)
 	saved := resumeGit
 	t.Cleanup(func() { resumeGit = saved })
 	resumeGit = func(int) error { return errors.New("cannot resume for this test") }
@@ -146,23 +154,11 @@ func TestAGitThatCanBeNeitherResumedNorKilledFailsInsteadOfHanging(t *testing.T)
 // So the job, not some side effect of cancelling, is what ends git's tree, and
 // processGone reports a live process, by the id the sleeper wrote, as live.
 func TestWithoutTheJobTheSleeperOutlivesTheCancelledSync(t *testing.T) {
-	saved := assignJob
-	t.Cleanup(func() { assignJob = saved })
-	assignJob = func(syscall.Handle, int) error { return errors.New("cannot join for this test") }
-	done := filepath.Join(t.TempDir(), "ssh-done")
-	s, err := syncUntilSleeperRuns(t, fmt.Sprintf("sleep 3; : > '%s'; true", filepath.ToSlash(done)))
-	// Outside a job only git's launcher is killed; the real git.exe and sh keep
-	// their working directory in the clone until the stand-in ssh ends. Wait for
-	// them before the TempDirs are removed. This runs before the sleeper is
-	// killed, which is registered earlier.
-	t.Cleanup(func() {
-		for wait := time.Now().Add(15 * time.Second); time.Now().Before(wait); time.Sleep(100 * time.Millisecond) {
-			if _, err := os.Stat(done); err == nil {
-				break
-			}
-		}
-		time.Sleep(time.Second) // for git to exit after its ssh has
-	})
+	releaseTempDirs(t)
+	// The test's own job ends the sleeper's tree when the test does; it does
+	// nothing when the sync is cancelled, so it cannot kill the sleeper early.
+	outsideFleetdsJob(t)
+	s, err := syncUntilSleeperRuns(t, "sleep 3; true")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected the cancellation, got %v", err)
 	}

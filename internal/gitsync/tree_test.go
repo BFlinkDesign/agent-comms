@@ -102,12 +102,8 @@ func syncUntilSleeperRuns(t *testing.T, sshTail string) (*sleeper, error) {
 	// Do not leave the sleeper running. Once it is proven gone its id may
 	// belong to another process, so it is not killed then.
 	t.Cleanup(func() {
-		if s.gone {
-			return
-		}
-		if p, err := os.FindProcess(s.pid); err == nil {
-			_ = p.Kill()
-			_ = p.Release()
+		if !s.gone {
+			killSleeper(t, s.pid)
 		}
 	})
 	return s, err

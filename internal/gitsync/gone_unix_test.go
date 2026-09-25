@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // processGone reports whether a process has ended. A killed process nobody has
@@ -31,4 +32,22 @@ func processGone(t *testing.T, pid int) bool {
 		}
 	}
 	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+}
+
+// killSleeper ends the sleeper with this process id and waits until it has
+// ended.
+func killSleeper(t *testing.T, pid int) {
+	t.Helper()
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		if !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("kill %d: %v", pid, err)
+		}
+		return
+	}
+	for deadline := time.Now().Add(10 * time.Second); !processGone(t, pid); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Errorf("the sleeper %d had not ended 10s after it was killed", pid)
+			return
+		}
+	}
 }
