@@ -111,6 +111,9 @@ func gitEnv() []string {
 // output exactly as written.
 type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error)
 
+// runGitTree is runTree, as a variable so a test can stand in for it.
+var runGitTree = runTree
+
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
 // terminal and credential prompts are off, hooks do not run, and commits are
 // never signed, since a signer can prompt. Nothing it runs may outlive it
@@ -137,11 +140,19 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		cmd.Stderr = &stderr
 		return cmd
 	}
-	if err := runTree(newCmd); err != nil {
-		if ctx.Err() != nil {
-			return stdout.String(), fmt.Errorf("git %s: %w", strings.Join(args, " "), ctx.Err())
+	if err := runGitTree(newCmd); err != nil {
+		name := strings.Join(args, " ")
+		ctxErr := ctx.Err()
+		switch {
+		case ctxErr == nil:
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		case errors.Is(err, ctxErr):
+			return stdout.String(), fmt.Errorf("git %s: %w", name, ctxErr)
+		default:
+			// The context ended and something more went wrong, such as a git
+			// that could not be killed and was left behind: say both.
+			return stdout.String(), fmt.Errorf("git %s: %w: %w", name, ctxErr, err)
 		}
-		return stdout.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
 }
