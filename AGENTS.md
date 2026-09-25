@@ -40,7 +40,7 @@ convenience.
 |-----------|---------|
 | `hive/` | HIVE Python protocol library (see `hive/AGENTS.md`) |
 | `cmd/fleetd/` | `fleetd` — native host-attributed journal writer (see below) |
-| `internal/` | Go packages backing `fleetd`: `cell`, `hostid`, `journal` |
+| `internal/` | Go packages backing `fleetd`: `cell`, `gitsync`, `hostid`, `journal` |
 | `tests/` | Full pytest suite (see `tests/AGENTS.md`) |
 | `channels/` | JSONL channel files — shared message bus (see `channels/AGENTS.md`) |
 | `dashboard/` | Factory floor web UI + FastAPI server (see `dashboard/AGENTS.md`) |
@@ -55,7 +55,10 @@ convenience.
 - Set `COMMS_AGENT` before any comms command: `export COMMS_AGENT="agent/role"`
 - Run tests: `cd C:/tools/agent-comms && python -m pytest tests/ --timeout=30 -q`
 - Quality gates (all enforced in CI, all must pass before pushing):
-  `python -m pytest tests/ -q` && `mypy` && `ruff check .`
+  `python -m pytest tests/ -q` && `mypy` && `ruff check .`, and for fleetd
+  `gofmt -l ./cmd ./internal` (must print nothing) && `go vet ./...` && `go test ./... -count=1`
+  (CI adds `-race` on Linux, which needs cgo; a Windows runner; five cross-compile targets; and the
+  Windows-only `scripts/install-fleetd.test.ps1`)
 - `comms.sh` is the CLI entry point — source it, don't execute directly
 
 ### Task Protocol (A2A-Aligned — 7 States)
@@ -98,10 +101,12 @@ rebases, merges or stashes, and never writes this machine's own file, which
 - snapshots the file up to its last complete record;
 - builds a commit on top of the remote tip with git plumbing (`hash-object`,
   `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
-  lost a race to another machine at most three times;
+  lost a race to another machine, for at most three attempts in all;
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (another identity's unpublished records on this
-  machine, or an edit made by hand) is never overwritten; sync names it.
+  machine, or an edit made by hand) is never overwritten; sync names it. The
+  exception, not yet fixed: an edit staged with `git add` but not committed is
+  overwritten.
 
 Two machines can collide only by deriving the same host id. That is detected by
 content: the remote copy of this machine's file must be a prefix of the local one,
