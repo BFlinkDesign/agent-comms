@@ -118,3 +118,34 @@ func TestARetriedGitIsStillCutOffNearTheDeadline(t *testing.T) {
 	resumeGit = func(int) error { return errors.New("cannot resume for this test") }
 	fallbackDeadline(t)
 }
+
+// The negative control for TestCancellingASyncKillsEveryProcessGitStarted: with
+// git kept out of its job, the same cancelled sync leaves the sleeper running.
+// So the job, not some side effect of cancelling, is what ends git's tree, and
+// processGone reports a live process, by the id the sleeper wrote, as live.
+func TestWithoutTheJobTheSleeperOutlivesTheCancelledSync(t *testing.T) {
+	saved := assignJob
+	t.Cleanup(func() { assignJob = saved })
+	assignJob = func(syscall.Handle, int) error { return errors.New("cannot join for this test") }
+	done := filepath.Join(t.TempDir(), "ssh-done")
+	s, err := syncUntilSleeperRuns(t, fmt.Sprintf("sleep 3; : > '%s'; true", filepath.ToSlash(done)))
+	// Outside a job only git's launcher is killed; the real git.exe and sh keep
+	// their working directory in the clone until the stand-in ssh ends. Wait for
+	// them before the TempDirs are removed. This runs before the sleeper is
+	// killed, which is registered earlier.
+	t.Cleanup(func() {
+		for wait := time.Now().Add(15 * time.Second); time.Now().Before(wait); time.Sleep(100 * time.Millisecond) {
+			if _, err := os.Stat(done); err == nil {
+				break
+			}
+		}
+		time.Sleep(time.Second) // for git to exit after its ssh has
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the cancellation, got %v", err)
+	}
+	time.Sleep(time.Second) // as long as a kill could take to land
+	if processGone(t, s.pid) {
+		t.Fatalf("process %d ended although git ran outside any job: the tree-kill test cannot tell a job from no job", s.pid)
+	}
+}

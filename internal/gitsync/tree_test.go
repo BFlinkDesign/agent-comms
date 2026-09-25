@@ -32,6 +32,36 @@ func TestSleeperHelper(t *testing.T) {
 }
 
 func TestCancellingASyncKillsEveryProcessGitStarted(t *testing.T) {
+	s, err := syncUntilSleeperRuns(t, "sleep 60; true")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the cancellation, got %v", err)
+	}
+	// Termination is asynchronous; give it a moment, but far less than the
+	// sleeper's own two minutes.
+	deadline := time.Now().Add(10 * time.Second)
+	for !processGone(t, s.pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, started by git's ssh command, outlived the cancelled sync", s.pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s.gone = true
+}
+
+// sleeper is the process a stand-in ssh started.
+type sleeper struct {
+	pid  int
+	gone bool // proven ended, so its id may now belong to another process
+}
+
+// syncUntilSleeperRuns syncs against a remote whose stand-in ssh starts the
+// sleeper in the background and then runs sshTail, and cancels the sync as soon
+// as the sleeper is running. It returns the sleeper and what Sync returned. The
+// sleeper is a child of sh, which is a child of git, so only a kill of git's
+// whole tree reaches it. Unless the caller marks it gone, it is killed when the
+// test ends.
+func syncUntilSleeperRuns(t *testing.T, sshTail string) (*sleeper, error) {
+	t.Helper()
 	_, m := fleet(t, 1)
 	a := m[0]
 	exe, err := os.Executable()
@@ -40,11 +70,9 @@ func TestCancellingASyncKillsEveryProcessGitStarted(t *testing.T) {
 	}
 	pidfile := filepath.Join(t.TempDir(), "sleeper.pid")
 	t.Setenv(sleeperEnv, pidfile)
-	// A stand-in ssh that starts the sleeper in the background and then hangs:
-	// the sleeper is a child of sh, which is a child of git, so only a kill of
-	// git's whole tree reaches it. sh accepts a forward-slashed Windows path.
+	// sh accepts a forward-slashed Windows path.
 	run(t, a, "remote", "set-url", "origin", "ssh://git@example.invalid/journal.git")
-	t.Setenv("GIT_SSH_COMMAND", "'"+filepath.ToSlash(exe)+"' -test.run='^TestSleeperHelper$' & sleep 60; true")
+	t.Setenv("GIT_SSH_COMMAND", "'"+filepath.ToSlash(exe)+"' -test.run='^TestSleeperHelper$' & "+sshTail)
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
 
 	// Cancel as soon as the sleeper is running, so the test does not depend on
@@ -65,35 +93,22 @@ func TestCancellingASyncKillsEveryProcessGitStarted(t *testing.T) {
 		}
 	}()
 	_, err = Sync(ctx, options(a, "host-a"))
-	var sleeper int
+	s := &sleeper{}
 	select {
-	case sleeper = <-pid:
+	case s.pid = <-pid:
 	default:
 		t.Fatalf("the stand-in ssh never started the sleeper; sync returned %v", err)
 	}
-	// On failure, do not leave the sleeper running. Once it is proven gone its
-	// id may belong to another process, so it is not killed then.
-	gone := false
+	// Do not leave the sleeper running. Once it is proven gone its id may
+	// belong to another process, so it is not killed then.
 	t.Cleanup(func() {
-		if gone {
+		if s.gone {
 			return
 		}
-		if p, err := os.FindProcess(sleeper); err == nil {
+		if p, err := os.FindProcess(s.pid); err == nil {
 			_ = p.Kill()
 			_ = p.Release()
 		}
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected the cancellation, got %v", err)
-	}
-	// Termination is asynchronous; give it a moment, but far less than the
-	// sleeper's own two minutes.
-	deadline := time.Now().Add(10 * time.Second)
-	for !processGone(t, sleeper) {
-		if time.Now().After(deadline) {
-			t.Fatalf("process %d, started by git's ssh command, outlived the cancelled sync", sleeper)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	gone = true
+	return s, err
 }
