@@ -354,6 +354,10 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
 			strings.Join(res.Kept, ", "), store.Dir())
 	}
+	if len(res.Cleared) > 0 {
+		fmt.Fprintf(stdout, "removed %s that a killed git command left in the clone: %s\n",
+			plural(len(res.Cleared), "stale lock file"), strings.Join(res.Cleared, ", "))
+	}
 	return nil
 }
 

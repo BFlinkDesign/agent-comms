@@ -125,21 +125,28 @@ master or a credential-helper daemon does not survive from one git command to
 the next, and if fleetd itself dies mid-command git dies with it. The job is
 closed only once git's output has been read to the end, so a leftover that still
 holds that output open still costs a two-second wait, as on Unix, before it is
-ended, and that git command counts as failed. On Windows git cannot move automatic
-`gc`/`maintenance` into the background, so when a fetch starts one it runs inside
-the job and is ended with it on timeout. That can leave a lock file in the clone
-(`packed-refs.lock`, or a `.lock` under `refs/` or `objects/`); later syncs then
-fail with `Unable to create '...lock': File exists` until you delete the file the
-error names, once no git is running in that clone. If Windows will
+ended, and that git command counts as failed. Automatic `gc` and `maintenance`
+are off for every command a sync runs, so a sync never starts them inside its
+deadline. A git command killed on timeout can still leave a lock file (an
+`index.lock`, or a `.lock` under `refs/`); once fleetd holds its own sync lock, it
+removes any git lock in the clone older than ten minutes and says so (`cleared` in
+`--json`), and leaves a newer one alone. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
 seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
 all disabled, so a sync never waits for input and starts no daemon. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
-which is used as is.
+which is used as is. Variables that point git at a repository (`GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE` and the rest of `git rev-parse --local-env-vars`)
+are dropped, so fleetd run from a git hook still syncs its own clone. Journal
+commits are by `fleetd <fleetd@fleetd.invalid>`, never the PC's git identity,
+which may be missing or a private address GitHub refuses to publish.
 
 Every command takes `--json`, so one surface serves a person and a program. The
-journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.
+journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host; with no
+`COMMS_CHANNELS` and no `--dir`, at `~/.ai/channels/journal`, never in the current
+directory. A record appended after a torn one (a crash partway through a write)
+starts on a line of its own, so the fragment stays one malformed line.
 `PROTOCOL.md` carries the cell schema and the full command reference.
 
 Two defaults are deliberate and worth knowing before you use it:

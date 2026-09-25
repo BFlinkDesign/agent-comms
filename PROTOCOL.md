@@ -274,10 +274,15 @@ brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
 (`kept` in `--json`). Anything staged with `git add` and not committed is the
 exception: sync resets a staged edit to the remote's version and deletes a
-staged new file (`git fsck --lost-found` recovers either).
+staged new file (`git fsck --lost-found` recovers either). A git lock file older
+than ten minutes, left by a git command a timeout killed, is removed (`cleared` in
+`--json`). Journal commits are by `fleetd <fleetd@fleetd.invalid>`, and git's
+repository variables (`GIT_DIR` and the rest of `git rev-parse --local-env-vars`)
+are ignored, so a sync run from a git hook still syncs the journal clone.
 
 `fleetd` resolves its journal directory from `--dir`, else
-`$COMMS_CHANNELS/journal`, else `./channels/journal`. `fleetd where` reports an
+`$COMMS_CHANNELS/journal`, else `~/.ai/channels/journal` (never the current
+directory). `fleetd where` reports an
 error rather than "no records" when that directory does not exist, so a mistyped
 path is distinguishable from a machine that genuinely recorded nothing.
 

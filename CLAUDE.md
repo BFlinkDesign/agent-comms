@@ -125,6 +125,10 @@ changing any of them):
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
   is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces. On Windows, running
   git outside a job object because Windows refused one is a fallback, not a failure, and is not reported.
+- git runs only on the journal clone, as fleetd: `gitEnv` drops every variable
+  `git rev-parse --local-env-vars` lists (a git hook exports `GIT_DIR`, which once sent the journal
+  into the hook's repository) and sets a fixed author and committer. Automatic gc and maintenance are
+  off, and git lock files older than `staleLock` are cleared, because a killed git leaves them.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:
