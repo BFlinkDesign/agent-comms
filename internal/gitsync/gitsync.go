@@ -267,7 +267,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 		// Only a push that lost a race to another machine is retried; anything
 		// else, such as a refused credential, is reported as it is.
-		if !strings.Contains(out, "[rejected]") || res.Attempts >= MaxAttempts {
+		if !lostRace(out) || res.Attempts >= MaxAttempts {
 			return res, err
 		}
 	}
@@ -285,6 +285,27 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	res.Head = tip
 	return res, nil
+}
+
+// lostRace reports whether push's porcelain output says the push lost a race
+// to another machine: "[rejected]" when the remote had already moved, or
+// "[remote rejected]" for a ref the remote could not update because another push
+// was updating it, as GitHub reports a race it catches late. A remote rejection
+// for any other reason, such as a declined hook or a protected branch, is not a
+// race, and retrying it would only repeat it.
+func lostRace(out string) bool {
+	if strings.Contains(out, "[rejected]") {
+		return true
+	}
+	if !strings.Contains(out, "[remote rejected]") {
+		return false
+	}
+	for _, reason := range []string{"cannot lock ref", "failed to update ref", "incorrect old value"} {
+		if strings.Contains(out, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 // batchSSH returns the arguments that keep ssh from waiting for a person, or none

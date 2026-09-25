@@ -936,3 +936,24 @@ func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
 		t.Fatalf("the stale index.lock is still there: %v", err)
 	}
 }
+
+// A push that lost a race to another machine is retried however the remote
+// words it. GitHub reports a race it catches while updating the ref as
+// "[remote rejected] ... (cannot lock ref ...)", not "[rejected]". A rejection
+// for any other reason, a declined hook or a protected branch, is not a race,
+// and retrying it would only repeat it.
+func TestOnlyARaceIsRetried(t *testing.T) {
+	for out, want := range map[string]bool{
+		"To github.com:o/journal.git\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n":                                                            true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (cannot lock ref 'refs/heads/main': is at 3f1c but expected 1a2b)\n":                                    true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (failed to update ref)\n":                                                                               true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (incorrect old value provided)\n":                                                                       true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n":                                                                          false,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (protected branch hook declined)\n":                                                                     false,
+		"remote: Permission to o/journal.git denied to someone.\nfatal: unable to access 'https://github.com/o/journal.git/': The requested URL returned error: 403\n": false,
+	} {
+		if got := lostRace(out); got != want {
+			t.Errorf("lostRace(%q) = %v, want %v", out, got, want)
+		}
+	}
+}
