@@ -171,6 +171,9 @@ type Result struct {
 	// Kept lists files the remote changed that were left as they are, because
 	// this clone has changes to them that are not on the remote.
 	Kept []string `json:"kept,omitempty"`
+	// Cleared lists git lock files, relative to the git directory, that were
+	// older than staleLock and removed: left by a git command that was killed.
+	Cleared []string `json:"cleared,omitempty"`
 }
 
 type git struct {
@@ -210,11 +213,12 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	own := filepath.Base(o.File)
 
-	unlock, err := lock(g)
+	unlock, gitDir, err := lock(g)
 	if err != nil {
 		return res, err
 	}
 	defer unlock()
+	res.Cleared = clearStaleLocks(gitDir)
 
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {
@@ -500,29 +504,71 @@ func nulList(paths []string) []byte {
 
 // lock takes a lock file in the clone's git directory so two syncs of the same
 // clone never interleave. A lock older than staleLock is taken to be abandoned.
-func lock(g git) (func(), error) {
+func lock(g git) (func(), string, error) {
 	gitDir, err := g.line("rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	path := filepath.Join(gitDir, "fleetd-sync.lock")
+	path := filepath.Join(gitDir, syncLockName)
 	for range 2 {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			fmt.Fprintf(f, "%d\n", os.Getpid())
 			f.Close()
-			return func() { os.Remove(path) }, nil
+			return func() { os.Remove(path) }, gitDir, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return nil, err
+			return nil, "", err
 		}
 		info, statErr := os.Stat(path)
 		if statErr != nil || time.Since(info.ModTime()) < staleLock {
-			return nil, fmt.Errorf("%w: %s exists", ErrBusy, path)
+			return nil, "", fmt.Errorf("%w: %s exists", ErrBusy, path)
 		}
 		os.Remove(path)
 	}
-	return nil, fmt.Errorf("%w: %s exists", ErrBusy, path)
+	return nil, "", fmt.Errorf("%w: %s exists", ErrBusy, path)
+}
+
+// syncLockName is fleetd's own lock, in the clone's git directory.
+const syncLockName = "fleetd-sync.lock"
+
+// clearStaleLocks removes git's lock files in the git directory that are older
+// than staleLock, and returns their paths relative to it. git writes a file by
+// creating <file>.lock and renaming it into place; a git command killed on a
+// timeout leaves the .lock, and git never removes it, so every later command
+// that needs the file fails until someone deletes it. The caller holds fleetd's
+// sync lock on a clone fleetd owns, so a lock this old was left by a killed
+// command, not taken by a running one. The object store is not searched: only
+// gc and maintenance lock files there, and fleetd runs neither.
+func clearStaleLocks(gitDir string) []string {
+	var cleared []string
+	_ = filepath.WalkDir(gitDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(gitDir, path)
+		if relErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if rel == "objects" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() || !strings.HasSuffix(d.Name(), ".lock") || rel == syncLockName {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil || time.Since(info.ModTime()) < staleLock {
+			return nil
+		}
+		if os.Remove(path) == nil {
+			cleared = append(cleared, rel)
+		}
+		return nil
+	})
+	return cleared
 }
 
 // sameDir reports whether two paths name the same directory, after resolving

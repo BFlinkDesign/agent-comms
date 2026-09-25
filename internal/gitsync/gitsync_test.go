@@ -895,3 +895,44 @@ func TestASyncNeverStartsGitsAutomaticMaintenance(t *testing.T) {
 		}
 	}
 }
+
+// A git command the deadline kills can leave its lock file, which git never
+// removes: every later sync of that clone then fails, silently, inside a hook.
+// fleetd owns the clone and holds its own sync lock, so a git lock left for
+// longer than staleLock is a leftover, and is removed. A newer one is left
+// alone, since a git command may still be using it.
+func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
+	mustSync(t, options(b, "host-b"))
+	for _, name := range []string{"index.lock", filepath.Join("refs", "heads", "main.lock")} {
+		write(t, filepath.Join(a, ".git", name), "")
+	}
+
+	// Fresh locks may belong to a git command that is still running.
+	if _, err := Sync(context.Background(), options(a, "host-a")); err == nil {
+		t.Fatal("a sync ran over a fresh git lock")
+	}
+	for _, name := range []string{"index.lock", filepath.Join("refs", "heads", "main.lock")} {
+		if _, err := os.Stat(filepath.Join(a, ".git", name)); err != nil {
+			t.Fatalf("a fresh lock was removed: %v", err)
+		}
+		old := time.Now().Add(-staleLock - time.Minute)
+		if err := os.Chtimes(filepath.Join(a, ".git", name), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := mustSync(t, options(a, "host-a"))
+	if res.Received != 1 {
+		t.Fatalf("expected b's record once the stale locks were cleared: %+v", res)
+	}
+	want := []string{"index.lock", filepath.Join("refs", "heads", "main.lock")}
+	if !slices.Equal(res.Cleared, want) {
+		t.Fatalf("cleared %v, want %v", res.Cleared, want)
+	}
+	if _, err := os.Stat(filepath.Join(a, ".git", "index.lock")); !os.IsNotExist(err) {
+		t.Fatalf("the stale index.lock is still there: %v", err)
+	}
+}
