@@ -144,6 +144,15 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 	_, statErr := os.Lstat(p)
 	isNew := errors.Is(statErr, os.ErrNotExist)
 
+	// A crash partway through an earlier append leaves a fragment with no
+	// newline. Joined to it, this record would be lost with it, and published
+	// that way. It starts a line of its own instead, in the same single write, so
+	// the fragment stays one malformed line that readers report. A concurrent
+	// appender writes whole lines, so it can only make this add an empty line.
+	if !isNew && !endsWithNewline(p) {
+		line = "\n" + line
+	}
+
 	f, err := openAppend(p)
 	if err != nil {
 		return fmt.Errorf("journal: opening %s: %w", p, err)
@@ -173,6 +182,26 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 		}
 	}
 	return nil
+}
+
+// endsWithNewline reports whether a file is empty or ends with a newline. A file
+// that cannot be read is taken to be whole: the append that follows fails on it
+// anyway, or succeeds as before.
+func endsWithNewline(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return true
+	}
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, fi.Size()-1); err != nil {
+		return true
+	}
+	return last[0] == '\n'
 }
 
 // Record is one parsed journal line, kept as raw text plus the fields a reader

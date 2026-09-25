@@ -559,3 +559,36 @@ func TestJournalFileIsOwnerOnly(t *testing.T) {
 		t.Errorf("journal mode is %#o; it records local activity and should not be group- or world-readable", perm)
 	}
 }
+
+// A crash partway through an append leaves a fragment with no newline. The next
+// record must start on a line of its own: joined to the fragment, it would be
+// lost with it, and published that way to every machine.
+func TestAnAppendAfterATornRecordIsNotJoinedToIt(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "a", 0, "")); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, testStem+".jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"id":"hive:deadbeef","v":1,"type":"obs`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := s.Append(testHost, mustCell(t, "a", 1, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Read(testHost)
+	if len(got) != 2 {
+		t.Fatalf("read %d intact records, want both appended ones (err: %v)", len(got), err)
+	}
+	if err == nil || errors.Is(err, ErrTornRecord) {
+		t.Fatalf("err = %v, want the fragment reported as a malformed line of its own", err)
+	}
+}
