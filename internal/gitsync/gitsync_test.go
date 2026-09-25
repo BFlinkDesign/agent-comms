@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -379,6 +380,11 @@ func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected the deadline, got %v", err)
+	}
+	// A plain timeout says so and nothing more: the git that was killed for it
+	// exits unsuccessfully, which is not a second problem.
+	if !strings.HasSuffix(err.Error(), ": "+context.DeadlineExceeded.Error()) {
+		t.Fatalf("a plain timeout reads as more than one: %v", err)
 	}
 	if elapsed > time.Second+waitDelay+2*time.Second {
 		t.Fatalf("a hung remote held the sync for %v", elapsed)
@@ -802,4 +808,235 @@ func TestFsmonitorIsTurnedOffInAWayOldGitUnderstands(t *testing.T) {
 		}
 	}
 	t.Fatalf("git is run without core.fsmonitor turned off: %q", gitConfig)
+}
+
+// A git hook, or anything run from one, has GIT_DIR and friends in its
+// environment, pointing at the repository the hook belongs to. fleetd run there
+// must still sync its own journal clone and nothing else.
+func TestTheCallersGitEnvironmentCannotRedirectASync(t *testing.T) {
+	for _, withWorkTree := range []bool{false, true} {
+		t.Run(fmt.Sprintf("work tree set too: %v", withWorkTree), func(t *testing.T) {
+			journalRemote, m := fleet(t, 1)
+			a := m[0]
+			projectRemote, p := fleet(t, 1)
+			t.Setenv("GIT_DIR", filepath.Join(p[0], ".git"))
+			if withWorkTree {
+				t.Setenv("GIT_WORK_TREE", p[0])
+				t.Setenv("GIT_INDEX_FILE", filepath.Join(p[0], ".git", "index"))
+			}
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+			res, err := Sync(context.Background(), options(a, "host-a"))
+			if got := remoteFile(t, projectRemote, "host-a.jsonl"); got != "" {
+				t.Fatalf("the journal was pushed into the repository GIT_DIR names (sync returned %+v, %v)", res, err)
+			}
+			if err != nil || res.Published != 1 || remoteFile(t, journalRemote, "host-a.jsonl") == "" {
+				t.Fatalf("the record did not reach the journal's own remote: %+v, %v", res, err)
+			}
+		})
+	}
+}
+
+// Every variable git itself counts as local to a repository is cleared, so a
+// newer git that adds one fails here rather than in the field.
+func TestEveryRepositoryVariableGitKnowsIsCleared(t *testing.T) {
+	requireGit(t)
+	out, err := exec.Command("git", "rev-parse", "--local-env-vars").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range strings.Fields(string(out)) {
+		if name == "GIT_CONFIG_COUNT" {
+			// Kept on purpose, as git itself keeps it for a command it runs in
+			// another repository: see TestConfigurationTheEnvironmentSetsOnPurposeStillApplies.
+			continue
+		}
+		if !slices.Contains(repositoryVariables, name) {
+			t.Errorf("git reports %s as local to a repository, and fleetd would pass it on", name)
+		}
+	}
+}
+
+// Configuration the environment sets on purpose, through GIT_CONFIG_COUNT and
+// its GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n, still applies: IT policy, CI or a
+// sandbox may rewrite a URL, trust a directory or name an ssh command that way,
+// and git never sets GIT_CONFIG_COUNT itself (a parent git's -c travels in
+// GIT_CONFIG_PARAMETERS, which is dropped).
+func TestConfigurationTheEnvironmentSetsOnPurposeStillApplies(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "remote", "set-url", "origin", "journal-by-policy:journal")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url."+remote+".insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "journal-by-policy:journal")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	if res := mustSync(t, options(a, "host-a")); res.Published != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+	if remoteFile(t, remote, "host-a.jsonl") == "" {
+		t.Fatal("the record was not published through the URL the environment rewrote")
+	}
+}
+
+// git exports the dates of the commit it is making to its hooks, and an amend
+// carries the original commit's. A sync run from such a hook dates its journal
+// commit when the sync ran, not with the hook's dates.
+func TestJournalCommitsAreDatedWhenTheSyncRan(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	t.Setenv("GIT_AUTHOR_DATE", "@1009843200 +0000")
+	t.Setenv("GIT_COMMITTER_DATE", "@1009843200 +0000")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	before := time.Now().Add(-time.Minute).Unix()
+	mustSync(t, options(a, "host-a"))
+	out, err := exec.Command("git", "--git-dir", remote, "log", "-1", "--format=%at %ct", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range strings.Fields(string(out)) {
+		if at, _ := strconv.ParseInt(field, 10, 64); at < before {
+			t.Fatalf("the journal commit is dated %s (Unix seconds), not when the sync ran", out)
+		}
+	}
+}
+
+// A clone that nothing packs grows without end: every sync adds loose objects,
+// and git's automatic gc is off for every command a sync runs, so that none
+// starts inside a fetch. Once the clone holds packLimit loose objects, a
+// successful sync packs it.
+func TestAJournalCloneIsPackedOnceItHoldsPackLimitLooseObjects(t *testing.T) {
+	saved := packLimit
+	t.Cleanup(func() { packLimit = saved })
+	packLimit = 12
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	for i := range 6 {
+		appendLines(t, filepath.Join(b, "host-b.jsonl"), fmt.Sprintf(`{"id":"hive:b%d"}`, i))
+		mustSync(t, options(b, "host-b"))
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), fmt.Sprintf(`{"id":"hive:a%d"}`, i))
+		mustSync(t, options(a, "host-a"))
+	}
+	out := run(t, a, "count-objects", "-v")
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "count: "); ok {
+			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose >= packLimit {
+				t.Fatalf("machine a's clone holds %d loose objects after 12 syncs; it should have been packed at %d", loose, packLimit)
+			}
+			return
+		}
+	}
+	t.Fatalf("count-objects said %q", out)
+}
+
+// Journal commits are fleetd's, not the person's: a PC's git identity may be a
+// private address GitHub refuses to publish (GH007), may be missing altogether,
+// and does not belong in a shared journal's history either way.
+func TestJournalCommitsCarryFleetdsIdentityNotThePCs(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "--unset", "user.name")
+	run(t, a, "config", "--unset", "user.email")
+	t.Setenv("GIT_AUTHOR_NAME", "Someone Private")
+	t.Setenv("GIT_AUTHOR_EMAIL", "someone@example.com")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	out, err := exec.Command("git", "--git-dir", remote, "log", "-1", "--format=%an <%ae>|%cn <%ce>", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(out)), "fleetd <fleetd@fleetd.invalid>|fleetd <fleetd@fleetd.invalid>"; got != want {
+		t.Fatalf("journal commit identity = %q, want %q", got, want)
+	}
+}
+
+// git's automatic gc and maintenance can take longer than a sync's deadline, and
+// one killed partway leaves lock files that fail every later sync. A sync never
+// starts them; git's own trace shows whether it did.
+func TestASyncNeverStartsGitsAutomaticMaintenance(t *testing.T) {
+	remote, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	// The stand-in remote is a local repository, so its own receive-pack would
+	// start its own gc after a push, which a real remote does on its server.
+	run(t, a, "--git-dir", remote, "config", "receive.autogc", "false")
+	run(t, a, "config", "gc.auto", "1")
+	run(t, a, "config", "maintenance.auto", "true")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
+	mustSync(t, options(b, "host-b"))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
+	trace := filepath.Join(t.TempDir(), "trace2.json")
+	t.Setenv("GIT_TRACE2_EVENT", trace)
+	if res := mustSync(t, options(a, "host-a")); res.Received != 1 {
+		t.Fatalf("expected to receive b's record: %+v", res)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatalf("git wrote no trace, so this test proves nothing: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, `"event":"child_start"`) && strings.Contains(line, `"--auto"`) &&
+			(strings.Contains(line, `"maintenance"`) || strings.Contains(line, `"gc"`)) {
+			t.Fatalf("a sync started git's automatic maintenance: %s", line)
+		}
+	}
+}
+
+// A git command the deadline kills can leave its lock file, which git never
+// removes: every later sync of that clone then fails, silently, inside a hook.
+// fleetd owns the clone and holds its own sync lock, so a git lock left for
+// longer than staleLock is a leftover, and is removed. A newer one is left
+// alone, since a git command may still be using it.
+func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
+	mustSync(t, options(b, "host-b"))
+	for _, name := range []string{"index.lock", filepath.Join("refs", "heads", "main.lock")} {
+		write(t, filepath.Join(a, ".git", name), "")
+	}
+
+	// Fresh locks may belong to a git command that is still running.
+	if _, err := Sync(context.Background(), options(a, "host-a")); err == nil {
+		t.Fatal("a sync ran over a fresh git lock")
+	}
+	for _, name := range []string{"index.lock", filepath.Join("refs", "heads", "main.lock")} {
+		if _, err := os.Stat(filepath.Join(a, ".git", name)); err != nil {
+			t.Fatalf("a fresh lock was removed: %v", err)
+		}
+		old := time.Now().Add(-staleLock - time.Minute)
+		if err := os.Chtimes(filepath.Join(a, ".git", name), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := mustSync(t, options(a, "host-a"))
+	if res.Received != 1 {
+		t.Fatalf("expected b's record once the stale locks were cleared: %+v", res)
+	}
+	want := []string{"index.lock", filepath.Join("refs", "heads", "main.lock")}
+	if !slices.Equal(res.Cleared, want) {
+		t.Fatalf("cleared %v, want %v", res.Cleared, want)
+	}
+	if _, err := os.Stat(filepath.Join(a, ".git", "index.lock")); !os.IsNotExist(err) {
+		t.Fatalf("the stale index.lock is still there: %v", err)
+	}
+}
+
+// A push that lost a race to another machine is retried however the remote
+// words it. GitHub reports a race it catches while updating the ref as
+// "[remote rejected] ... (cannot lock ref ...)", not "[rejected]". A rejection
+// for any other reason, a declined hook or a protected branch, is not a race,
+// and retrying it would only repeat it.
+func TestOnlyARaceIsRetried(t *testing.T) {
+	for out, want := range map[string]bool{
+		"To github.com:o/journal.git\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n":                                                            true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (cannot lock ref 'refs/heads/main': is at 3f1c but expected 1a2b)\n":                                    true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (failed to update ref)\n":                                                                               true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (incorrect old value provided)\n":                                                                       true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n":                                                                          false,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (protected branch hook declined)\n":                                                                     false,
+		"remote: Permission to o/journal.git denied to someone.\nfatal: unable to access 'https://github.com/o/journal.git/': The requested URL returned error: 403\n": false,
+	} {
+		if got := lostRace(out); got != want {
+			t.Errorf("lostRace(%q) = %v, want %v", out, got, want)
+		}
+	}
 }

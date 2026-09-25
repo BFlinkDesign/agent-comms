@@ -41,6 +41,10 @@ const MaxAttempts = 3
 // when a child such as ssh keeps its output pipes open.
 const waitDelay = 2 * time.Second
 
+// packLimit is how many loose objects a journal clone may hold before a sync
+// packs it: every sync adds a few, and git's automatic gc is off inside one.
+var packLimit = 1000
+
 // staleLock is how old a sync lock must be before another sync may break it.
 const staleLock = 10 * time.Minute
 
@@ -63,13 +67,66 @@ var (
 // gitConfig is the configuration every git command runs with. core.fsmonitor
 // is emptied rather than set to false: git before 2.36 reads it only as a hook's
 // path, so "false" would name a hook to run, while every version reads an empty
-// value as no fsmonitor at all.
+// value as no fsmonitor at all. Automatic gc and maintenance are off: a fetch
+// would otherwise start them inside the sync's deadline, and one killed partway
+// leaves lock files that fail every later sync until someone deletes them.
 var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.fsmonitor="}
+	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false"}
+
+// repositoryVariables are the variables git reads to find a repository, its
+// index or its objects, and a git command's own -c settings, as
+// `git rev-parse --local-env-vars` lists them. git exports some of them to its
+// hooks, so fleetd run from a hook, or from anything a hook starts, would
+// otherwise point every command below at the hook's repository: publishing the
+// journal into it, or refusing to sync at all. GIT_CONFIG_COUNT is not among
+// them, as git itself keeps it for a command it runs in another repository:
+// git never sets it, so it is configuration the environment sets on purpose,
+// such as a URL rewrite, a trusted directory or an ssh command.
+var repositoryVariables = []string{
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+	"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+	"GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+	"GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+}
+
+// commitDates are dropped too: git exports the dates of the commit it is making
+// to its hooks, and an amend carries the original commit's, so a sync run from a
+// hook would otherwise date its journal commit years back.
+var commitDates = []string{"GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"}
+
+// identity is who fleetd's journal commits are by. It is not the person's: a
+// PC's git identity may be missing, which fails commit-tree, or a private
+// address GitHub refuses to publish (push declined, GH007), and it does not
+// belong in a journal every machine reads. The host is in each commit's message
+// and file already.
+var identity = []string{"GIT_AUTHOR_NAME=fleetd", "GIT_AUTHOR_EMAIL=fleetd@fleetd.invalid",
+	"GIT_COMMITTER_NAME=fleetd", "GIT_COMMITTER_EMAIL=fleetd@fleetd.invalid"}
+
+// gitEnv is the environment every git command runs with: this process's, less
+// the variables that would point git at another repository or name another
+// author, plus fleetd's own settings. Names are compared ignoring case, as
+// Windows does.
+func gitEnv() []string {
+	env := make([]string, 0, len(os.Environ())+8)
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.ContainsFunc(repositoryVariables, func(v string) bool { return strings.EqualFold(v, name) }) ||
+			slices.ContainsFunc(commitDates, func(v string) bool { return strings.EqualFold(v, name) }) ||
+			slices.ContainsFunc(identity, func(v string) bool { return strings.EqualFold(v[:strings.IndexByte(v, '=')], name) }) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+	return append(env, identity...)
+}
 
 // Runner runs git with args in dir, feeding it stdin, and returns its standard
 // output exactly as written.
 type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error)
+
+// runGitTree is runTree, as a variable so a test can stand in for it.
+var runGitTree = runTree
 
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
 // terminal and credential prompts are off, hooks do not run, and commits are
@@ -89,7 +146,7 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		cmd := exec.CommandContext(ctx, "git", full...)
 		cmd.Dir = dir
 		cmd.WaitDelay = waitDelay
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+		cmd.Env = gitEnv()
 		if stdin != nil {
 			cmd.Stdin = bytes.NewReader(stdin)
 		}
@@ -97,13 +154,30 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 		cmd.Stderr = &stderr
 		return cmd
 	}
-	if err := runTree(newCmd); err != nil {
-		if ctx.Err() != nil {
-			return stdout.String(), fmt.Errorf("git %s: %w", strings.Join(args, " "), ctx.Err())
+	if err := runGitTree(newCmd); err != nil {
+		name := strings.Join(args, " ")
+		ctxErr := ctx.Err()
+		switch {
+		case ctxErr == nil:
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		case errors.Is(err, ctxErr), isExit(err):
+			// Killing git is how the context's end stops it, and a killed git
+			// exits unsuccessfully: that is all the timeout, not a second problem.
+			return stdout.String(), fmt.Errorf("git %s: %w", name, ctxErr)
+		default:
+			// The context ended and something more went wrong, such as a git
+			// that could not be killed and was left behind: say both.
+			return stdout.String(), fmt.Errorf("git %s: %w: %w", name, ctxErr, err)
 		}
-		return stdout.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// isExit reports whether err is git exiting unsuccessfully, as opposed to git
+// not starting or not being ended.
+func isExit(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit)
 }
 
 // Options says what to publish.
@@ -131,6 +205,11 @@ type Result struct {
 	// Kept lists files the remote changed that were left as they are, because
 	// this clone has changes to them that are not on the remote.
 	Kept []string `json:"kept,omitempty"`
+	// Cleared lists git lock files, relative to the git directory, that were
+	// older than staleLock and removed: left by a git command that was killed.
+	Cleared []string `json:"cleared,omitempty"`
+	// Packed is set when the sync packed the clone's loose objects.
+	Packed bool `json:"packed,omitempty"`
 }
 
 type git struct {
@@ -170,11 +249,12 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	own := filepath.Base(o.File)
 
-	unlock, err := lock(g)
+	unlock, gitDir, err := lock(g)
 	if err != nil {
 		return res, err
 	}
 	defer unlock()
+	res.Cleared = clearStaleLocks(gitDir)
 
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {
@@ -223,7 +303,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 		// Only a push that lost a race to another machine is retried; anything
 		// else, such as a refused credential, is reported as it is.
-		if !strings.Contains(out, "[rejected]") || res.Attempts >= MaxAttempts {
+		if !lostRace(out) || res.Attempts >= MaxAttempts {
 			return res, err
 		}
 	}
@@ -240,7 +320,53 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		return res, err
 	}
 	res.Head = tip
+	res.Packed = pack(g)
 	return res, nil
+}
+
+// pack packs the clone once it holds packLimit loose objects. Every sync adds a
+// few, and every fetch of fewer than a hundred objects adds them loose, so a
+// clone nothing packs grows without end. git's automatic gc is off for every
+// command above, so that none starts inside a fetch; this runs gc at the end
+// instead, once the sync has done its work, with what is left of its deadline.
+// It is best effort: a clone that is not packed still syncs, and a gc the
+// deadline kills leaves lock files that a later sync clears.
+func pack(g git) bool {
+	out, err := g.line("count-objects", "-v")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "count: "); ok {
+			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose < packLimit {
+				return false
+			}
+			_, err := g.line("gc", "--quiet")
+			return err == nil
+		}
+	}
+	return false
+}
+
+// lostRace reports whether push's porcelain output says the push lost a race
+// to another machine: "[rejected]" when the remote had already moved, or
+// "[remote rejected]" for a ref the remote could not update because another push
+// was updating it, as GitHub reports a race it catches late. A remote rejection
+// for any other reason, such as a declined hook or a protected branch, is not a
+// race, and retrying it would only repeat it.
+func lostRace(out string) bool {
+	if strings.Contains(out, "[rejected]") {
+		return true
+	}
+	if !strings.Contains(out, "[remote rejected]") {
+		return false
+	}
+	for _, reason := range []string{"cannot lock ref", "failed to update ref", "incorrect old value"} {
+		if strings.Contains(out, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 // batchSSH returns the arguments that keep ssh from waiting for a person, or none
@@ -460,29 +586,71 @@ func nulList(paths []string) []byte {
 
 // lock takes a lock file in the clone's git directory so two syncs of the same
 // clone never interleave. A lock older than staleLock is taken to be abandoned.
-func lock(g git) (func(), error) {
+func lock(g git) (func(), string, error) {
 	gitDir, err := g.line("rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	path := filepath.Join(gitDir, "fleetd-sync.lock")
+	path := filepath.Join(gitDir, syncLockName)
 	for range 2 {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			fmt.Fprintf(f, "%d\n", os.Getpid())
 			f.Close()
-			return func() { os.Remove(path) }, nil
+			return func() { os.Remove(path) }, gitDir, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return nil, err
+			return nil, "", err
 		}
 		info, statErr := os.Stat(path)
 		if statErr != nil || time.Since(info.ModTime()) < staleLock {
-			return nil, fmt.Errorf("%w: %s exists", ErrBusy, path)
+			return nil, "", fmt.Errorf("%w: %s exists", ErrBusy, path)
 		}
 		os.Remove(path)
 	}
-	return nil, fmt.Errorf("%w: %s exists", ErrBusy, path)
+	return nil, "", fmt.Errorf("%w: %s exists", ErrBusy, path)
+}
+
+// syncLockName is fleetd's own lock, in the clone's git directory.
+const syncLockName = "fleetd-sync.lock"
+
+// clearStaleLocks removes git's lock files in the git directory that are older
+// than staleLock, and returns their paths relative to it. git writes a file by
+// creating <file>.lock and renaming it into place; a git command killed on a
+// timeout leaves the .lock, and git never removes it, so every later command
+// that needs the file fails until someone deletes it. The caller holds fleetd's
+// sync lock on a clone fleetd owns, so a lock this old was left by a killed
+// command, not taken by a running one. The object store is not searched: only
+// gc and maintenance lock files there, and fleetd runs neither.
+func clearStaleLocks(gitDir string) []string {
+	var cleared []string
+	_ = filepath.WalkDir(gitDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(gitDir, path)
+		if relErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if rel == "objects" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() || !strings.HasSuffix(d.Name(), ".lock") || rel == syncLockName {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil || time.Since(info.ModTime()) < staleLock {
+			return nil
+		}
+		if os.Remove(path) == nil {
+			cleared = append(cleared, rel)
+		}
+		return nil
+	})
+	return cleared
 }
 
 // sameDir reports whether two paths name the same directory, after resolving

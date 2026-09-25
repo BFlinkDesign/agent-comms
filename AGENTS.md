@@ -125,21 +125,48 @@ master or a credential-helper daemon does not survive from one git command to
 the next, and if fleetd itself dies mid-command git dies with it. The job is
 closed only once git's output has been read to the end, so a leftover that still
 holds that output open still costs a two-second wait, as on Unix, before it is
-ended, and that git command counts as failed. On Windows git cannot move automatic
-`gc`/`maintenance` into the background, so when a fetch starts one it runs inside
-the job and is ended with it on timeout. That can leave a lock file in the clone
-(`packed-refs.lock`, or a `.lock` under `refs/` or `objects/`); later syncs then
-fail with `Unable to create '...lock': File exists` until you delete the file the
-error names, once no git is running in that clone. If Windows will
+ended, and that git command counts as failed. Automatic `gc` and `maintenance`
+are off for every command a sync runs, so a sync never starts them inside its
+deadline. Instead, once a sync has done its work and the clone holds a thousand
+loose objects, it runs `git gc` with what is left of its deadline (`packed` in
+`--json`), so the clone does not grow without end. A git command killed on timeout
+can still leave a lock file (an `index.lock`, or a `.lock` under `refs/`); once
+fleetd holds its own sync lock, it removes any git lock in the clone older than ten
+minutes and says so (`cleared` in `--json`, and on stderr when the sync then
+fails), and leaves a newer one alone. A git command a person leaves running in the
+clone for over ten minutes, such as a commit with its editor open, loses its lock
+the same way: the clone is fleetd's. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
 seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
 all disabled, so a sync never waits for input and starts no daemon. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
-which is used as is.
+which is used as is. Variables that point git at a repository or carry a git
+command's own `-c` settings (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_CONFIG_PARAMETERS` and the rest of `git rev-parse --local-env-vars`) are
+dropped, and so are the commit dates a git hook exports, so fleetd run from a git
+hook still syncs its own clone and dates its commits when it runs.
+`GIT_CONFIG_COUNT` is kept, as git itself keeps it: configuration the environment
+sets on purpose that way (a URL rewrite, a trusted directory, an ssh command) still
+applies. Journal commits are by `fleetd <fleetd@fleetd.invalid>`, never the PC's
+git identity, which may be missing or a private address GitHub refuses to publish.
 
 Every command takes `--json`, so one surface serves a person and a program. The
-journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host.
+journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host; with no
+`COMMS_CHANNELS` and no `--dir`, at `~/.ai/channels/journal`, never in the current
+directory. On Windows `~` is `%USERPROFILE%`, which is not always Git Bash's `~`:
+Git Bash sets `HOME` to `%HOMEDRIVE%%HOMEPATH%` when that exists, as it can on a
+domain PC with a network home folder, so clone the journal into
+`%USERPROFILE%\.ai\channels\journal`, not `$HOME/.ai/channels/journal`.
+
+**Upgrading from fleetd-v0.1.0: run `fleetd sync` with the old version first.**
+Two changes in how fleetd finds things could otherwise leave records behind that
+the old version wrote and never synced:
+- The default journal directory is now the home directory, where v0.1.0 used the
+  current directory.
+- On a Windows PC where `reg.exe` could not be read, the host id is now derived
+  from MachineGuid, where v0.1.0 fell back to the hostname. A record appended after a torn one (a crash partway through a write)
+starts on a line of its own, so the fragment stays one malformed line.
 `PROTOCOL.md` carries the cell schema and the full command reference.
 
 Two defaults are deliberate and worth knowing before you use it:
