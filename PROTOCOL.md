@@ -259,14 +259,23 @@ comms belief <channel> <claim> [confidence]
 comms refute <belief_id> <reason> [correction] [channel]
 
 # Host attribution (fleetd — a separate single static binary, no runtime)
-fleetd host   [--json] [--salt S]
+fleetd init   [--json] [--dir D] [--salt S] [--timeout 2m] URL
+fleetd host   [--json] [--dir D] [--salt S]
 fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
 fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
 fleetd where  [--json] [--dir D] [--limit N]
 ```
 
+`fleetd init URL` sets up the journal directory as a clone of the journal
+repository, once per machine. An empty repository gets a first commit holding
+`fleetd.json` (`{"salt": ...}`, plus an `about` line). A repository whose top level
+holds anything but `*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
+`.gitattributes` is refused. A journal directory holding records written before
+init keeps them in the clone; one holding anything else is refused.
+
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository, with an upstream branch. It publishes only this host's
+journal repository, with an upstream branch. It notes each outcome in the clone's
+`.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never writes that file. A push rejected
 because another machine pushed first is retried, up to three attempts. It then
@@ -289,10 +298,16 @@ the journal clone.
 `$COMMS_CHANNELS/journal`, else `~/.ai/channels/journal` (never the current
 directory). `fleetd where` reports an
 error rather than "no records" when that directory does not exist, so a mistyped
-path is distinguishable from a machine that genuinely recorded nothing.
+path is distinguishable from a machine that genuinely recorded nothing. For each
+host, `where --json` adds `last_published` (when the remote, as of this clone's
+last sync, last took the host's records, by the publisher's clock) and
+`unpublished` (the host's complete records here that the remote lacks), when the
+journal is a clone.
 
-`--salt` (or `$FLEET_SALT`) must be identical on every machine in the fleet, or
-one machine will appear as several. It is not a credential.
+The salt is the one in the journal's `fleetd.json`. `--salt` (or `$FLEET_SALT`)
+may repeat it but not contradict it; without `fleetd.json` they supply it. It
+must be identical on every machine in the fleet, or one machine will appear as
+several. It is not a credential.
 
 DOES NOT EXIST (never use):
 - comms join

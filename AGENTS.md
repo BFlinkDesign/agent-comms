@@ -89,11 +89,21 @@ and `internal/`, so it runs on a host that has no Python and participates in the
 through the documented extension point — any process that can append a file.
 
 ```
+fleetd init URL                 set up this machine's journal, once
 fleetd host                     what this machine is, and how much that is worth
 fleetd record --type T --note N append one host-attributed record
 fleetd sync                     publish this machine's records, receive the others'
-fleetd where                    per machine, what it was last doing
+fleetd where                    per machine, what it was last doing, and how fresh that is
 ```
+
+`fleetd init URL` sets a machine up, once. It clones the journal repository into
+the journal directory. When the repository is empty, its first commit holds
+`fleetd.json` with a salt for the fleet, and every later machine that clones it
+uses that salt. It refuses a repository whose files are not a journal's, and a
+directory holding anything but journal files. Records written there before init
+(by a hook installed first, say) are kept in the clone, for the next sync to
+publish. When two machines start the same empty repository at once, the one whose
+push loses takes the other's commit and salt.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never
@@ -190,6 +200,13 @@ Two defaults are deliberate and worth knowing before you use it:
   answering "no records". An empty answer that is indistinguishable from a
   mistyped path is the worst available output for a tool whose only job is
   saying which machine did something.
+- **`fleetd where` says how fresh its answer is.** Every sync notes its outcome in
+  the clone's git directory, and `where` reports it: when this machine last
+  synced, and whether its last sync failed and why. For each machine it gives when
+  the remote last received its records (`last_published` in `--json`) and how
+  many of them this machine holds that the remote lacks (`unpublished`). A
+  machine whose syncs keep failing, or a second identity whose records no sync
+  publishes, shows up there rather than looking idle.
 
 Three things about it are load-bearing, and each exists because the naive version
 was wrong:
@@ -197,8 +214,11 @@ was wrong:
 - **Host identity is derived, not assumed.** `internal/hostid` reads
   `/etc/machine-id`, the Windows `MachineGuid`, or the macOS `IOPlatformUUID`, and
   publishes only a salted digest of it — a hardware fingerprint committed to a
-  repository has left the machine. Set `FLEET_SALT` to the *same* value on every
-  host or one machine will appear as several. When no stable source is readable it
+  repository has left the machine. The salt is the one in the journal's
+  `fleetd.json`, so every machine that clones the journal uses the same one, with
+  nothing to set in its environment. `--salt` or `FLEET_SALT` may repeat it but
+  not contradict it: fleetd refuses rather than file this machine's records under
+  a second id that no sync would publish. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
   change if the machine is renamed and may collide with another machine of that
   name. A weak identity is labelled weak rather than presented as a strong one.
