@@ -114,7 +114,15 @@ process it started (ssh, a remote helper) are killed: a process group on Unix, a
 job object on Windows. On Windows the job also ends anything git leaves running
 when each git command returns, not only on timeout, so an ssh ControlPersist
 master or a credential-helper daemon does not survive from one git command to
-the next, and if fleetd itself dies mid-command git dies with it. If Windows will
+the next, and if fleetd itself dies mid-command git dies with it. The job is
+closed only once git's output has been read to the end, so a leftover that still
+holds that output open still costs a two-second wait, as on Unix, before it is
+ended, and that git command counts as failed. On Windows git cannot move automatic
+`gc`/`maintenance` into the background, so when a fetch starts one it runs inside
+the job and is ended with it on timeout. That can leave a lock file in the clone
+(`packed-refs.lock`, or a `.lock` under `refs/` or `objects/`); later syncs then
+fail with `Unable to create '...lock': File exists` until you delete the file the
+error names, once no git is running in that clone. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
 seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
