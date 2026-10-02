@@ -35,9 +35,10 @@ jobs:
   # target for this binary, not an afterthought. A gate that cannot see half the code
   # is not a gate.
   #
-  # No setup-go action is used: Go is preinstalled on both runner images, and go.mod
-  # states a minor-version floor, so this avoids adding an action whose pinned commit
-  # would otherwise have to be taken on trust.
+  # No setup-go action is used: the Go preinstalled on both runner images reads
+  # go.mod's toolchain line and runs that Go, which it downloads and checks against
+  # the Go checksum database, so no action's pinned commit has to be taken on trust.
+  # The Report toolchain step shows which Go that was.
   go:
     name: go (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

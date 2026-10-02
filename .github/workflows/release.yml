@@ -80,6 +80,8 @@ jobs:
               -o "dist/fleetd-$os-$arch$ext" ./cmd/fleetd
           done
           ./dist/fleetd-windows-amd64.exe version
+          # Which Go built the release, which go.mod's toolchain line sets.
+          go version ./dist/fleetd-windows-amd64.exe
           cp scripts/install-fleetd.ps1 dist/
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
 
