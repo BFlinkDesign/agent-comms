@@ -94,6 +94,7 @@ fleetd host                     what this machine is, and how much that is worth
 fleetd record --type T --note N append one host-attributed record
 fleetd sync                     publish this machine's records, receive the others'
 fleetd where                    per machine, what it was last doing, and how fresh that is
+fleetd hook <tool>              record a Claude Code, Cursor, Codex or Grok event
 ```
 
 `fleetd init URL` sets a machine up, once. It clones the journal repository into
@@ -257,6 +258,194 @@ reader tell it is the same record. A content-derived id makes them collide, so t
 reader can collapse them. Anything appended to a journal through the raw plane's
 uuid4 path therefore cannot be deduplicated across hosts; that is a property of
 that plane, not a defect in it, and it is the reason `fleetd` does not use it.
+
+### `fleetd hook`: recording AI CLI sessions without anyone remembering to
+
+`fleetd hook <tool>` is what a tool's own hook configuration runs. The tool can be
+`claude`, `cursor`, `codex` or `grok`. Each of their hook systems, payloads and
+exit-code contracts was checked against the tool's own documentation on
+2026-09-25. The hook reads the event the way the tool documents it: JSON on stdin,
+or for Codex's `notify` program, JSON as the last argument. It then appends one
+record through the same code path as `fleetd record`, with:
+
+- `from` set to the tool;
+- type `session` when a session ended, `turn` when a turn did, and `hook` for any
+  other event;
+- note `<tool> <event>`, and `tool`, `event` and `session` (the tool's session id)
+  in the record's data;
+- `repo` and `branch` taken from the git repository at the event's working
+  directory: the basename of `git -C <cwd> rev-parse --show-toplevel`, and
+  `git branch --show-current`. The working directory is `cwd`, or
+  `workspace_roots[0]` for Cursor. In a linked worktree the repo is the
+  worktree's directory name.
+
+An event outside a repository, or with no working directory, is recorded without
+repo and branch. The working directory itself is never recorded, because it
+usually contains the account name. Neither are transcripts, prompts or replies.
+Unknown payload fields are ignored.
+
+**A session's turns are recorded at most once every 30 minutes.** A turn ends
+after every reply. One record per half hour says where the work happened as well
+as one per reply would, and keeps each machine's file, which every machine
+reads, small. The check reads only the end of this machine's file and runs
+before git is asked anything, so a skipped turn costs almost nothing. A session
+end is always recorded.
+
+**A session end syncs; a turn from a tool's own hooks does not.** A tool runs its
+per-turn hook (Stop, `stop`) while the person waits, so a sync there would add a
+fetch and a push to an answer. A sync publishes this machine's whole file, so a
+turn's record goes out with the next sync. That sync is bounded by `--timeout`
+(default 40s). `--no-sync` records only.
+
+- **Codex's hooks never sync.** Its SessionEnd hook may run for at most 3
+  seconds, which is too short for a fetch and a push, and a sync killed partway
+  leaves its lock behind for ten minutes.
+- **Codex's `notify` program does sync every turn it records.** Codex starts it
+  and neither waits for it nor limits it, so a machine that runs only Codex
+  still publishes.
+- **Another sync already running is not a problem.** If one is running when a
+  hook syncs, the next sync publishes the record.
+
+**A hook never disturbs the session it runs in.** Every one of these tools gives
+a hook's exit code and output a meaning:
+
+- exit 2 from a Stop hook keeps Claude Code or Grok working;
+- Codex fails a Stop hook that prints plain text;
+- Cursor submits a `followup_message` that a stop hook prints as the next user
+  message;
+- a non-zero exit shows an error in the session.
+
+So `fleetd hook` prints nothing and always exits 0, even for a bad flag, `-h` or a
+panic. It appends any problem to **`fleetd-hook.log` beside the journal
+directory**: with the default journal, `~/.ai/channels/fleetd-hook.log`. Problems
+include a payload that isn't JSON, a salt that contradicts the journal's, or a
+sync that failed or timed out. `fleetd where` names the log and quotes its last
+line while a problem is less than a week old. Once the log reaches 256 KiB it is
+moved to `fleetd-hook.log.1`, replacing the previous copy, so the log never
+grows past two files. `--json` prints what the hook did, for trying it by hand.
+Never put `--json` in a tool's configuration.
+
+**The journal directory must be absolute.** It is `--dir`, else
+`$COMMS_CHANNELS/journal`, else `~/.ai/channels/journal`, and a relative `--dir`
+or `COMMS_CHANNELS` is refused. A hook runs in whatever directory the tool
+chose, usually the project, so a relative journal would scatter records across
+every project worked in.
+
+**One tool's hook fires inside the others' sessions.** By default, Cursor and
+Grok both run the hooks in `~/.claude/settings.json`, and Grok also runs
+`~/.cursor/hooks.json`. The hook tells the sender from its payload and
+environment:
+
+- Grok's events carry `hookEventName`, and Grok sets `GROK_HOOK_EVENT`;
+- Cursor's events carry `cursor_version`, and Cursor sets `CURSOR_VERSION`.
+
+It records nothing when the sender isn't the tool it was configured for, since
+recording the event would either misattribute it or duplicate what that tool's
+own hook records. So configure `fleetd hook <tool>` in every tool you use. With
+only Claude Code's hook configured, Cursor and Grok sessions are not recorded.
+
+#### Setting it up on a Windows PC
+
+1. `install-fleetd.ps1` puts `fleetd.exe` in `%USERPROFILE%\bin` and on the
+   user PATH. That is how the configurations below find it.
+2. Run `fleetd init <journal repository URL>` once, from any directory. It
+   clones the journal to `%USERPROFILE%\.ai\channels\journal`, with the fleet's
+   salt in it, so no environment variable needs setting. The first PC to run it
+   on an empty repository starts the journal.
+3. Add the configurations below, then restart each tool so it reads them.
+
+Each tool's session-end entry allows 60 seconds, so that fleetd's own 40-second
+limit on the sync is always the one that stops it.
+
+**Claude Code**: `%USERPROFILE%\.claude\settings.json`. Exec form (`args` set)
+resolves `fleetd.exe` on PATH with no shell in between.
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "fleetd.exe", "args": ["hook", "claude"], "timeout": 30 } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "fleetd.exe", "args": ["hook", "claude"], "timeout": 30 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "fleetd.exe", "args": ["hook", "claude"], "timeout": 60 } ] }
+    ]
+  }
+}
+```
+
+SessionEnd hooks share a 1.5-second budget unless a hook sets a longer
+`timeout`, which raises it to at most 60 seconds, so keep the 60.
+
+**Cursor**: `%USERPROFILE%\.cursor\hooks.json`. Cursor documents
+`~/.cursor/hooks.json`; that this is the Windows location is inferred.
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "stop": [ { "command": "fleetd.exe hook cursor", "timeout": 30 } ],
+    "sessionEnd": [ { "command": "fleetd.exe hook cursor", "timeout": 60 } ]
+  }
+}
+```
+
+**Codex**: its `notify` program, at the top level of
+`%USERPROFILE%\.codex\config.toml`, before any table. It needs no trust. Codex
+adds the event as the last argument, and a turn it records is synced at once:
+
+```toml
+notify = ["fleetd.exe", "hook", "codex"]
+```
+
+Codex's hooks work too, instead of `notify` rather than as well as it, or every
+turn is recorded twice. Codex skips a hook until you trust it, and trust is tied
+to the hook's exact definition, so run `/hooks` in Codex after adding or editing
+these. Codex's hooks never sync; the machine's next sync publishes their
+records.
+
+```toml
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "fleetd hook codex"
+command_windows = "fleetd.exe hook codex"
+timeout = 30
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "fleetd hook codex"
+command_windows = "fleetd.exe hook codex"
+timeout = 3
+```
+
+**Grok Build**: `%USERPROFILE%\.grok\hooks\fleetd.json`. Grok documents
+`~/.grok/hooks/*.json`; the Windows location is inferred from its
+documented `%USERPROFILE%\.grok\config.toml`. Grok also loads Claude Code's
+hooks, but an open Grok bug (xai-org/plugin-marketplace#236) reports that those
+never run, so give Grok its own:
+
+```json
+{
+  "hooks": {
+    "Stop": [ { "hooks": [ { "type": "command", "command": "fleetd.exe hook grok", "timeout": 30 } ] } ],
+    "StopFailure": [ { "hooks": [ { "type": "command", "command": "fleetd.exe hook grok", "timeout": 30 } ] } ],
+    "SessionEnd": [ { "hooks": [ { "type": "command", "command": "fleetd.exe hook grok", "timeout": 60 } ] } ]
+  }
+}
+```
+
+Grok fires one more Stop when a session ends (reason `channel_closed` or
+`shutdown`), and fleetd leaves that to SessionEnd. It also records nothing for a
+subagent's events (`subagentType`).
+
+None of these configurations has yet been run by the tool on a Windows PC. The
+tests feed each tool's own documented example event through `fleetd hook`
+against real repositories and a real remote. They cannot show a tool starting
+the hook.
 
 ## Dependencies
 

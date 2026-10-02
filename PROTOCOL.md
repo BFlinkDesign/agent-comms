@@ -123,7 +123,7 @@ Empty msg field = protocol violation. Agents that post empty cells are broken.
 }
 ```
 
-### Observation Cell (type="observation" | "handoff" | "note", channel="journal")
+### Observation Cell (type="observation" | "handoff" | "note" | "session" | "turn" | "hook", channel="journal")
 
 Written by `fleetd` (see the Fleet Command Reference below) to record **which
 machine** did a piece of work. Git records no such thing: a commit carries an
@@ -166,6 +166,7 @@ same id for a reader to collapse the duplicate.
 | `host.source` | Where `host.id` came from: `linux:machine-id`, `windows:MachineGuid`, `darwin:IOPlatformUUID`, or `hostname-only`. |
 | `host.stable` | `false` means no stable identifier was readable and the id is hostname-derived: it changes if the machine is renamed and may collide with another machine of that name. |
 | `note` / `repo` / `branch` | Optional, present only when supplied. |
+| `tool` / `event` / `session` | Written by `fleetd hook`: the AI tool, its event name as the tool spells it, and its session id. The record's type is `session` for a session end, `turn` for a turn end, `hook` for any other event. |
 | `user` | Optional. Present **only** with `--include-user`: on a domain-joined host the OS account name carries the domain with it, and these records are committed. |
 
 `ts` carries nanosecond precision. At whole-second resolution two distinct
@@ -264,7 +265,16 @@ fleetd host   [--json] [--dir D] [--salt S]
 fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
 fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
 fleetd where  [--json] [--dir D] [--limit N]
+fleetd hook   <claude|cursor|codex|grok> [--dir D] [--salt S] [--timeout 40s] [--no-sync] [--json] [event-json]
 ```
+
+`fleetd hook` is what an AI tool's own hook configuration runs; AGENTS.md has
+the configuration for each tool. It reads the tool's event (JSON on stdin, or the
+last argument for Codex's `notify`) and records it as above. A session's turns
+are recorded at most once every 30 minutes. A session end, and a turn Codex's
+`notify` records, then syncs. It prints nothing, always exits 0, and logs any
+problem to `fleetd-hook.log` beside the journal directory, which `fleetd where`
+mentions for a week.
 
 `fleetd init URL` sets up the journal directory as a clone of the journal
 repository, once per machine. An empty repository gets a first commit holding
