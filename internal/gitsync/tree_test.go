@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -107,4 +108,34 @@ func syncUntilSleeperRuns(t *testing.T, sshTail string) (*sleeper, error) {
 		}
 	})
 	return s, err
+}
+
+// When the context ends and something else also went wrong, such as a git that
+// could not be killed and was left behind, the error says both, so it does not
+// read as a plain timeout. A plain timeout still reads as one.
+func TestATimeoutDoesNotHideWhatElseWentWrong(t *testing.T) {
+	saved := runGitTree
+	t.Cleanup(func() { runGitTree = saved })
+	stuck := errors.New("git could not be killed")
+	for _, tc := range []struct {
+		name string
+		err  error // what running git returns after the context ends
+		want string
+	}{
+		{"something else", stuck, "git version: context canceled: git could not be killed"},
+		{"only the timeout", context.Canceled, "git version: context canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runGitTree = func(func() *exec.Cmd) error {
+				cancel()
+				return tc.err
+			}
+			_, err := Git(ctx, t.TempDir(), nil, "version")
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, tc.err) || err.Error() != tc.want {
+				t.Fatalf("err = %q, want %q wrapping both errors", err, tc.want)
+			}
+		})
+	}
 }

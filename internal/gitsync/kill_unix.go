@@ -3,6 +3,8 @@
 package gitsync
 
 import (
+	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -17,7 +19,13 @@ func runTree(newCmd func() *exec.Cmd) error {
 		if cmd.Process == nil {
 			return nil
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			// The whole group has ended already. Say so as exec's own Cancel
+			// does, so that exec reports git's exit status, not a failed kill.
+			return os.ErrProcessDone
+		}
+		return err
 	}
 	return cmd.Run()
 }

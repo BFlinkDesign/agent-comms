@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The whole point of the journal, end to end: two machines each record what they
@@ -147,5 +148,27 @@ func TestSyncNamesAFileItLeftAloneAndHowToTakeTheRemotesCopy(t *testing.T) {
 	got, _ := os.ReadFile(filepath.Join(a, "README.md"))
 	if string(got) != "edited on cnc-1\n" {
 		t.Fatalf("the local edit was overwritten: %q", got)
+	}
+}
+
+// A lock file sync removes before it then fails is still reported, on stderr:
+// the next sync finds nothing to remove, so this is the only time it is said.
+func TestClearedLocksAreReportedWhenTheSyncThenFails(t *testing.T) {
+	a, _ := twoMachines(t)
+	lock := filepath.Join(a, ".git", "index.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-11 * time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, a, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+	_, stderr, err := exec(t, "sync", "--dir", a, "--salt", "s", "--timeout", "20s")
+	if err == nil {
+		t.Fatal("a sync against a missing remote succeeded")
+	}
+	if !strings.Contains(stderr, "removed 1 git lock file older than ten minutes from the clone: index.lock") {
+		t.Fatalf("stderr = %q, want the removed lock named", stderr)
 	}
 }

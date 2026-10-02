@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -177,7 +176,8 @@ func TestWithoutTheJobTheSleeperOutlivesTheCancelledSync(t *testing.T) {
 // If the context ends after git is started, suspended, but before it joins its
 // job, cancel can only kill git alone. When that kill is refused (by endpoint
 // software, say), Wait would last as long as git stays suspended, which may be
-// forever, so the command returns at once instead.
+// forever, so the command returns at once instead, and says that git could not
+// be killed rather than only that the context ended.
 func TestACancelBeforeGitJoinsItsJobDoesNotWaitWhenGitCannotBeKilled(t *testing.T) {
 	releaseTempDirs(t)
 	requireGit(t)
@@ -203,16 +203,10 @@ func TestACancelBeforeGitJoinsItsJobDoesNotWaitWhenGitCannotBeKilled(t *testing.
 			time.Sleep(time.Millisecond)
 		}
 	}
-	newCmd := func() *exec.Cmd {
-		cmd := exec.CommandContext(ctx, "git", "version")
-		cmd.Dir = dir
-		cmd.WaitDelay = waitDelay
-		return cmd
-	}
 	start := time.Now()
-	err := runTree(newCmd)
-	if !errors.Is(err, errUnkillable) {
-		t.Fatalf("err = %v, want errUnkillable", err)
+	_, err := Git(ctx, dir, nil, "version")
+	if !errors.Is(err, errUnkillable) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want errUnkillable and the cancellation", err)
 	}
 	if elapsed := time.Since(start); elapsed >= waitDelay {
 		t.Fatalf("waited %v for a git that could not be killed", elapsed)
