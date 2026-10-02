@@ -240,11 +240,11 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	if err != nil {
 		return res, fmt.Errorf("%w: %s (%v)", ErrNotClone, o.Dir, err)
 	}
-	if !sameDir(top, o.Dir) {
+	if !SameDir(top, o.Dir) {
 		return res, fmt.Errorf("%w: %s is inside the repository at %s; clone the journal repository into a directory of its own",
 			ErrNotClone, o.Dir, top)
 	}
-	if !sameDir(filepath.Dir(o.File), o.Dir) {
+	if !SameDir(filepath.Dir(o.File), o.Dir) {
 		return res, fmt.Errorf("gitsync: %s is not directly inside %s", o.File, o.Dir)
 	}
 	own := filepath.Base(o.File)
@@ -659,9 +659,9 @@ func clearStaleLocks(gitDir string) []string {
 	return cleared
 }
 
-// sameDir reports whether two paths name the same directory, after resolving
+// SameDir reports whether two paths name the same directory, after resolving
 // symbolic links; on Windows letter case does not matter.
-func sameDir(a, b string) bool {
+func SameDir(a, b string) bool {
 	ra, errA := filepath.EvalSymlinks(a)
 	rb, errB := filepath.EvalSymlinks(b)
 	if errA != nil || errB != nil {

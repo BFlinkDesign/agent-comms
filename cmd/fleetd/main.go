@@ -13,6 +13,7 @@
 //	fleetd record ...      append one host-attributed record
 //	fleetd sync            publish this machine's records, receive the others'
 //	fleetd where           per machine, what it was last doing, and how fresh that is
+//	fleetd hook TOOL       record a Claude Code, Cursor, Codex or Grok event
 //	fleetd version         which build this is
 //
 // Every command takes --json, so the same surface serves a person at a terminal
@@ -52,6 +53,7 @@ usage:
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
   fleetd where  [--json] [--dir D] [--limit N]
+  fleetd hook   <claude|cursor|codex|grok> [--dir D] [--salt S] [--timeout 40s] [--no-sync] [--json] [event-json]
   fleetd version
 
 The journal directory is --dir, else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal.
@@ -79,6 +81,19 @@ sync names it instead.
 The OS account name is recorded only with --include-user. These records are
 meant to be committed, and on a domain-joined host that name carries the domain
 with it.
+
+hook is what an AI tool's own hook configuration runs; AGENTS.md has a ready
+configuration for claude, cursor, codex and grok. It reads the event the way the
+tool documents it (JSON on stdin, or for codex's notify program the last
+argument) and appends one record through the same path as record: --agent is
+the tool, --type is session, turn or hook, and --repo and --branch come from the
+git repository at the event's working directory. A turn is recorded at most once
+every 30 minutes per session. A session end then syncs, bounded by --timeout,
+unless --no-sync is given; so does a turn codex's notify program records, since
+codex neither waits for nor limits it. A turn from a tool's own hooks does not
+sync, since the person is waiting. A hook never disturbs the tool that ran it: it
+prints nothing (--json is for trying it by hand), always exits 0, and appends any
+problem to fleetd-hook.log beside the journal directory.
 `
 
 // version is set by the release build (-ldflags "-X main.version=fleetd-v1.2.3").
@@ -142,6 +157,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdSync(args[1:], stdout, stderr)
 	case "where":
 		return cmdWhere(args[1:], stdout, stderr)
+	case "hook":
+		return cmdHook(args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "fleetd", buildVersion(), runtime.GOOS+"/"+runtime.GOARCH)
 		return nil
@@ -253,38 +270,71 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("record", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
-	typ := fs.String("type", "", "record type, e.g. observation, handoff, note (required)")
-	note := fs.String("note", "", "what happened, in your own words")
-	repo := fs.String("repo", "", "repository the work was in")
-	branch := fs.String("branch", "", "branch the work was on")
-	agent := fs.String("agent", "", "which tool produced this, as name/role")
-	at := fs.String("at", "", "RFC3339 timestamp (default: now)")
-	includeUser := fs.Bool("include-user", false,
+	var req recordRequest
+	fs.StringVar(&req.dir, "dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
+	fs.StringVar(&req.salt, "salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
+	fs.StringVar(&req.typ, "type", "", "record type, e.g. observation, handoff, note (required)")
+	fs.StringVar(&req.note, "note", "", "what happened, in your own words")
+	fs.StringVar(&req.repo, "repo", "", "repository the work was in")
+	fs.StringVar(&req.branch, "branch", "", "branch the work was on")
+	fs.StringVar(&req.agent, "agent", "", "which tool produced this, as name/role")
+	fs.StringVar(&req.at, "at", "", "RFC3339 timestamp (default: now)")
+	fs.BoolVar(&req.includeUser, "include-user", false,
 		"publish the OS account name in clear; off by default because these records are committed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*typ) == "" {
-		return errors.New("--type is required")
-	}
-	journalDir, err := resolveDir(*dir)
+	rec, err := appendRecord(req, stderr)
 	if err != nil {
 		return err
 	}
-	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
+	if *asJSON {
+		return writeJSON(stdout, map[string]any{"id": rec.id, "host": rec.host.ID, "file": rec.file})
+	}
+	fmt.Fprintf(stdout, "%s  recorded on %s\n", rec.id, rec.host.Name)
+	return nil
+}
+
+// recordRequest is one record to append. `fleetd record` fills it from its flags
+// and `fleetd hook` from a tool's event, and both go through appendRecord, so a
+// record a hook wrote has exactly the shape and host attribution of one a person
+// wrote.
+type recordRequest struct {
+	dir, salt, typ, note, repo, branch, agent, at string
+	// extra holds further data fields: the tool and session a hook recorded.
+	extra       map[string]string
+	includeUser bool
+}
+
+// recorded says what appendRecord wrote and where.
+type recorded struct {
+	id   string
+	host hostOut
+	file string
+}
+
+// appendRecord builds one host-attributed cell and appends it to this host's
+// journal file. Warnings, such as a missing salt, go to warn.
+func appendRecord(req recordRequest, warn io.Writer) (recorded, error) {
+	if strings.TrimSpace(req.typ) == "" {
+		return recorded{}, errors.New("--type is required")
+	}
+	journalDir, err := resolveDir(req.dir)
 	if err != nil {
-		return err
+		return recorded{}, err
+	}
+	fleetSalt, err := resolveSalt(req.salt, journalDir, warn)
+	if err != nil {
+		return recorded{}, err
 	}
 
 	h := identity(fleetSalt)
-	from := *agent
+	from := req.agent
 	if strings.TrimSpace(from) == "" {
 		from = "fleetd/" + h.Name
 	}
 
-	ts := *at
+	ts := req.at
 	if ts == "" {
 		// Nanosecond precision, not whole seconds. The cell id is derived from
 		// the content including this timestamp, so at second resolution two
@@ -296,7 +346,7 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		// problem; fleetd introduced it.
 		ts = time.Now().UTC().Format(time.RFC3339Nano)
 	} else if _, err := time.Parse(time.RFC3339, ts); err != nil {
-		return fmt.Errorf("--at %q is not an RFC3339 timestamp: %w", ts, err)
+		return recorded{}, fmt.Errorf("--at %q is not an RFC3339 timestamp: %w", ts, err)
 	}
 
 	// Host facts travel with every record. That is the entire point: the record is
@@ -310,7 +360,12 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		"host.source": cell.S(h.Source),
 		"host.stable": cell.B(h.Stable),
 	}
-	for k, v := range map[string]string{"note": *note, "repo": *repo, "branch": *branch} {
+	for k, v := range req.extra {
+		if strings.TrimSpace(v) != "" {
+			data[k] = cell.S(v)
+		}
+	}
+	for k, v := range map[string]string{"note": req.note, "repo": req.repo, "branch": req.branch} {
 		if strings.TrimSpace(v) != "" {
 			data[k] = cell.S(v)
 		}
@@ -321,30 +376,23 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	// user.Current().Username is of the form DOMAIN\account, so the default
 	// behaviour would have committed the AD domain and the operator's account
 	// name into a repository on every record.
-	if *includeUser && strings.TrimSpace(h.User) != "" {
+	if req.includeUser && strings.TrimSpace(h.User) != "" {
 		data["user"] = cell.S(h.User)
 	}
 
-	c, err := cell.New(*typ, from, ts, "journal", data, nil, nil, 0)
+	c, err := cell.New(req.typ, from, ts, "journal", data, nil, nil, 0)
 	if err != nil {
-		return err
+		return recorded{}, err
 	}
 
 	store, err := journal.Open(journalDir)
 	if err != nil {
-		return err
+		return recorded{}, err
 	}
 	if err := store.Append(h.ID, c); err != nil {
-		return err
+		return recorded{}, err
 	}
-
-	if *asJSON {
-		return writeJSON(stdout, map[string]any{
-			"id": c.ID, "host": h.ID, "file": filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
-		})
-	}
-	fmt.Fprintf(stdout, "%s  recorded on %s\n", c.ID, h.Name)
-	return nil
+	return recorded{id: c.ID, host: h, file: filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl")}, nil
 }
 
 func cmdSync(args []string, stdout, stderr io.Writer) error {
@@ -369,18 +417,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	h := identity(fleetSalt)
-	store, err := journal.Open(journalDir)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	res, err := gitsync.Sync(ctx, gitsync.Options{
-		Dir:     store.Dir(),
-		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
-		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
-	})
-	noteSync(store.Dir(), res, err, stderr)
+	res, storeDir, err := syncJournal(journalDir, h, *timeout, stderr)
 	if err != nil {
 		// Lock files removed before the sync failed are still worth knowing
 		// about: the next sync would otherwise not mention them at all.
@@ -399,13 +436,32 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "kept this machine's copy of %s: it has changes the remote does not have.\n"+
 			"  Another identity's journal file is published by syncing with that identity's salt. For anything else,\n"+
 			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
-			strings.Join(res.Kept, ", "), store.Dir())
+			strings.Join(res.Kept, ", "), storeDir)
 	}
 	if len(res.Cleared) > 0 {
 		fmt.Fprintf(stdout, "removed %s older than ten minutes from the clone: %s\n",
 			plural(len(res.Cleared), "git lock file"), strings.Join(res.Cleared, ", "))
 	}
 	return nil
+}
+
+// syncJournal publishes host h's journal file in journalDir, brings in every
+// other host's, gives up after timeout, and notes the outcome for `where`.
+// `fleetd sync` and `fleetd hook` both sync through it.
+func syncJournal(journalDir string, h hostOut, timeout time.Duration, stderr io.Writer) (gitsync.Result, string, error) {
+	store, err := journal.Open(journalDir)
+	if err != nil {
+		return gitsync.Result{}, "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	res, err := gitsync.Sync(ctx, gitsync.Options{
+		Dir:     store.Dir(),
+		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
+		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
+	})
+	noteSync(store.Dir(), res, err, stderr)
+	return res, store.Dir(), err
 }
 
 type whereEntry struct {
@@ -578,6 +634,9 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		case st.LastSuccess != nil:
 			fmt.Fprintf(stdout, "the records below are as of this machine's last sync, %s\n", ago(st.LastSuccess.At))
 		}
+	}
+	if path, last, ok := hookProblem(store.Dir()); ok {
+		fmt.Fprintf(stdout, "a hook logged a problem in %s; the last one:\n  %s\n", path, last)
 	}
 	for _, e := range out {
 		name := e.HostName

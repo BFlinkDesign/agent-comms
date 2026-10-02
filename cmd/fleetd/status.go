@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -143,4 +144,36 @@ func ago(ts string) string {
 		return fmt.Sprintf("%s (%d h ago)", ts, int(d.Hours()))
 	}
 	return fmt.Sprintf("%s (%d days ago)", ts, int(d.Hours()/24))
+}
+
+// hookProblemAge is how long `where` keeps mentioning a problem a hook logged.
+const hookProblemAge = 7 * 24 * time.Hour
+
+// hookProblem returns the hook log beside the journal directory and its last
+// line, when a hook logged a problem there within hookProblemAge. A hook's own
+// output goes nowhere a person looks, so this is where its failures surface.
+func hookProblem(journalDir string) (path, last string, ok bool) {
+	path = filepath.Join(filepath.Dir(journalDir), hookLogName)
+	f, err := os.Open(path)
+	if err != nil {
+		return path, "", false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || time.Since(info.ModTime()) > hookProblemAge {
+		return path, "", false
+	}
+	offset := info.Size() - 4096
+	if offset < 0 {
+		offset = 0
+	}
+	tail := make([]byte, info.Size()-offset)
+	if _, err := f.ReadAt(tail, offset); err != nil && !errors.Is(err, io.EOF) {
+		return path, "", false
+	}
+	lines := lines(tail)
+	if len(lines) == 0 {
+		return path, "", false
+	}
+	return path, lines[len(lines)-1], true
 }
