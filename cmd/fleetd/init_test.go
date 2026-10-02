@@ -521,48 +521,90 @@ func TestInitTakesARelativePathToALocalRepository(t *testing.T) {
 	}
 }
 
-// A repository whose default branch does not exist, with the fleet's records on
-// another branch, is not empty: init must not start a second branch with a salt
-// of its own, nor tell the person to delete the branch holding the records.
-func TestInitRefusesARepositoryWhoseDefaultBranchIsMissing(t *testing.T) {
-	remote := emptyJournalRemote(t) // HEAD names main, which has no commits
+// recordsOn makes the remote's only branch the given one, holding a machine's
+// records but no fleetd.json, while the remote's HEAD names main.
+func recordsOn(t *testing.T, remote string, branches ...string) {
+	t.Helper()
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
-	gitIn(t, seed, "checkout", "--quiet", "-b", "master")
-	if err := os.WriteFile(filepath.Join(seed, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:1"}`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, seed, "add", ".")
-	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "records")
-	gitIn(t, seed, "push", "--quiet", "origin", "master")
-	branches := func() string {
-		out, err := osexec.Command("git", "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
-		if err != nil {
+	for _, b := range branches {
+		gitIn(t, seed, "checkout", "--quiet", "-B", b)
+		if err := os.WriteFile(filepath.Join(seed, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:`+b+`"}`+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		return strings.TrimSpace(string(out))
-	}
-	before := branches()
-
-	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote)
-	if after := branches(); after != before {
-		t.Errorf("init pushed to a repository that holds records: %q became %q", before, after)
-	}
-	if err == nil || !strings.Contains(err.Error(), "master") || strings.Contains(err.Error(), "delete") {
-		t.Fatalf("err = %v, want a refusal naming master that deletes nothing", err)
+		gitIn(t, seed, "add", ".")
+		gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "records on "+b)
+		gitIn(t, seed, "push", "--quiet", "origin", b)
 	}
 }
 
-// init stopped right after the clone's git directory moved in. Running init
-// again leaves a clone that a sync keeps in step with the remote.
+func remoteBranchList(t *testing.T, remote string) string {
+	t.Helper()
+	out, err := osexec.Command("git", "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// A repository whose default branch does not exist, with the fleet's records on
+// its only branch, is not empty: init follows that branch. It must not start a
+// second branch with a salt of its own, nor tell the person to delete one.
+func TestInitFollowsTheOnlyBranchOfARepositoryWhoseDefaultIsMissing(t *testing.T) {
+	remote := emptyJournalRemote(t) // HEAD names main, which never gets a commit
+	recordsOn(t, remote, "master")
+	before := remoteBranchList(t, remote)
+
+	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote)
+	if after := remoteBranchList(t, remote); after != before {
+		t.Errorf("init pushed to a repository that holds records: %q became %q", before, after)
+	}
+	if !errors.Is(err, gitsync.ErrNeedSalt) {
+		t.Fatalf("err = %v, want ErrNeedSalt: the records on master have a salt init must be given", err)
+	}
+	stdout, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
+	if err != nil || !strings.Contains(stdout, "following master") {
+		t.Fatalf("init with the salt: %v\n%s", err, stdout)
+	}
+	if after := remoteBranchList(t, remote); after != before {
+		t.Errorf("the journal is on %q, want master alone", after)
+	}
+}
+
+// With several branches and no default among them, the journal could be on any:
+// init refuses, before anything is pushed, and names them.
+func TestInitRefusesSeveralBranchesWithoutADefault(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	recordsOn(t, remote, "master", "trunk")
+	before := remoteBranchList(t, remote)
+	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
+	if !errors.Is(err, gitsync.ErrNoDefaultBranch) || !strings.Contains(err.Error(), "master, trunk") {
+		t.Fatalf("err = %v, want ErrNoDefaultBranch naming master and trunk", err)
+	}
+	if after := remoteBranchList(t, remote); after != before {
+		t.Errorf("init pushed: %q became %q", before, after)
+	}
+}
+
+// init stopped right after the clone's git directory moved in. A hook's sync
+// may run before init is run again; afterwards the clone is one a sync keeps in
+// step with the remote.
 func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a shell script in place of git")
 	}
 	remote := emptyJournalRemote(t)
-	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "other"), "--salt", "s", remote); err != nil {
+	other := filepath.Join(t.TempDir(), "other")
+	if _, _, err := exec(t, "init", "--dir", other, "--salt", "s", remote); err != nil {
 		t.Fatal(err)
 	}
+	// Another machine's records, so the remote has a file a sync brings in.
+	if err := os.WriteFile(filepath.Join(other, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, other, "add", "host-0123456789abcdef.jsonl")
+	gitIn(t, other, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "another machine")
+	gitIn(t, other, "push", "--quiet")
 	real, err := osexec.LookPath("git")
 	if err != nil {
 		t.Fatal(err)
@@ -579,6 +621,9 @@ func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
 		t.Fatal("the interruption did not happen")
 	}
 	t.Setenv("PATH", path)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
 		t.Fatal(err)
 	}
@@ -596,15 +641,23 @@ func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
 func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
-	abandoned, current := dir+".init-1111", dir+".init-2222"
+	abandoned, current, notes := dir+".init-1111", dir+".init-2222", dir+".init-notes"
 	for _, d := range []string{abandoned, current} {
 		if err := os.MkdirAll(filepath.Join(d, ".git"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	old := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(abandoned, old, old); err != nil {
+	if err := os.MkdirAll(notes, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(notes, "todo.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	for _, d := range []string{abandoned, notes} {
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -614,5 +667,8 @@ func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
 	}
 	if _, err := os.Stat(current); err != nil {
 		t.Errorf("a clone an init may still be using was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(notes, "todo.txt")); err != nil {
+		t.Errorf("a directory init did not make was removed: %v", err)
 	}
 }

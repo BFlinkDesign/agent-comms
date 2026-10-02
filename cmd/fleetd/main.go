@@ -49,7 +49,7 @@ import (
 const usage = `fleetd — record and answer what happened on which machine
 
 usage:
-  fleetd init   [--json] [--dir D] [--salt S] [--timeout 2m] URL
+  fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--timeout 2m] URL
   fleetd host   [--json] [--dir D] [--salt S]
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
@@ -65,7 +65,10 @@ init makes the journal directory a clone of the journal repository URL, once per
 machine, without moving or deleting anything in it, and then syncs. An empty
 repository gets its first commit, holding fleetd.json with a salt for the fleet;
 one that already holds records needs the salt its machines use, from --salt or
-$FLEET_SALT.
+$FLEET_SALT. When this machine's journal directory was set up again, or restored
+from an older copy, its file no longer starts with the records the journal holds
+for it, and nothing is published until init --reclaim puts those records back in
+front of the newer ones.
 
 The salt is the one in the journal's fleetd.json, so every machine that clones the
 journal uses the same one. --salt may repeat it but not contradict it; $FLEET_SALT
@@ -504,16 +507,16 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 // other host's, gives up after timeout, and notes the outcome for `where`.
 // `fleetd sync`, `fleetd hook` and `fleetd init` all sync through it. Holding
 // the sync's lock, it first files under h the records this machine wrote under
-// another identity (see refile), and after init, when the clone was set up over
-// a newer copy of h's own file, makes that file start with the published one
-// again (see reconcileOwn).
-func syncJournal(journalDir string, h hostOut, timeout time.Duration, afterInit bool, stderr io.Writer) (gitsync.Result, string, error) {
+// another identity (see refile), and with reclaim, which only `fleetd init
+// --reclaim` sets, puts h's published records back at the start of its own file
+// (see reconcileOwn).
+func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bool, stderr io.Writer) (gitsync.Result, string, error) {
 	store, err := journal.Open(journalDir)
 	if err != nil {
 		return gitsync.Result{}, "", err
 	}
 	prepare := func(gitDir string) {
-		if afterInit {
+		if reclaim {
 			if err := reconcileOwn(store.Dir(), gitDir, h); err != nil {
 				fmt.Fprintf(stderr, "fleetd: warning: putting this machine's published records back in its journal file: %v\n", err)
 			}

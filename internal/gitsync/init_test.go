@@ -262,3 +262,32 @@ func TestInitStartsAnEmptyJournalOnTheBranchTheRemoteNames(t *testing.T) {
 		t.Fatal("the repository's HEAD does not resolve")
 	}
 }
+
+// A server that does not advertise an empty repository's unborn HEAD leaves the
+// first machine's clone on no branch, and that machine starts main. The
+// repository's HEAD still names its own missing default, so the second machine's
+// clone again names no branch: it follows main, the only branch there is, rather
+// than being refused.
+func TestASecondMachineFollowsTheOnlyBranchWhenTheServerNamesNone(t *testing.T) {
+	requireGit(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "journal.git")
+	run(t, root, "init", "--quiet", "--bare", "--initial-branch=master", remote)
+	run(t, root, "--git-dir", remote, "config", "lsrefs.unborn", "ignore")
+
+	first := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(root, "a"), Salt: "s"})
+	if !first.Started || first.Branch != "main" {
+		t.Fatalf("first machine = %+v, want it to start main", first)
+	}
+	second, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(root, "b")})
+	if err != nil {
+		t.Fatalf("the second machine was refused: %v", err)
+	}
+	if second.Started || second.Branch != "main" || second.Salt != "s" {
+		t.Fatalf("second machine = %+v, want it to follow main with the first machine's salt", second)
+	}
+	setUp(t, filepath.Join(root, "b"), "s")
+	if heads := run(t, root, "ls-remote", "--heads", remote); strings.Count(heads, "refs/heads/") != 1 {
+		t.Fatalf("the journal has branches %q, want main alone", heads)
+	}
+}

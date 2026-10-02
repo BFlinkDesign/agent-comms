@@ -23,6 +23,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
 	salt := fs.String("salt", "", "fleet salt for a journal that has none yet (else $FLEET_SALT, else a random one for a journal with no records)")
+	reclaim := fs.Bool("reclaim", false, "put this machine's published records back at the start of its journal file, "+
+		"after its journal directory was set up again or restored from an older copy")
 	timeout := fs.Duration("timeout", 2*time.Minute, "give up after this long")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -79,7 +81,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		}
 		waitForFleetFile(journalDir, deadline)
 		var r gitsync.Result
-		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), true, stderr)
+		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), *reclaim, stderr)
 		published += r.Published
 	}
 
@@ -91,7 +93,13 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		if syncErr != nil {
 			out["sync_error"] = syncErr.Error()
 		}
-		return writeJSON(stdout, out)
+		if err := writeJSON(stdout, out); err != nil {
+			return err
+		}
+		if errors.Is(syncErr, gitsync.ErrSameFile) {
+			return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
+		}
+		return nil
 	}
 	switch {
 	case res.Started:
@@ -103,6 +111,10 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "the journal is set up at %s, following %s\n", journalDir, res.Branch)
 	} else {
 		fmt.Fprintf(stdout, "the journal at %s was already set up, following %s\n", journalDir, res.Branch)
+	}
+	if errors.Is(syncErr, gitsync.ErrSameFile) {
+		// No later sync can get past this: a person has to say which it is.
+		return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
 	}
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "the first sync failed, and the next one retries: %v\n", syncErr)

@@ -420,6 +420,18 @@ func TestACloneWithoutAnUpstreamSaysHowToSetOne(t *testing.T) {
 	}
 }
 
+// A repository with no commit yet has no index either; a sync there still says
+// what is missing rather than failing to fill the index.
+func TestARepositoryWithNoCommitSaysHowToSetAnUpstream(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	run(t, dir, "init", "--quiet", "--initial-branch=main")
+	_, err := Sync(context.Background(), options(dir, "h"))
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "git push -u") {
+		t.Fatalf("expected ErrNoUpstream with a fix, got %v", err)
+	}
+}
+
 func TestADirectoryThatIsNotACloneIsNamedAsSuch(t *testing.T) {
 	requireGit(t)
 	dir := t.TempDir()

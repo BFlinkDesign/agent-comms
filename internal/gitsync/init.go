@@ -48,7 +48,7 @@ var (
 	// files, which init leaves alone.
 	ErrDirInUse = errors.New("gitsync: the journal directory holds files that are not journal records")
 	// ErrNoDefaultBranch means the repository's default branch does not exist
-	// while other branches do, so the journal may be on one of them.
+	// while several other branches do, so the journal may be on any of them.
 	ErrNoDefaultBranch = errors.New("gitsync: the repository's default branch does not exist")
 )
 
@@ -278,23 +278,37 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 }
 
 // removeAbandonedClones removes the temporary clones beside dir that an init
-// killed before it finished left behind. One younger than staleLock may belong
-// to an init still running, and is left alone.
+// killed before it finished left behind: directories named as MkdirTemp names
+// them, holding nothing but a git directory, if that. One younger than staleLock
+// may belong to an init still running, and is left alone.
 func removeAbandonedClones(dir string) {
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".init-*"))
+	base := filepath.Base(dir) + ".init-"
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), base+"*"))
 	for _, m := range matches {
-		if info, err := os.Lstat(m); err == nil && info.IsDir() && time.Since(info.ModTime()) > staleLock {
-			os.RemoveAll(m)
+		info, err := os.Lstat(m)
+		if err != nil || !info.IsDir() || time.Since(info.ModTime()) <= staleLock {
+			continue
 		}
+		if suffix := strings.TrimPrefix(filepath.Base(m), base); suffix == "" || strings.Trim(suffix, "0123456789") != "" {
+			continue
+		}
+		entries, err := os.ReadDir(m)
+		if err != nil || len(entries) > 1 || (len(entries) == 1 && entries[0].Name() != ".git") {
+			continue
+		}
+		os.RemoveAll(m)
 	}
 }
 
 // startBranch names the branch the journal is on: the remote's default branch.
-// A repository whose default branch does not exist is empty, and the journal
-// starts that branch, else main when the remote names none, but never this
-// machine's own default, which another machine starting the same journal at the
-// same moment may not share. A repository that has other branches is not empty,
-// and is refused: the journal may be on one of them.
+// When that does not exist but the remote has exactly one branch, the journal is
+// on that one: a server that does not say which branch is its default (git
+// before 2.31, or protocol v0) leaves the clone on unnamedDefault, and the first
+// machine to start the journal there started main. With several branches and no
+// default among them the journal could be on any, so init refuses. A repository
+// with no branch at all is empty, and the journal starts the branch the remote
+// names as its default, else main, but never this machine's own default, which
+// another machine starting the same journal at the same moment may not share.
 func startBranch(g git, url string) (string, error) {
 	branch, err := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
@@ -313,19 +327,23 @@ func startBranch(g git, url string) (string, error) {
 			others = append(others, name)
 		}
 	}
-	if len(others) > 0 {
+	switch {
+	case len(others) > 1:
 		named := "names no branch"
 		if branch != unnamedDefault {
 			named = "is " + branch + ", which does not exist"
 		}
 		return "", fmt.Errorf("%w: %s's default branch %s, but it has %s; make the branch that holds the journal "+
 			"its default, then run fleetd init again", ErrNoDefaultBranch, url, named, strings.Join(others, ", "))
-	}
-	if branch == unnamedDefault {
+	case len(others) == 1:
+		branch = others[0]
+	case branch == unnamedDefault:
 		branch = "main"
-		if _, err := g.line("symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
-			return "", err
-		}
+	default:
+		return branch, nil
+	}
+	if _, err := g.line("symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+		return "", err
 	}
 	return branch, nil
 }

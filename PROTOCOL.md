@@ -260,7 +260,7 @@ comms belief <channel> <claim> [confidence]
 comms refute <belief_id> <reason> [correction] [channel]
 
 # Host attribution (fleetd — a separate single static binary, no runtime)
-fleetd init   [--json] [--dir D] [--salt S] [--timeout 2m] URL
+fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--timeout 2m] URL
 fleetd host   [--json] [--dir D] [--salt S]
 fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
 fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
@@ -281,12 +281,18 @@ once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
 an `about` line), on the branch it names as its default, else `main`; a repository
 that already holds records without one needs the salt its machines use (`--salt` or
-`$FLEET_SALT`), and one whose default branch does not exist while another branch
-does is refused. A `fleetd.json` in the journal directory with another salt is
-replaced by the journal's. A repository whose top level
+`$FLEET_SALT`). When the repository's default branch does not exist, the journal is
+on its only branch; with several, init is refused. A `fleetd.json` in the journal
+directory with another salt is replaced by the journal's. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
 `.gitattributes`, or a directory, is refused; so is a journal directory holding
 anything but journal files and `fleetd.json`, or a clone of another repository.
+When this machine's file no longer starts with the records the journal holds for
+it, nothing is published and init fails: its journal directory was set up again or
+restored from an older copy, or another machine has its id, and only a person can
+tell which. `--reclaim` says it is the first: under the sync lock it moves the file
+into `.git/fleetd-pre-init/`, puts the journal's copy back, and files the moved
+records the journal lacks after it.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository, with an upstream branch. It notes each outcome in the clone's

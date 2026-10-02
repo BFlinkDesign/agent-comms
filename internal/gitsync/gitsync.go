@@ -190,9 +190,10 @@ type Options struct {
 	File string
 	// Message is the commit message for this host's new records.
 	Message string
-	// Prepare, when set, runs once the sync holds its lock and before it reads
-	// anything, given the clone's git directory. Work on this machine's journal
-	// files that must not interleave with another sync goes there.
+	// Prepare, when set, runs once the sync holds its lock and the clone has an
+	// index, before it reads anything else, given the clone's git directory. Work
+	// on this machine's journal files that must not interleave with another sync
+	// goes there.
 	Prepare func(gitDir string)
 	// Run runs git; nil means Git.
 	Run Runner
@@ -261,6 +262,17 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	defer unlock()
 	res.Cleared = clearStaleLocks(gitDir)
+	// An init stopped between moving its clone's git directory in and filling
+	// the index leaves a clone without one, where every file would look deleted
+	// and untracked. A sync that comes first fills it, as init would. A
+	// repository with no commit has no index either, and nothing to fill it from.
+	if _, err := os.Stat(filepath.Join(gitDir, "index")); errors.Is(err, os.ErrNotExist) {
+		if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
+			if _, err := g.line("read-tree", "HEAD"); err != nil {
+				return res, err
+			}
+		}
+	}
 	if o.Prepare != nil {
 		o.Prepare(gitDir)
 	}
@@ -425,7 +437,8 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 	}
 	if !bytes.HasPrefix(complete, published) {
 		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine's copy lacks. If this machine's journal "+
-			"directory was set up again, `fleetd init` puts them back; otherwise another machine has this machine's id, and each "+
+			"directory was set up again, or restored from an older copy, `fleetd init --reclaim <journal URL>` puts them back "+
+			"and publishes this machine's newer records after them; otherwise another machine has this machine's id, and each "+
 			"needs a distinct one (see `fleetd host`)", ErrSameFile, own)
 	}
 	fresh := bytes.Count(complete, []byte{'\n'}) - bytes.Count(published, []byte{'\n'})

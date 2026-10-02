@@ -106,9 +106,12 @@ uses its salt, and only then moves the clone's git directory in and checks out t
 files the directory lacks. When the repository is empty, its first commit holds
 `fleetd.json` with a new salt for the fleet, on the branch the repository names as
 its default, else `main`. One that already holds records needs the salt its
-machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A
-repository whose default branch does not exist while it has another branch is
-refused before anything is pushed: the journal may be on that branch. A repository
+machines use (`--salt` or `FLEET_SALT`); init never invents one for it. When the
+repository's default branch does not exist but it has exactly one branch, the
+journal is on that branch; a server that does not advertise an empty repository's
+default leaves the first machine starting `main` whatever the repository's HEAD
+names. With several branches and no default among them, init is refused before
+anything is pushed. A repository
 with anything but host journal files, `fleetd.json`, a README, a LICENSE,
 `.gitignore` or `.gitattributes`, or with a directory, is refused, and so is a
 journal directory holding anything but journal files and `fleetd.json`. A
@@ -118,17 +121,22 @@ journal's, and the next sync files the records written under its salt under the
 journal's. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Running init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
-which init and every sync wait out for ten minutes. On a machine whose journal
-directory was lost and has records again, init puts back the records the journal
-holds for this machine and publishes the new ones after them, provided every
-record the journal holds for its id names this machine; otherwise another machine
-has its id, and sync says so.
+which init and every sync wait out for ten minutes. When this machine's journal
+directory was set up again, or restored from an older copy, its file no longer
+starts with the records the journal holds for it, and neither init nor any sync
+publishes anything: a second machine with this machine's id produces the same
+mismatch, and only a person can tell the two apart. `fleetd init --reclaim URL`
+says it is this machine: holding the sync lock, it moves the file into the clone's
+git directory, `fleetd-pre-init/`, puts the journal's copy back, and files the
+moved records the journal lacks after it.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never
 rebases, merges or stashes, and never rewrites this machine's own file, which
 `fleetd record` may be appending to at that moment: it only appends the records
-it re-files (see host identity below), as `fleetd record` appends. Instead it:
+it re-files (see host identity below), as `fleetd record` appends, and puts the
+file back as the remote has it when it is missing. Only `fleetd init --reclaim`
+moves it aside. Instead it:
 
 - snapshots the file up to its last complete record;
 - builds a commit on top of the remote tip with git plumbing (`hash-object`,
@@ -148,7 +156,7 @@ Two machines can collide only by deriving the same host id. That is detected by
 content: the remote copy of this machine's file must be a prefix of the local one,
 ignoring the CRLF line endings git for Windows checks files out with; records are
 always published with LF. The error also names the other cause: this machine's
-journal directory set up again over newer records, which `fleetd init` repairs. A clone with commits fleetd did not make is refused,
+journal directory set up again over newer records, which `fleetd init --reclaim` repairs. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
 Every git call is bounded by `--timeout`, and when it runs out git and the
@@ -252,8 +260,10 @@ was wrong:
   are filed under the fleet's id by the next sync, while it holds its lock. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
-  published. A process that still had the file open appends to the moved copy,
-  and the next sync files that record too. A re-filed record carries
+  published, and one a killed sync left missing is put back too. A file git
+  cannot answer for (it timed out, say) waits for the next sync. A process that
+  still had the file open appends to the moved copy, and the next sync files that
+  record too. A re-filed record carries
   `refiled.from`, the id it was written under, and `where` does not take it for
   the machine's latest activity. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
@@ -388,7 +398,10 @@ only Claude Code's hook configured, Cursor and Grok sessions are not recorded.
    sets the journal up at `%USERPROFILE%\.ai\channels\journal`, with the fleet's
    salt in it, so no environment variable needs setting. The first PC to run it
    on an empty repository starts the journal. On a journal its machines already
-   record into without `fleetd.json`, give the salt they use: `--salt`.
+   record into without `fleetd.json`, give the salt they use: `--salt`. If this
+   PC's journal directory was set up again or restored from a backup, init says
+   that nothing can be published; run `fleetd init --reclaim <URL>` to put the
+   journal's records for this PC back in front of its newer ones.
 3. Add the configurations below, then restart each tool so it reads them.
 
 Each tool's session-end entry allows 60 seconds, so that fleetd's own 40-second
