@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -77,7 +78,7 @@ filed under the fleet's by the next sync.
 sync needs the journal directory to be the root of a clone of the journal
 repository, used for nothing else. It publishes only this machine's file, as of
 its last complete record, in a commit built on top of the remote; it never
-rebases and never writes this machine's file, so a record written during a sync
+rebases and never rewrites this machine's file, so a record written during a sync
 is never lost. Each machine writes only its own file, so machines never
 conflict. A file with changes the remote does not have is never overwritten;
 sync names it instead.
@@ -208,6 +209,11 @@ func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error)
 			fmt.Fprintf(stderr, "fleetd: warning: FLEET_SALT differs from the salt in %s's %s, which is used; unset FLEET_SALT\n",
 				journalDir, gitsync.FleetFile)
 		}
+		// A changed salt leaves this machine's records under the old one
+		// unpublished: noting it lets a sync file them under the new one.
+		if prev := cachedSalt(journalDir); prev != "" && prev != fleet.Salt {
+			_ = gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev)
+		}
 		cacheSalt(journalDir, fleet.Salt)
 		return fleet.Salt, nil
 	case flagValue != "":
@@ -228,7 +234,9 @@ func cachedSalt(journalDir string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(data))
+	// Only the newline cacheSalt ends it with: a salt is used exactly as given,
+	// spaces and all, or the same machine gets a second id.
+	return strings.TrimSuffix(string(data), "\n")
 }
 
 // cacheSalt keeps salt for cachedSalt, in a clone only, and only when it changed.
@@ -461,11 +469,11 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
 	if err != nil {
 		// A sync that cannot start has still failed, and `where` says so.
-		noteSync(journalDir, gitsync.Result{}, err, stderr)
+		noteSync(journalDir, gitsync.Result{}, err, time.Now(), stderr)
 		return err
 	}
 	h := identity(fleetSalt)
-	res, storeDir, err := syncJournal(journalDir, h, *timeout, stderr)
+	res, storeDir, err := syncJournal(journalDir, h, *timeout, false, stderr)
 	if err != nil {
 		// Lock files removed before the sync failed are still worth knowing
 		// about: the next sync would otherwise not mention them at all.
@@ -494,25 +502,36 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 
 // syncJournal publishes host h's journal file in journalDir, brings in every
 // other host's, gives up after timeout, and notes the outcome for `where`.
-// `fleetd sync`, `fleetd hook` and `fleetd init` all sync through it. It first
-// files under h the records this machine wrote under another identity; see
-// refile.
-func syncJournal(journalDir string, h hostOut, timeout time.Duration, stderr io.Writer) (gitsync.Result, string, error) {
+// `fleetd sync`, `fleetd hook` and `fleetd init` all sync through it. Holding
+// the sync's lock, it first files under h the records this machine wrote under
+// another identity (see refile), and after init, when the clone was set up over
+// a newer copy of h's own file, makes that file start with the published one
+// again (see reconcileOwn).
+func syncJournal(journalDir string, h hostOut, timeout time.Duration, afterInit bool, stderr io.Writer) (gitsync.Result, string, error) {
 	store, err := journal.Open(journalDir)
 	if err != nil {
 		return gitsync.Result{}, "", err
 	}
-	if _, err := refile(store.Dir(), h, stderr); err != nil {
-		fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
+	prepare := func(gitDir string) {
+		if afterInit {
+			if err := reconcileOwn(store.Dir(), gitDir, h); err != nil {
+				fmt.Fprintf(stderr, "fleetd: warning: putting this machine's published records back in its journal file: %v\n", err)
+			}
+		}
+		if _, err := refile(store.Dir(), gitDir, h, stderr); err != nil {
+			fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	started := time.Now()
 	res, err := gitsync.Sync(ctx, gitsync.Options{
 		Dir:     store.Dir(),
 		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
 		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
+		Prepare: prepare,
 	})
-	noteSync(store.Dir(), res, err, stderr)
+	noteSync(store.Dir(), res, err, started, stderr)
 	return res, store.Dir(), err
 }
 
@@ -643,17 +662,26 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 	}
 
 	var out []whereEntry
-	for host, recs := range byHost {
+	for host, all := range byHost {
 		// Within a host the records already arrive in file order -- the order the
 		// appends actually committed -- because readFile numbers them as it reads
 		// and ReadAll keeps each host's slice contiguous. That is the ordering
 		// primitive here, and unlike a timestamp it cannot be wrong because a
-		// writer's clock was.
+		// writer's clock was. A record re-filed from another identity this
+		// machine wrote under earlier is the exception: it was appended late, so
+		// its place says nothing about when it happened, and it is left out of
+		// what was last.
+		recs := all
+		if live := slices.DeleteFunc(slices.Clone(all), func(r journal.Record) bool {
+			return fieldsOf(r.Raw)[refiledFrom] != ""
+		}); len(live) > 0 {
+			recs = live
+		}
 		last := recs[len(recs)-1]
 		f := fieldsOf(last.Raw)
 		e := whereEntry{
 			Host: host, HostName: f["host.name"], OS: f["host.os"],
-			Stable: f["host.stable"] == "true", Records: len(recs),
+			Stable: f["host.stable"] == "true", Records: len(all),
 			LastTS: last.TS, LastType: last.Type, LastRepo: f["repo"], LastNote: f["note"],
 			lastAt: parseTS(last.TS),
 		}

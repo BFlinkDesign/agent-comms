@@ -1086,3 +1086,37 @@ func TestOnlyARaceIsRetried(t *testing.T) {
 		}
 	}
 }
+
+// A file that holds only the start of git's own copy, such as one restored from
+// an older backup, has no change of its own. A sync brings it up to date, both
+// when the remote changed it since and when it did not.
+func TestASyncUpdatesAFileThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
+	_, m := fleet(t, 3)
+	a, b, c := m[0], m[1], m[2]
+	for _, host := range []struct{ dir, name string }{{b, "host-b"}, {c, "host-c"}} {
+		appendLines(t, filepath.Join(host.dir, host.name+".jsonl"), `{"id":"hive:1"}`, `{"id":"hive:2"}`)
+		mustSync(t, options(host.dir, host.name))
+	}
+	mustSync(t, options(a, "host-a"))
+	for _, name := range []string{"host-b.jsonl", "host-c.jsonl"} {
+		write(t, filepath.Join(a, name), "{\"id\":\"hive:1\"}\n")
+	}
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:3"}`)
+	mustSync(t, options(b, "host-b"))
+
+	res := mustSync(t, options(a, "host-a"))
+	if len(res.Kept) != 0 {
+		t.Fatalf("a file behind git's copy was kept: %+v", res)
+	}
+	for name, want := range map[string]string{
+		"host-b.jsonl": "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n{\"id\":\"hive:3\"}\n",
+		"host-c.jsonl": "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n",
+	} {
+		if got, _ := os.ReadFile(filepath.Join(a, name)); string(got) != want {
+			t.Errorf("%s is %q, want %q", name, got, want)
+		}
+	}
+	if status := run(t, a, "status", "--porcelain"); status != "" {
+		t.Fatalf("git status after the sync:\n%s", status)
+	}
+}

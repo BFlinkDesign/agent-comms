@@ -29,7 +29,10 @@ type syncStatus struct {
 }
 
 type syncOutcome struct {
-	At        string `json:"at"`
+	At string `json:"at"`
+	// Started is when the sync began, before it read anything. A record
+	// written after it may have missed the sync, however it ended.
+	Started   string `json:"started,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Published int    `json:"published,omitempty"`
 	Received  int    `json:"received,omitempty"`
@@ -39,14 +42,14 @@ type syncOutcome struct {
 // noteSync records a sync's outcome for `where`. A journal directory that is
 // not a clone has nowhere to note it; a failure to note it is only a warning,
 // because the sync itself already did, or did not, do its work.
-func noteSync(dir string, res gitsync.Result, syncErr error, stderr io.Writer) {
+func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, stderr io.Writer) {
 	gitDir := filepath.Join(dir, ".git")
 	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
 		return
 	}
 	path := filepath.Join(gitDir, syncStatusFile)
 	st, _ := readSyncStatus(dir)
-	now := syncOutcome{At: time.Now().UTC().Format(time.RFC3339)}
+	now := syncOutcome{At: time.Now().UTC().Format(time.RFC3339), Started: started.UTC().Format(time.RFC3339Nano)}
 	if syncErr != nil {
 		now.Error = syncErr.Error()
 	} else {

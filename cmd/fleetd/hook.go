@@ -287,8 +287,13 @@ func runHook(res *hookResult, args []string, stderr io.Writer) {
 		extra:  map[string]string{"tool": res.Tool, "event": res.Event, "session": res.Session},
 	}, &warn)
 	if w := strings.TrimSpace(warn.String()); w != "" {
-		res.problem("%s: run `fleetd init <journal repository URL>` on this machine, or its hook records may be filed apart from its others",
-			strings.TrimPrefix(w, "fleetd: warning: "))
+		w = strings.TrimPrefix(w, "fleetd: warning: ")
+		// Without the journal's fleetd.json, init is what gives this machine the
+		// fleet's salt; with it, the warning says what to do.
+		if _, ok, err := gitsync.ReadFleet(journalDir); !ok && err == nil {
+			w += ": run `fleetd init <journal repository URL>` on this machine, or its hook records may be filed apart from its others"
+		}
+		res.problem("%s", w)
 	}
 	if err != nil {
 		res.problem("recording: %v", err)
@@ -305,7 +310,7 @@ func runHook(res *hookResult, args []string, stderr io.Writer) {
 // syncHook syncs the journal for a hook and notes the outcome in res.
 func syncHook(res *hookResult, journalDir string, h hostOut, timeout time.Duration) {
 	var noted bytes.Buffer
-	synced, _, err := syncJournal(journalDir, h, timeout, &noted)
+	synced, _, err := syncJournal(journalDir, h, timeout, false, &noted)
 	if w := strings.TrimSpace(noted.String()); w != "" {
 		res.problem("%s", strings.TrimPrefix(w, "fleetd: warning: "))
 	}
@@ -322,7 +327,8 @@ func syncHook(res *hookResult, journalDir string, h hostOut, timeout time.Durati
 }
 
 // unsynced reports whether this machine's journal file changed after its last
-// successful sync, or was never synced.
+// successful sync began, or was never synced. A record written while that sync
+// ran may have been written after it read the file.
 func unsynced(journalDir, file string) bool {
 	info, err := os.Stat(file)
 	if err != nil {
@@ -332,8 +338,11 @@ func unsynced(journalDir, file string) bool {
 	if !ok || st.LastSuccess == nil {
 		return true
 	}
-	at, err := time.Parse(time.RFC3339, st.LastSuccess.At)
-	return err != nil || info.ModTime().After(at)
+	since, err := time.Parse(time.RFC3339Nano, st.LastSuccess.Started)
+	if st.LastSuccess.Started == "" {
+		since, err = time.Parse(time.RFC3339, st.LastSuccess.At)
+	}
+	return err != nil || info.ModTime().After(since)
 }
 
 // lastTurn returns when this machine last recorded a turn of the given tool's

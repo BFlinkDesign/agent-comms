@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -46,7 +47,16 @@ var (
 	// ErrDirInUse means the journal directory holds something besides journal
 	// files, which init leaves alone.
 	ErrDirInUse = errors.New("gitsync: the journal directory holds files that are not journal records")
+	// ErrNoDefaultBranch means the repository's default branch does not exist
+	// while other branches do, so the journal may be on one of them.
+	ErrNoDefaultBranch = errors.New("gitsync: the repository's default branch does not exist")
 )
+
+// unnamedDefault is the branch init's clone of an empty repository is on when the
+// remote does not say which branch is its default: git falls back to
+// init.defaultBranch, which init sets to this name for the clone, so this
+// machine's own default is never mistaken for the remote's.
+const unnamedDefault = "fleetd-unnamed-default"
 
 // hostFile is the name of a machine's journal file: journal.FileName of a host
 // id, which fleetd makes "host:" and 16 hex digits.
@@ -165,6 +175,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return res, err
 	}
+	removeAbandonedClones(o.Dir)
 	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
 	if err != nil {
 		return res, err
@@ -173,11 +184,12 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	defer os.RemoveAll(tmp)
 
 	g := git{ctx: ctx, dir: parent, run: run}
-	if _, err := g.line(append(batchSSH(g), "clone", "--quiet", "--no-checkout", "--no-tags", "--", url, tmp)...); err != nil {
+	clone := append(batchSSH(g), "-c", "init.defaultBranch="+unnamedDefault, "clone", "--quiet", "--no-checkout", "--no-tags", "--", url, tmp)
+	if _, err := g.line(clone...); err != nil {
 		return res, err
 	}
 	g.dir = tmp
-	if res.Branch, err = startBranch(g); err != nil {
+	if res.Branch, err = startBranch(g, o.URL); err != nil {
 		return res, err
 	}
 	if err := bootstrap(g, o, &res); err != nil {
@@ -200,7 +212,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
 		return res, err
 	}
-	if err := placeFleetFile(g, o.Dir, res.Head); err != nil {
+	if err := placeFleetFile(g, o.Dir, filepath.Join(tmp, ".git"), res.Head); err != nil {
 		return res, err
 	}
 	if err := RenameRetry(filepath.Join(tmp, ".git"), filepath.Join(o.Dir, ".git")); err != nil {
@@ -242,11 +254,19 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 		return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
 	}
 	res.Branch = branch
-	unlock, _, err := lock(g)
+	unlock, gitDir, err := lock(g)
 	if err != nil {
 		return res, err
 	}
 	defer unlock()
+	// An init stopped after moving its clone's git directory in, and before
+	// filling the index, left a clone with no index: every file would look
+	// deleted, and untracked, to git. Filling it now finishes that init.
+	if _, err := os.Stat(filepath.Join(gitDir, "index")); errors.Is(err, os.ErrNotExist) {
+		if _, err := g.line("read-tree", "HEAD"); err != nil {
+			return res, err
+		}
+	}
 	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
 		return res, err
 	}
@@ -257,11 +277,25 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	return res, err
 }
 
-// startBranch names the branch the journal is on. A clone of an empty repository
-// starts the branch the remote names as its default, else main, but never this
+// removeAbandonedClones removes the temporary clones beside dir that an init
+// killed before it finished left behind. One younger than staleLock may belong
+// to an init still running, and is left alone.
+func removeAbandonedClones(dir string) {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".init-*"))
+	for _, m := range matches {
+		if info, err := os.Lstat(m); err == nil && info.IsDir() && time.Since(info.ModTime()) > staleLock {
+			os.RemoveAll(m)
+		}
+	}
+}
+
+// startBranch names the branch the journal is on: the remote's default branch.
+// A repository whose default branch does not exist is empty, and the journal
+// starts that branch, else main when the remote names none, but never this
 // machine's own default, which another machine starting the same journal at the
-// same moment may not share.
-func startBranch(g git) (string, error) {
+// same moment may not share. A repository that has other branches is not empty,
+// and is refused: the journal may be on one of them.
+func startBranch(g git, url string) (string, error) {
 	branch, err := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("gitsync: the clone has no branch: %w", err)
@@ -269,17 +303,29 @@ func startBranch(g git) (string, error) {
 	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch); err == nil {
 		return branch, nil
 	}
-	branch = "main"
-	if out, err := g.line(append(batchSSH(g), "ls-remote", "--symref", "origin", "HEAD")...); err == nil {
-		for _, l := range strings.Split(out, "\n") {
-			rest, ok := strings.CutPrefix(l, "ref: refs/heads/")
-			if name, _, ok2 := strings.Cut(rest, "\t"); ok && ok2 && name != "" {
-				branch = name
-			}
+	out, err := g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
+	if err != nil {
+		return "", err
+	}
+	var others []string
+	for _, name := range strings.Split(out, "\n") {
+		if name != "" && name != "HEAD" {
+			others = append(others, name)
 		}
 	}
-	if _, err := g.line("symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
-		return "", err
+	if len(others) > 0 {
+		named := "names no branch"
+		if branch != unnamedDefault {
+			named = "is " + branch + ", which does not exist"
+		}
+		return "", fmt.Errorf("%w: %s's default branch %s, but it has %s; make the branch that holds the journal "+
+			"its default, then run fleetd init again", ErrNoDefaultBranch, url, named, strings.Join(others, ", "))
+	}
+	if branch == unnamedDefault {
+		branch = "main"
+		if _, err := g.line("symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+			return "", err
+		}
 	}
 	return branch, nil
 }
@@ -378,9 +424,11 @@ func oneBranch(g git, branch string) error {
 }
 
 // placeFleetFile writes the journal's FleetFile into dir, so that a record
-// appended from then on uses the journal's salt. dir may hold one from an
-// interrupted init; one with another salt is refused.
-func placeFleetFile(g git, dir, tip string) error {
+// appended from then on uses the journal's salt. dir may hold one already, from
+// an interrupted init or written by hand: the journal's replaces it, and a salt
+// it held that the journal does not use is noted in gitDir, so that the records
+// this machine wrote under it are filed under the journal's later.
+func placeFleetFile(g git, dir, gitDir, tip string) error {
 	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
 	if err != nil {
 		return err
@@ -393,8 +441,10 @@ func placeFleetFile(g git, dir, tip string) error {
 	case err == nil:
 		f, perr := parseFleet(have, path)
 		w, _ := parseFleet([]byte(want), FleetFile)
-		if perr != nil || f.Salt != w.Salt {
-			return fmt.Errorf("%w: %s holds another salt than the journal's; remove it, then run fleetd init again", ErrSaltMismatch, path)
+		if perr == nil && f.Salt != w.Salt {
+			if err := NotePastSalt(gitDir, f.Salt); err != nil {
+				return err
+			}
 		}
 	case !errors.Is(err, os.ErrNotExist):
 		return err
@@ -418,6 +468,42 @@ func placeFleetFile(g git, dir, tip string) error {
 		os.Remove(f.Name())
 	}
 	return err
+}
+
+// pastSaltsName is the file, in a clone's git directory, that lists the salts
+// this machine recorded under that the journal does not use: one a fleetd.json
+// in the journal directory held before init replaced it, and one the journal's
+// fleetd.json held before it changed. It is never committed.
+const pastSaltsName = "fleetd-past-salts"
+
+// PastSalts returns the salts noted in gitDir, oldest first.
+func PastSalts(gitDir string) []string {
+	data, err := os.ReadFile(filepath.Join(gitDir, pastSaltsName))
+	if err != nil {
+		return nil
+	}
+	var salts []string
+	if json.Unmarshal(data, &salts) != nil {
+		return nil
+	}
+	return salts
+}
+
+// NotePastSalt adds salt to the salts noted in gitDir.
+func NotePastSalt(gitDir, salt string) error {
+	salts := PastSalts(gitDir)
+	if slices.Contains(salts, salt) {
+		return nil
+	}
+	data, err := json.Marshal(append(salts, salt))
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(gitDir, pastSaltsName)
+	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	return RenameRetry(path+".tmp", path)
 }
 
 // restoreMissing checks out every tracked file the work tree lacks, and returns

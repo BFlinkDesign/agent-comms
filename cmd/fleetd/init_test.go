@@ -520,3 +520,99 @@ func TestInitTakesARelativePathToALocalRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A repository whose default branch does not exist, with the fleet's records on
+// another branch, is not empty: init must not start a second branch with a salt
+// of its own, nor tell the person to delete the branch holding the records.
+func TestInitRefusesARepositoryWhoseDefaultBranchIsMissing(t *testing.T) {
+	remote := emptyJournalRemote(t) // HEAD names main, which has no commits
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
+	gitIn(t, seed, "checkout", "--quiet", "-b", "master")
+	if err := os.WriteFile(filepath.Join(seed, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "records")
+	gitIn(t, seed, "push", "--quiet", "origin", "master")
+	branches := func() string {
+		out, err := osexec.Command("git", "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	before := branches()
+
+	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote)
+	if after := branches(); after != before {
+		t.Errorf("init pushed to a repository that holds records: %q became %q", before, after)
+	}
+	if err == nil || !strings.Contains(err.Error(), "master") || strings.Contains(err.Error(), "delete") {
+		t.Fatalf("err = %v, want a refusal naming master that deletes nothing", err)
+	}
+}
+
+// init stopped right after the clone's git directory moved in. Running init
+// again leaves a clone that a sync keeps in step with the remote.
+func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "other"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = read-tree ] && { echo interrupted >&2; exit 1; }; done\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil {
+		t.Fatal("the interruption did not happen")
+	}
+	t.Setenv("PATH", path)
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "sync", "--dir", dir)
+	if err != nil || strings.Contains(stdout, "kept") {
+		t.Fatalf("after init ran again, sync says: %q (%v)", stdout, err)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("after init ran again, git status says:\n%s", out)
+	}
+}
+
+// An init killed before it finished leaves its temporary clone beside the
+// journal. The next init removes it, but not one an init still running may own.
+func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	abandoned, current := dir+".init-1111", dir+".init-2222"
+	for _, d := range []string{abandoned, current} {
+		if err := os.MkdirAll(filepath.Join(d, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(abandoned, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Errorf("the abandoned clone is still there: %v", err)
+	}
+	if _, err := os.Stat(current); err != nil {
+		t.Errorf("a clone an init may still be using was removed: %v", err)
+	}
+}

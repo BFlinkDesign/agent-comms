@@ -104,20 +104,31 @@ without a work tree beside the directory, makes sure the repository has
 `fleetd.json`, writes that file into the directory so every record from then on
 uses its salt, and only then moves the clone's git directory in and checks out the
 files the directory lacks. When the repository is empty, its first commit holds
-`fleetd.json` with a new salt for the fleet. One that already holds records needs
-the salt its machines use (`--salt` or `FLEET_SALT`); init never invents one for
-it. A repository with anything but host journal files, `fleetd.json`, a README, a
-LICENSE, `.gitignore` or `.gitattributes`, or with a directory, is refused, and so
-is a journal directory holding anything but journal files and `fleetd.json`. A
-directory that is already a clone of another repository is refused too. When two
-machines start the same empty repository at once, the one whose push loses takes
-the other's commit and salt. Running init again finishes what an interrupted run
-began.
+`fleetd.json` with a new salt for the fleet, on the branch the repository names as
+its default, else `main`. One that already holds records needs the salt its
+machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A
+repository whose default branch does not exist while it has another branch is
+refused before anything is pushed: the journal may be on that branch. A repository
+with anything but host journal files, `fleetd.json`, a README, a LICENSE,
+`.gitignore` or `.gitattributes`, or with a directory, is refused, and so is a
+journal directory holding anything but journal files and `fleetd.json`. A
+directory that is already a clone of another repository is refused too. A
+`fleetd.json` already in the journal directory with another salt is replaced by the
+journal's, and the next sync files the records written under its salt under the
+journal's. When two machines start the same empty repository at once, the one
+whose push loses takes the other's commit and salt. Running init again finishes
+what an interrupted run began; one killed outright leaves the sync lock behind,
+which init and every sync wait out for ten minutes. On a machine whose journal
+directory was lost and has records again, init puts back the records the journal
+holds for this machine and publishes the new ones after them, provided every
+record the journal holds for its id names this machine; otherwise another machine
+has its id, and sync says so.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never
-rebases, merges or stashes, and never writes this machine's own file, which
-`fleetd record` may be appending to at that moment. Instead it:
+rebases, merges or stashes, and never rewrites this machine's own file, which
+`fleetd record` may be appending to at that moment: it only appends the records
+it re-files (see host identity below), as `fleetd record` appends. Instead it:
 
 - snapshots the file up to its last complete record;
 - builds a commit on top of the remote tip with git plumbing (`hash-object`,
@@ -125,7 +136,9 @@ rebases, merges or stashes, and never writes this machine's own file, which
   lost a race to another machine, for at most three attempts in all;
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (an edit made by hand, say) is never overwritten;
-  sync names it. The
+  sync names it. A file that holds only the start of git's copy, such as one
+  restored from an older backup, has nothing of its own and is brought up to
+  date, whether or not the remote changed it. The
   exception is anything staged with `git add` and not committed: the clone is
   fleetd's, so sync resets a staged edit to the remote's version and deletes a
   staged new file, even one the remote never had. `git fsck --lost-found`
@@ -134,7 +147,8 @@ rebases, merges or stashes, and never writes this machine's own file, which
 Two machines can collide only by deriving the same host id. That is detected by
 content: the remote copy of this machine's file must be a prefix of the local one,
 ignoring the CRLF line endings git for Windows checks files out with; records are
-always published with LF. A clone with commits fleetd did not make is refused,
+always published with LF. The error also names the other cause: this machine's
+journal directory set up again over newer records, which `fleetd init` repairs. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
 Every git call is bounded by `--timeout`, and when it runs out git and the
@@ -233,11 +247,15 @@ was wrong:
   would drop every record of a hook started with a stale one. An invalid
   `fleetd.json` is not trusted: the salt it last held, kept in the clone's git
   directory, is used until a sync brings in a fixed one. Records this machine
-  wrote under another salt before it knew the fleet's (a hook that fired before
-  `fleetd init`, say) are filed under the fleet's id by the next sync, which keeps
-  their original file in the clone's git directory, `fleetd-pre-init/`; only files
-  git does not track are filed, since a tracked one was published under its own
-  id. When no stable source is readable it
+  wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
+  salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
+  are filed under the fleet's id by the next sync, while it holds its lock. It
+  moves their file into the clone's git directory, `fleetd-pre-init/`, and files
+  the records the old id never published; a file git tracks is put back as
+  published. A process that still had the file open appends to the moved copy,
+  and the next sync files that record too. A re-filed record carries
+  `refiled.from`, the id it was written under, and `where` does not take it for
+  the machine's latest activity. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
   change if the machine is renamed and may collide with another machine of that
   name. A weak identity is labelled weak rather than presented as a strong one.

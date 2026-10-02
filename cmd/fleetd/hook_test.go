@@ -1093,3 +1093,49 @@ func TestWhereShowsAHookProblemWhenThereAreNoRecords(t *testing.T) {
 		t.Fatalf("where with no records does not mention the hook's problem:\n%s", stdout)
 	}
 }
+
+// A record written while a sync ran, after it read the file, is not published
+// by it, however that sync ended. notify must still see it as unsynced.
+func TestARecordWrittenDuringASyncCountsAsUnsynced(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "host-0123456789abcdef.jsonl")
+	if err := os.WriteFile(file, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	began, ended := time.Now().Add(-10*time.Second), time.Now().Add(-2*time.Second)
+	written := began.Add(3 * time.Second)
+	if err := os.Chtimes(file, written, written); err != nil {
+		t.Fatal(err)
+	}
+	status := fmt.Sprintf(`{"last_success": {"at": %q, "started": %q}}`,
+		ended.UTC().Format(time.RFC3339), began.UTC().Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(dir, ".git", "fleetd-sync.json"), []byte(status), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !unsynced(dir, file) {
+		t.Fatal("a record written while the last sync ran counts as synced")
+	}
+}
+
+// On a machine set up with init, a stale FLEET_SALT is worth a warning, but not
+// the advice to run init.
+func TestTheHookAdvisesInitOnlyWhenTheJournalHasNoFleetFile(t *testing.T) {
+	hookEnv(t)
+	remote := emptyJournalRemote(t)
+	journal := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", journal, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "stale")
+	hook(t, event(t, docClaudeSessionEnd, map[string]any{"cwd": t.TempDir()}), "claude", "--dir", journal, "--no-sync")
+	log, err := os.ReadFile(logBeside(journal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "FLEET_SALT differs") || strings.Contains(string(log), "fleetd init") {
+		t.Fatalf("hook log:\n%s", log)
+	}
+}

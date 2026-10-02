@@ -245,3 +245,20 @@ func TestReadFleetRefusesAFileWithoutASalt(t *testing.T) {
 		t.Fatalf("a directory without fleetd.json: ok %v, err %v", ok, err)
 	}
 }
+
+// An empty repository whose HEAD names a branch, as GitHub's names its default,
+// tells a clone which branch that is (protocol v2's unborn HEAD). The journal
+// starts on it, so the repository's HEAD then resolves.
+func TestInitStartsAnEmptyJournalOnTheBranchTheRemoteNames(t *testing.T) {
+	requireGit(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "journal.git")
+	run(t, root, "init", "--quiet", "--bare", "--initial-branch=trunk", remote)
+	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal"), Salt: "s"})
+	if res.Branch != "trunk" {
+		t.Fatalf("started branch %q, want trunk", res.Branch)
+	}
+	if head := run(t, root, "--git-dir", remote, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"); head == "" {
+		t.Fatal("the repository's HEAD does not resolve")
+	}
+}

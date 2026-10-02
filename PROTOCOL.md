@@ -279,8 +279,11 @@ mentions for a week.
 `fleetd init URL` makes the journal directory a clone of the journal repository,
 once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
-an `about` line); a repository that already holds records without one needs the
-salt its machines use (`--salt` or `$FLEET_SALT`). A repository whose top level
+an `about` line), on the branch it names as its default, else `main`; a repository
+that already holds records without one needs the salt its machines use (`--salt` or
+`$FLEET_SALT`), and one whose default branch does not exist while another branch
+does is refused. A `fleetd.json` in the journal directory with another salt is
+replaced by the journal's. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
 `.gitattributes`, or a directory, is refused; so is a journal directory holding
 anything but journal files and `fleetd.json`, or a clone of another repository.
@@ -289,7 +292,7 @@ anything but journal files and `fleetd.json`, or a clone of another repository.
 journal repository, with an upstream branch. It notes each outcome in the clone's
 `.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
-the remote tip. It never rebases and never writes that file. A push rejected
+the remote tip. It never rebases and never rewrites that file. A push rejected
 because another machine pushed first is retried, up to three attempts. It then
 brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
@@ -320,9 +323,12 @@ The salt is the one in the journal's `fleetd.json`. `--salt` may repeat it but n
 contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning.
 Without `fleetd.json` they supply it. It must be identical on every machine in the
 fleet, or one machine will appear as several. It is not a credential. A sync files
-under this machine's fleet id the records it wrote, before it knew the fleet's
-salt, under no salt or `$FLEET_SALT`, and keeps their original file in
-`.git/fleetd-pre-init/`.
+under this machine's fleet id the records it wrote under another salt (none or
+`$FLEET_SALT` before it knew the fleet's, a replaced `fleetd.json`'s, or the
+journal's previous one) that the old id never published, appending them to this
+machine's file with `refiled.from` set to the old id. It moves their file into
+`.git/fleetd-pre-init/`, putting back a file git tracks as published, and files a
+record appended to the moved copy later at the next sync.
 
 DOES NOT EXIST (never use):
 - comms join

@@ -119,12 +119,15 @@ salt under the fleet's id. init never moves, rewrites or deletes a record. Its s
 `AGENTS.md` plus the `internal/gitsync` package comment. Sync rules (read `gitsync_test.go` before
 changing any of them):
 
-- Sync never writes this host's own journal file (`fleetd record` may be appending to it) and never
+- Sync never rewrites this host's own journal file (`fleetd record` may be appending to it) and never
   rebases, merges or stashes: it commits a snapshot cut at the last newline onto the remote tip with
-  plumbing, pushes that commit, and only then brings in the other hosts' files.
+  plumbing, pushes that commit, and only then brings in the other hosts' files. What runs under its
+  lock first (`Options.Prepare`: fleetd's re-filing) only appends to that file; only init's first sync
+  may move it aside, to put the published copy back.
 - git removes and writes the other files, never Go's `os` package, so a remote symlink cannot lead a
   sync outside the clone. Removals go first. A file with unstaged changes, or an untracked or ignored
-  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. The
+  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path; a
+  file holding only the start of git's copy has nothing of its own and is updated. The
   clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
   staged new file, even one the remote never had. `git fsck --lost-found` recovers such content
   until the gc a sync runs prunes it, which it may as soon as the content is two weeks old.

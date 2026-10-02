@@ -79,7 +79,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		}
 		waitForFleetFile(journalDir, deadline)
 		var r gitsync.Result
-		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), stderr)
+		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), true, stderr)
 		published += r.Published
 	}
 

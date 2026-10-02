@@ -10,7 +10,9 @@
 // file with changes that are not on the remote, such as another identity's
 // unpublished records on this machine, is left as it is and reported. Only
 // working-tree changes count: the clone is fleetd's, so an edit staged with
-// `git add` and not changed since is reset to the remote's version.
+// `git add` and not changed since is reset to the remote's version, and a file
+// that holds only the start of git's copy, such as one restored from an older
+// backup, is brought up to date.
 //
 // Because each host owns one file, the only way two hosts can collide is by
 // deriving the same host id. That is detected by content rather than by reading
@@ -188,6 +190,10 @@ type Options struct {
 	File string
 	// Message is the commit message for this host's new records.
 	Message string
+	// Prepare, when set, runs once the sync holds its lock and before it reads
+	// anything, given the clone's git directory. Work on this machine's journal
+	// files that must not interleave with another sync goes there.
+	Prepare func(gitDir string)
 	// Run runs git; nil means Git.
 	Run Runner
 }
@@ -255,6 +261,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	defer unlock()
 	res.Cleared = clearStaleLocks(gitDir)
+	if o.Prepare != nil {
+		o.Prepare(gitDir)
+	}
 
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {
@@ -415,8 +424,9 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		published = []byte(out)
 	}
 	if !bytes.HasPrefix(complete, published) {
-		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine never wrote; give each machine a distinct identity (see `fleetd host`)",
-			ErrSameFile, own)
+		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine's copy lacks. If this machine's journal "+
+			"directory was set up again, `fleetd init` puts them back; otherwise another machine has this machine's id, and each "+
+			"needs a distinct one (see `fleetd host`)", ErrSameFile, own)
 	}
 	fresh := bytes.Count(complete, []byte{'\n'}) - bytes.Count(published, []byte{'\n'})
 	if fresh == 0 {
@@ -505,6 +515,13 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		behind, err := behindIndex(g, mapKeys(changed))
+		if err != nil {
+			return nil, err
+		}
+		for path := range behind {
+			delete(changed, path)
+		}
 		keep := func(list []string) []string {
 			var out []string
 			for _, path := range list {
@@ -544,6 +561,26 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			return nil, err
 		}
 	}
+	// A file that holds only the start of git's own copy, such as one restored
+	// from an older backup, is brought up to date even when the remote did not
+	// change it: it has no change of its own to keep.
+	modified, err := g.raw(nil, "diff", "--name-only", "-z", "--no-renames")
+	if err != nil {
+		return nil, err
+	}
+	var candidates []string
+	for _, path := range strings.Split(modified, "\x00") {
+		if path != "" && path != own {
+			candidates = append(candidates, path)
+		}
+	}
+	if stale, err := behindIndex(g, candidates); err != nil {
+		return nil, err
+	} else if len(stale) > 0 {
+		if _, err := g.raw(nulList(mapKeys(stale)), "checkout-index", "-f", "-z", "--stdin"); err != nil {
+			return nil, err
+		}
+	}
 	// Keep this host's index entry equal to the remote's, so `git status` shows
 	// exactly the records not yet published.
 	if blob, ok, err := blobAt(g, tip, own); err != nil {
@@ -573,6 +610,42 @@ func locallyChanged(g git, paths []string) (map[string]bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+// behindIndex returns, of paths, the regular files whose content is a strict
+// start of the index's copy, line endings aside: files with nothing of their own
+// that git's copy lacks. A file that cannot be read, or is not a regular file, is
+// not among them.
+func behindIndex(g git, paths []string) (map[string]bool, error) {
+	behind := map[string]bool{}
+	for _, path := range paths {
+		info, err := os.Lstat(filepath.Join(g.dir, path))
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(g.dir, path))
+		if err != nil {
+			continue
+		}
+		indexed, err := g.raw(nil, "cat-file", "blob", ":"+path)
+		if err != nil {
+			continue
+		}
+		have := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		if len(have) < len(indexed) && strings.HasPrefix(indexed, string(have)) {
+			behind[path] = true
+		}
+	}
+	return behind, nil
+}
+
+func mapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // nests reports whether path is a directory above one of others, or inside one.

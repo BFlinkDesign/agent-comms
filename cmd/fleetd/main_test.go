@@ -498,3 +498,18 @@ func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
 		t.Fatalf("stdout = %q, want an empty JSON list (%v)", stdout, jerr)
 	}
 }
+
+// A salt is used exactly as given: one kept with a space trimmed off would give
+// the same machine a second id when fleetd.json is invalid.
+func TestTheCachedSaltIsKeptExactly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, salt := range []string{" padded ", "tab\t", "plain"} {
+		cacheSalt(dir, salt)
+		if got := cachedSalt(dir); got != salt {
+			t.Errorf("cached %q, read back %q", salt, got)
+		}
+	}
+}
