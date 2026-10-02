@@ -24,7 +24,7 @@ go vet ./... && GOOS=windows go vet ./... # CI also vets and tests on a real win
 go test ./... -count=1 -race              # real git, real bare remote; -race needs cgo (a C compiler)
 # CI also cross-compiles fleetd for linux/amd64, linux/arm64, windows/amd64, windows/arm64 and
 # darwin/arm64, and runs scripts/install-fleetd.test.ps1 in Windows PowerShell (no local equivalent).
-# go.mod's toolchain line makes `go` download and run that Go. Where the download is blocked (the
+# go.mod's toolchain line makes `go` download and run at least that Go. Where the download is blocked (the
 # cloud sandbox's proxy refuses it), prefix the go commands with GOTOOLCHAIN=local to use the
 # installed Go instead, and say so: only CI then shows the pinned toolchain passing.
 

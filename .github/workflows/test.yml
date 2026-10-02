@@ -36,9 +36,9 @@ jobs:
   # is not a gate.
   #
   # No setup-go action is used: the Go preinstalled on both runner images reads
-  # go.mod's toolchain line and runs that Go, which it downloads and checks against
-  # the Go checksum database, so no action's pinned commit has to be taken on trust.
-  # The Report toolchain step shows which Go that was.
+  # go.mod's toolchain line and runs that Go, or a newer one it already is, which it
+  # downloads and checks against the Go checksum database, so no action's pinned
+  # commit has to be taken on trust. The Report toolchain step fails if it did not.
   go:
     name: go (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -55,7 +55,17 @@ jobs:
           persist-credentials: false
 
       - name: Report toolchain
-        run: go version
+        # Fails when the go command did not switch to go.mod's toolchain line, as
+        # when GOTOOLCHAIN=local is set: every later step would otherwise pass on
+        # whatever Go the runner image has.
+        shell: bash
+        run: |
+          go version
+          want="$(sed -n 's/^toolchain go//p' go.mod)"; have="$(go env GOVERSION)"; have="${have#go}"
+          if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)" != "$want" ]; then
+            echo "::error::go$have is older than go.mod's toolchain go$want"
+            exit 1
+          fi
 
       - name: Check formatting
         # Linux only. Formatting is not platform-specific, so running this twice
@@ -69,7 +79,8 @@ jobs:
         run: |
           # gofmt exits 0 whether or not it finds anything, so the file list is the
           # signal. Without this check the job would pass on unformatted code.
-          unformatted="$(gofmt -l ./cmd ./internal)"
+          # The toolchain's own gofmt: the one on PATH is the runner image's.
+          unformatted="$("$(go env GOROOT)/bin/gofmt" -l ./cmd ./internal)"
           if [ -n "$unformatted" ]; then
             echo "these files are not gofmt-clean:"
             echo "$unformatted"
