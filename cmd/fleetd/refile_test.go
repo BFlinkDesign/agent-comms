@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
@@ -52,6 +53,22 @@ func recordWithout(t *testing.T, dir string, args ...string) {
 func fleetFile(t *testing.T, dir string) string {
 	t.Helper()
 	return filepath.Join(dir, strings.ReplaceAll(hostID(t, "--dir", dir), ":", "-")+".jsonl")
+}
+
+// recordLine returns the line `fleetd record` writes for note under the identity
+// this machine has without a salt, from a directory of its own, for a test to put
+// where a process with that identity would have appended it.
+func recordLine(t *testing.T, note string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", note); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, strings.ReplaceAll(hostID(t, "--salt", "", "--dir", dir), ":", "-")+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 // Two syncs that start together, as a hook's and init's do, must not both file
@@ -356,18 +373,37 @@ func TestATrackedFileAKilledSyncLeftMissingIsPutBack(t *testing.T) {
 // This machine's own file goes missing: an init --reclaim was killed between
 // moving it aside and putting the remote's copy back. The next sync puts that
 // copy back, rather than finding the remote holding records this machine lacks.
+// The directory was restored from an older copy, so its HEAD is behind the
+// remote, and only the remote's copy holds every published record.
 func TestThisMachinesMissingFileIsPutBackAsTheRemoteHasIt(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published"); err != nil {
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published first"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
 		t.Fatal(err)
 	}
+	backup := filepath.Join(t.TempDir(), "backup")
+	if err := os.CopyFS(backup, os.DirFS(dir)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published later"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.CopyFS(dir, os.DirFS(backup)); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "fetch", "--quiet") // as init --reclaim does before its sync
 	own := fleetFile(t, dir)
 	if err := os.Remove(own); err != nil {
 		t.Fatal(err)
@@ -376,7 +412,8 @@ func TestThisMachinesMissingFileIsPutBackAsTheRemoteHasIt(t *testing.T) {
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
 		t.Fatalf("sync with this machine's file missing: %v", err)
 	}
-	if got, err := os.ReadFile(own); err != nil || !strings.Contains(string(got), "published") {
+	got, err := os.ReadFile(own)
+	if err != nil || !strings.Contains(string(got), "published first") || !strings.Contains(string(got), "published later") {
 		t.Fatalf("this machine's file holds %q (%v), want the remote's copy", got, err)
 	}
 	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
@@ -385,62 +422,109 @@ func TestThisMachinesMissingFileIsPutBackAsTheRemoteHasIt(t *testing.T) {
 }
 
 // When git cannot say whether another identity's file is tracked, or what was
-// published under it (it timed out, say), the file waits for the next sync.
-// Taking it for untracked, or for published under nothing, would file its
-// published records a second time and leave the file missing.
+// published under it (it timed out, say), nothing about that file is decided
+// until it can: the file is neither moved nor re-filed, and a copy moved earlier
+// that has grown since waits too. Taking it for untracked, or for published
+// under nothing, would file its published records a second time.
 func TestRefilingWaitsWhenGitCannotSay(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a shell script in place of git")
 	}
-	remote := emptyJournalRemote(t)
-	dir := filepath.Join(t.TempDir(), "journal")
-	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
-		t.Fatal(err)
-	}
-	// Published under no salt, from a plain clone, as a machine did before init,
-	// then a record under that identity that was never published.
-	recordWithout(t, dir, "--note", "published under no salt")
-	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
-	gitIn(t, dir, "add", plain)
-	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "published by hand")
-	gitIn(t, dir, "push", "--quiet")
-	recordWithout(t, dir, "--note", "never published")
+	for _, tc := range []struct{ name, fails string }{
+		{"anything about the file", ""},
+		{"whether git tracks it", "ls-files"},
+		{"what was published", "ls-tree|cat-file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			// Published under no salt, from a plain clone, as a machine did before
+			// init, then a record under that identity that was never published.
+			recordWithout(t, dir, "--note", "published under no salt")
+			plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+			gitIn(t, dir, "add", plain)
+			gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "published by hand")
+			gitIn(t, dir, "push", "--quiet")
+			recordWithout(t, dir, "--note", "never published")
+			fleetFileAged(t, dir)
+			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+				t.Fatal(err)
+			}
+			// A process that had the file open appends to the copy moved aside, and
+			// one that starts again writes a record into the file put back.
+			keep := filepath.Join(dir, ".git", "fleetd-pre-init")
+			copies := func() []string {
+				t.Helper()
+				m, err := filepath.Glob(filepath.Join(keep, plain+".*"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return m
+			}
+			moved := copies()
+			if len(moved) != 1 {
+				t.Fatalf("moved copies %v, want one", moved)
+			}
+			f, err := os.OpenFile(moved[0], os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString(recordLine(t, "appended to the moved copy")); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+			recordWithout(t, dir, "--note", "written after the move")
 
-	real, err := osexec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := t.TempDir()
-	script := "#!/bin/sh\ncase \"$*\" in *" + plain + "*) echo 'fatal: timed out' >&2; exit 128;; esac\nexec " + real + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := os.Getenv("PATH")
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
-	fleetFileAged(t, dir)
-	// The sync itself may fail, since git fails on that file; what matters is
-	// what it filed.
-	_, _, _ = exec(t, "sync", "--dir", dir)
-	t.Setenv("PATH", path)
-	if n := remoteCount(t, remote, "published under no salt"); n != 1 {
-		t.Fatalf("with git unable to say, the published record is on the remote %d times, want once", n)
-	}
-	if _, err := os.Stat(filepath.Join(dir, plain)); err != nil {
-		t.Fatalf("with git unable to say, the file was moved and not put back: %v", err)
-	}
+			real, err := osexec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fail := "echo 'fatal: timed out' >&2; exit 128"
+			script := "#!/bin/sh\ncase \"$*\" in *" + plain + "*) " + fail + ";; esac\nexec " + real + " \"$@\"\n"
+			if tc.fails != "" {
+				script = "#!/bin/sh\ncase \"$*\" in *" + plain + "*) for a in \"$@\"; do case \"$a\" in " + tc.fails + ") " + fail +
+					";; esac; done;; esac\nexec " + real + " \"$@\"\n"
+			}
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := os.Getenv("PATH")
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+			fleetFileAged(t, dir)
+			// The sync itself may fail, since git fails on that file; what matters
+			// is what it filed.
+			_, _, _ = exec(t, "sync", "--dir", dir)
+			t.Setenv("PATH", path)
+			if n := remoteCount(t, remote, "published under no salt"); n != 1 {
+				t.Fatalf("with git unable to say, the published record is on the remote %d times, want once", n)
+			}
+			if got, err := os.ReadFile(filepath.Join(dir, plain)); err != nil || !strings.Contains(string(got), "written after the move") {
+				t.Fatalf("with git unable to say, the file holds %q (%v); want it left as it was", got, err)
+			}
+			if n := len(copies()); n != 1 {
+				t.Fatalf("with git unable to say, the file was moved: %d moved copies, want one", n)
+			}
 
-	fleetFileAged(t, dir)
-	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
-		t.Fatal(err)
-	}
-	if n := remoteCount(t, remote, "published under no salt"); n != 1 {
-		t.Fatalf("the published record is on the remote %d times, want once", n)
-	}
-	if _, ok := remoteHostRecords(t, remote, "s", "never published"); !ok {
-		t.Fatal("once git could say, the unpublished record was still not filed")
-	}
-	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
-		t.Fatalf("git status after the syncs:\n%s", out)
+			fleetFileAged(t, dir)
+			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+				t.Fatal(err)
+			}
+			if n := remoteCount(t, remote, "published under no salt"); n != 1 {
+				t.Fatalf("the published record is on the remote %d times, want once", n)
+			}
+			for _, note := range []string{"never published", "appended to the moved copy", "written after the move"} {
+				if _, ok := remoteHostRecords(t, remote, "s", note); !ok {
+					t.Errorf("once git could say, %q was still not filed", note)
+				}
+			}
+			if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+				t.Fatalf("git status after the syncs:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -503,6 +587,59 @@ func TestPutBackKeepsARecordAppendedAsItCreatesTheFile(t *testing.T) {
 	placed, err := putBack(staged, path, "published\n")
 	if got, _ := os.ReadFile(path); err != nil || !placed || !strings.Contains(string(got), "a record appended meanwhile\n") {
 		t.Fatalf("placed %v, err %v, content %q: the appended record is lost", placed, err, got)
+	}
+}
+
+// Windows' clock can give two moves the same time. A process that starts the file
+// again before its published copy is back makes the sync move that file too; its
+// copy must not replace the first, which holds the record never published, and
+// the published copy is still back by the end of that sync.
+func TestASecondMoveInTheSameClockTickKeepsTheFirstCopy(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "published under no salt")
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	gitIn(t, dir, "add", plain)
+	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "published by hand")
+	gitIn(t, dir, "push", "--quiet")
+	recordWithout(t, dir, "--note", "never published")
+	window := recordLine(t, "written in the window")
+
+	defer func(f func() time.Time) { now = f }(now)
+	fixed := time.Now()
+	now = func() time.Time { return fixed }
+	defer func(f func(string, string) error) { linkFile = f }(linkFile)
+	link, started := linkFile, false
+	linkFile = func(oldname, newname string) error {
+		if !started && filepath.Base(newname) == plain {
+			started = true
+			if err := os.WriteFile(newname, []byte(window), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return link(oldname, newname)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("no process started the file again")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, plain))
+	if err != nil || !strings.Contains(string(got), "published under no salt") || strings.Contains(string(got), "written in the window") {
+		t.Fatalf("after the sync the file holds %q (%v), want its published copy", got, err)
+	}
+	for _, note := range []string{"never published", "written in the window"} {
+		if _, ok := remoteHostRecords(t, remote, "s", note); !ok {
+			t.Errorf("%q is on no remote file", note)
+		}
+	}
+	if n := remoteCount(t, remote, "published under no salt"); n != 1 {
+		t.Errorf("the published record is on the remote %d times, want once", n)
 	}
 }
 

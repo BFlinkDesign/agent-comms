@@ -292,7 +292,9 @@ it, nothing is published and init fails: its journal directory was set up again 
 restored from an older copy, or another machine has its id, and only a person can
 tell which. `--reclaim` says it is the first: under the sync lock it moves the file
 into `.git/fleetd-pre-init/`, puts the journal's copy back, and files the moved
-records the journal lacks after it.
+records the journal lacks after it. init exits non-zero when its sync failed with
+`--reclaim`, or for a reason no later sync gets past; otherwise a failed first
+sync is retried by the next one.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository, with an upstream branch. It notes each outcome in the clone's

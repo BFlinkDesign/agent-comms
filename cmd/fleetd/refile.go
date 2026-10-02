@@ -62,60 +62,54 @@ func otherIdentities(gitDir string, me hostOut) []hostOut {
 }
 
 // refilePending reports whether dir holds a file refile would move.
-func refilePending(dir string, me hostOut) bool {
-	gitDir, err := gitOut(dir, "rev-parse", "--absolute-git-dir")
+func refilePending(ctx context.Context, dir string, me hostOut) bool {
+	gitDir, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return false
 	}
 	for _, o := range otherIdentities(strings.TrimSpace(gitDir), me) {
-		if movable(dir, journal.FileName(o.ID)+".jsonl") {
+		if movable(ctx, dir, journal.FileName(o.ID)+".jsonl") {
 			return true
 		}
 	}
 	return false
 }
 
-// gitOut runs git in dir with a deadline of its own.
-func gitOut(dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return gitsync.Git(ctx, dir, nil, args...)
-}
-
 // copyAt returns name's content at rev. ok is false when rev has no such file;
 // err is set when git could not say, and the caller then leaves the file alone.
-func copyAt(dir, rev, name string) (content string, ok bool, err error) {
-	entry, err := gitOut(dir, "ls-tree", "-z", rev, "--", name)
+func copyAt(ctx context.Context, dir, rev, name string) (content string, ok bool, err error) {
+	entry, err := gitsync.Git(ctx, dir, nil, "ls-tree", "-z", rev, "--", name)
 	if err != nil || entry == "" {
 		return "", false, err
 	}
-	content, err = gitOut(dir, "cat-file", "blob", rev+":"+name)
+	content, err = gitsync.Git(ctx, dir, nil, "cat-file", "blob", rev+":"+name)
 	return content, err == nil, err
 }
 
 // movable reports whether another identity's journal file holds records not
 // published under it: git does not track it, or it differs from git's copy. A
 // file git cannot answer for is left for the next pass.
-func movable(dir, name string) bool {
+func movable(ctx context.Context, dir, name string) bool {
 	if fi, err := os.Lstat(filepath.Join(dir, name)); err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	tracked, err := gitOut(dir, "ls-files", "-z", "--", name)
+	tracked, err := gitsync.Git(ctx, dir, nil, "ls-files", "-z", "--", name)
 	if err != nil {
 		return false
 	}
 	if tracked == "" {
 		return true
 	}
-	differs, err := gitOut(dir, "diff", "--name-only", "-z", "--", name)
+	differs, err := gitsync.Git(ctx, dir, nil, "diff", "--name-only", "-z", "--", name)
 	return err == nil && differs != ""
 }
 
 // refile files under me the records this machine wrote under another identity,
 // as described above. It does nothing until dir holds the journal's fleetd.json,
 // me is the identity it gives, and it has been in place for refileSettle. It
-// returns how many records it appended. The caller holds the sync lock.
-func refile(dir, gitDir string, me hostOut, warn io.Writer) (int, error) {
+// returns how many records it appended. The caller holds the sync lock, and ctx
+// bounds every git command it runs.
+func refile(ctx context.Context, dir, gitDir string, me hostOut, warn io.Writer) (int, error) {
 	fleet, ok, err := gitsync.ReadFleet(dir)
 	if err != nil || !ok || identity(fleet.Salt).ID != me.ID {
 		return 0, nil
@@ -125,15 +119,15 @@ func refile(dir, gitDir string, me hostOut, warn io.Writer) (int, error) {
 		return 0, nil
 	}
 	others := otherIdentities(gitDir, me)
-	putBackDeleted(dir, gitDir, me, others)
+	putBackDeleted(ctx, dir, gitDir, me, others)
 	keep := filepath.Join(gitDir, preInitDir)
 	moved := map[string]bool{}
 	for _, o := range others {
 		name := journal.FileName(o.ID) + ".jsonl"
-		if !movable(dir, name) {
+		if !movable(ctx, dir, name) {
 			continue
 		}
-		dests, err := moveAside(dir, gitDir, keep, name, "HEAD")
+		dests, err := moveAside(ctx, dir, gitDir, keep, name, "HEAD")
 		for _, dest := range dests {
 			moved[filepath.Base(dest)] = true
 		}
@@ -141,14 +135,14 @@ func refile(dir, gitDir string, me hostOut, warn io.Writer) (int, error) {
 			return 0, err
 		}
 	}
-	return fileMoved(dir, keep, me, moved, warn)
+	return fileMoved(ctx, dir, keep, me, moved, warn)
 }
 
 // putBackDeleted puts back, as git has it, a journal file of this machine's that
 // git tracks and the work tree lacks: a pass killed between moving a file and
 // putting its published copy back leaves it so. This machine's own file is put
 // back as the remote has it, since a sync publishes only what follows that.
-func putBackDeleted(dir, gitDir string, me hostOut, others []hostOut) {
+func putBackDeleted(ctx context.Context, dir, gitDir string, me hostOut, others []hostOut) {
 	for _, h := range append([]hostOut{me}, others...) {
 		name := journal.FileName(h.ID) + ".jsonl"
 		if _, err := os.Lstat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
@@ -158,7 +152,7 @@ func putBackDeleted(dir, gitDir string, me hostOut, others []hostOut) {
 		if h.ID == me.ID {
 			rev = "@{upstream}"
 		}
-		if content, ok, err := copyAt(dir, rev, name); err == nil && ok {
+		if content, ok, err := copyAt(ctx, dir, rev, name); err == nil && ok {
 			if staged, err := stage(gitDir, content); err == nil {
 				_, _ = putBack(staged, filepath.Join(dir, name), content)
 				os.Remove(staged)
@@ -172,8 +166,8 @@ func putBackDeleted(dir, gitDir string, me hostOut, others []hostOut) {
 // read and staged before the move, so the file is back an instant after it
 // leaves. A process that starts the file again in that instant has its new file
 // moved too, at most three times in all. It returns where the files went.
-func moveAside(dir, gitDir, keep, name, rev string) ([]string, error) {
-	published, ok, err := copyAt(dir, rev, name)
+func moveAside(ctx context.Context, dir, gitDir, keep, name, rev string) ([]string, error) {
+	published, ok, err := copyAt(ctx, dir, rev, name)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +183,10 @@ func moveAside(dir, gitDir, keep, name, rev string) ([]string, error) {
 	}
 	var dests []string
 	for range 3 {
-		dest := filepath.Join(keep, fmt.Sprintf("%s.%d", name, time.Now().UnixNano()))
+		dest, err := freeName(keep, name)
+		if err != nil {
+			return dests, err
+		}
 		if err := gitsync.RenameRetry(filepath.Join(dir, name), dest); err != nil {
 			return dests, err
 		}
@@ -203,6 +200,28 @@ func moveAside(dir, gitDir, keep, name, rev string) ([]string, error) {
 		}
 	}
 	return dests, nil
+}
+
+// now is time.Now; a test fixes it to give two moves the same time, as Windows'
+// clock can, whose ticks are milliseconds apart.
+var now = time.Now
+
+// freeName names a copy of name moved into keep now: the time, made unique
+// among the copies keep holds, since a rename onto an existing name would replace
+// that copy. The caller holds the sync lock, so nothing else adds to keep.
+func freeName(keep, name string) (string, error) {
+	t := now().UnixNano()
+	for i := range int64(1000) {
+		dest := filepath.Join(keep, fmt.Sprintf("%s.%d", name, t+i))
+		_, err := os.Lstat(dest)
+		if errors.Is(err, os.ErrNotExist) {
+			return dest, nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("%s holds a thousand copies of %s moved at %d", keep, name, t)
 }
 
 // stage writes content to a temporary file in gitDir, which is on the journal
@@ -266,7 +285,7 @@ func putBack(staged, path, content string) (placed bool, err error) {
 // under its own identity, here or on the remote, is skipped, so reading a copy
 // again adds nothing twice. A copy git cannot say what was published for waits
 // for the next pass.
-func fileMoved(dir, keep string, me hostOut, moved map[string]bool, warn io.Writer) (int, error) {
+func fileMoved(ctx context.Context, dir, keep string, me hostOut, moved map[string]bool, warn io.Writer) (int, error) {
 	entries, err := os.ReadDir(keep)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -301,7 +320,7 @@ func fileMoved(dir, keep string, me hostOut, moved map[string]bool, warn io.Writ
 	for _, copyName := range grown {
 		m := movedCopy.FindStringSubmatch(copyName)
 		from := strings.Replace(m[1], "-", ":", 1)
-		published, known := publishedIDs(dir, m[1]+".jsonl")
+		published, known := publishedIDs(ctx, dir, m[1]+".jsonl")
 		if !known {
 			continue
 		}
@@ -329,10 +348,10 @@ func fileMoved(dir, keep string, me hostOut, moved map[string]bool, warn io.Writ
 
 // publishedIDs returns the ids of the records name holds in this clone's HEAD
 // and on the remote. known is false when git could not say.
-func publishedIDs(dir, name string) (ids map[string]bool, known bool) {
+func publishedIDs(ctx context.Context, dir, name string) (ids map[string]bool, known bool) {
 	ids = map[string]bool{}
 	for _, rev := range []string{"HEAD", "@{upstream}"} {
-		content, _, err := copyAt(dir, rev, name)
+		content, _, err := copyAt(ctx, dir, rev, name)
 		if err != nil {
 			return nil, false
 		}
@@ -442,9 +461,9 @@ const refiledFrom = "refiled.from"
 // tell the two apart, so only `fleetd init --reclaim` calls it, holding the sync
 // lock. The local file moves aside, the remote's copy takes its place, and refile
 // then files the moved records the remote lacks after it.
-func reconcileOwn(dir, gitDir string, me hostOut) error {
+func reconcileOwn(ctx context.Context, dir, gitDir string, me hostOut) error {
 	name := journal.FileName(me.ID) + ".jsonl"
-	published, ok, err := copyAt(dir, "@{upstream}", name)
+	published, ok, err := copyAt(ctx, dir, "@{upstream}", name)
 	if err != nil || !ok {
 		return err
 	}
@@ -455,6 +474,6 @@ func reconcileOwn(dir, gitDir string, me hostOut) error {
 	if bytes.HasPrefix(bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n")), []byte(published)) {
 		return nil
 	}
-	_, err = moveAside(dir, gitDir, filepath.Join(gitDir, preInitDir), name, "@{upstream}")
+	_, err = moveAside(ctx, dir, gitDir, filepath.Join(gitDir, preInitDir), name, "@{upstream}")
 	return err
 }

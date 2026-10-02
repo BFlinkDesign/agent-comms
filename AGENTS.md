@@ -128,7 +128,11 @@ publishes anything: a second machine with this machine's id produces the same
 mismatch, and only a person can tell the two apart. `fleetd init --reclaim URL`
 says it is this machine: holding the sync lock, it moves the file into the clone's
 git directory, `fleetd-pre-init/`, puts the journal's copy back, and files the
-moved records the journal lacks after it.
+moved records the journal lacks after it. No later sync does that, so an
+`init --reclaim` whose sync fails exits non-zero and says to run it again. A
+plain init fails too when its sync stops for a reason no later sync gets past
+(this machine's file, or commits fleetd did not make); otherwise it says that
+the next sync retries.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never

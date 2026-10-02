@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -642,7 +643,10 @@ func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	abandoned, current, notes := dir+".init-1111", dir+".init-2222", dir+".init-notes"
-	for _, d := range []string{abandoned, current} {
+	// Not init's either: a name MkdirTemp never gives, and a clone holding more
+	// than a git directory.
+	named, more := dir+".init-backup", dir+".init-3333"
+	for _, d := range []string{abandoned, current, named, more} {
 		if err := os.MkdirAll(filepath.Join(d, ".git"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -650,11 +654,13 @@ func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
 	if err := os.MkdirAll(notes, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(notes, "todo.txt"), []byte("mine\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, f := range []string{filepath.Join(notes, "todo.txt"), filepath.Join(more, "todo.txt")} {
+		if err := os.WriteFile(f, []byte("mine\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	old := time.Now().Add(-time.Hour)
-	for _, d := range []string{abandoned, notes} {
+	for _, d := range []string{abandoned, notes, named, more} {
 		if err := os.Chtimes(d, old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -668,7 +674,106 @@ func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
 	if _, err := os.Stat(current); err != nil {
 		t.Errorf("a clone an init may still be using was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(notes, "todo.txt")); err != nil {
-		t.Errorf("a directory init did not make was removed: %v", err)
+	for _, kept := range []string{filepath.Join(notes, "todo.txt"), filepath.Join(named, ".git"), filepath.Join(more, "todo.txt")} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("a directory init did not make was removed: %v", err)
+		}
+	}
+}
+
+// A push fails during init's sync. With --reclaim, nothing may have been put
+// back, and no later sync reclaims, so init fails and says to run it again.
+// Without it, the next sync retries what failed, and init says so.
+func TestInitReclaimWhoseSyncFailedSaysToRunItAgain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "waits for a push"); err != nil {
+		t.Fatal(err)
+	}
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = push ] && { echo 'fatal: unable to access the remote' >&2; exit 128; }; done\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "init", "--dir", dir, "--reclaim", remote); err == nil || !strings.Contains(err.Error(), "init --reclaim") {
+		t.Fatalf("init --reclaim whose sync failed: %v, want an error saying to run it again", err)
+	}
+	stdout, _, err := exec(t, "init", "--dir", dir, remote)
+	if err != nil || !strings.Contains(stdout, "the next one retries") {
+		t.Fatalf("init whose sync failed: %v, %q; want success, saying the next sync retries", err, stdout)
+	}
+	t.Setenv("PATH", path)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "waits for a push"); !ok {
+		t.Fatal("once pushing worked, the record was still not published")
+	}
+}
+
+// A sync error no later sync gets past, such as a commit made by hand in the
+// clone, makes init fail, with --json too, instead of promising a retry.
+func TestInitFailsWhenNoLaterSyncCanPublish(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "by hand")
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrLocalCommits) {
+		t.Fatalf("init in a clone with a commit made by hand: %v, want ErrLocalCommits", err)
+	}
+	stdout, _, err := exec(t, "init", "--json", "--dir", dir, remote)
+	var out struct {
+		SyncError string `json:"sync_error"`
+	}
+	if !errors.Is(err, gitsync.ErrLocalCommits) || json.Unmarshal([]byte(stdout), &out) != nil || out.SyncError == "" {
+		t.Fatalf("init --json in a clone with a commit made by hand: %v, output %q; want ErrLocalCommits and sync_error", err, stdout)
+	}
+}
+
+// Re-filing's git calls are bounded by the sync's --timeout, and a sync that runs
+// out of time while re-filing says so, rather than that the clone has no upstream.
+func TestASyncThatRunsOutOfTimeWhileRefilingSaysSo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = ls-tree ] && exec sleep 30; done\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	fleetFileAged(t, dir)
+	start := time.Now()
+	_, _, err = exec(t, "sync", "--dir", dir, "--timeout", "3s")
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("a sync with a 3s timeout took %v", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, gitsync.ErrNoUpstream) {
+		t.Fatalf("sync: %v, want the deadline", err)
 	}
 }

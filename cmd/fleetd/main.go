@@ -515,13 +515,13 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 	if err != nil {
 		return gitsync.Result{}, "", err
 	}
-	prepare := func(gitDir string) {
+	prepare := func(ctx context.Context, gitDir string) {
 		if reclaim {
-			if err := reconcileOwn(store.Dir(), gitDir, h); err != nil {
+			if err := reconcileOwn(ctx, store.Dir(), gitDir, h); err != nil {
 				fmt.Fprintf(stderr, "fleetd: warning: putting this machine's published records back in its journal file: %v\n", err)
 			}
 		}
-		if _, err := refile(store.Dir(), gitDir, h, stderr); err != nil {
+		if _, err := refile(ctx, store.Dir(), gitDir, h, stderr); err != nil {
 			fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
 		}
 	}

@@ -76,7 +76,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	var published int
 	var syncErr error
 	for pass := 0; pass < 2 && syncErr == nil; pass++ {
-		if pass == 1 && !refilePending(journalDir, h) {
+		if pass == 1 && !refilePending(ctx, journalDir, h) {
 			break
 		}
 		waitForFleetFile(journalDir, deadline)
@@ -85,6 +85,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		published += r.Published
 	}
 
+	failed := finalSyncError(syncErr, *reclaim, url)
 	if *asJSON {
 		out := map[string]any{
 			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head, "started": res.Started,
@@ -96,10 +97,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		if err := writeJSON(stdout, out); err != nil {
 			return err
 		}
-		if errors.Is(syncErr, gitsync.ErrSameFile) {
-			return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
-		}
-		return nil
+		return failed
 	}
 	switch {
 	case res.Started:
@@ -112,15 +110,33 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	} else {
 		fmt.Fprintf(stdout, "the journal at %s was already set up, following %s\n", journalDir, res.Branch)
 	}
-	if errors.Is(syncErr, gitsync.ErrSameFile) {
-		// No later sync can get past this: a person has to say which it is.
-		return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
+	if failed != nil {
+		return failed
 	}
 	if syncErr != nil {
 		fmt.Fprintf(stdout, "the first sync failed, and the next one retries: %v\n", syncErr)
 		return nil
 	}
 	fmt.Fprintf(stdout, "published %s from this machine\n", plural(published, "record"))
+	return nil
+}
+
+// finalSyncError is the error init fails with when its sync failed and no later
+// sync makes up for it, else nil: the next sync retries whatever else stopped it.
+// Only init --reclaim puts this machine's published records back, so when its
+// sync failed, perhaps before doing that, it has to run again. A person has to
+// act on the others.
+func finalSyncError(syncErr error, reclaim bool, url string) error {
+	switch {
+	case syncErr == nil:
+		return nil
+	case reclaim:
+		return fmt.Errorf("the journal is set up, but its sync failed, perhaps before putting this machine's published "+
+			"records back, which no later sync does; run `fleetd init --reclaim %s` again: %w", url, syncErr)
+	case errors.Is(syncErr, gitsync.ErrSameFile), errors.Is(syncErr, gitsync.ErrLocalCommits),
+		errors.Is(syncErr, gitsync.ErrNoUpstream), errors.Is(syncErr, gitsync.ErrNotClone):
+		return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
+	}
 	return nil
 }
 

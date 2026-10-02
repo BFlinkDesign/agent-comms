@@ -191,10 +191,10 @@ type Options struct {
 	// Message is the commit message for this host's new records.
 	Message string
 	// Prepare, when set, runs once the sync holds its lock and the clone has an
-	// index, before it reads anything else, given the clone's git directory. Work
-	// on this machine's journal files that must not interleave with another sync
-	// goes there.
-	Prepare func(gitDir string)
+	// index, before it reads anything else, given the sync's context, which bounds
+	// it, and the clone's git directory. Work on this machine's journal files that
+	// must not interleave with another sync goes there.
+	Prepare func(ctx context.Context, gitDir string)
 	// Run runs git; nil means Git.
 	Run Runner
 }
@@ -245,6 +245,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 
 	top, err := g.line("rev-parse", "--show-toplevel")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("%w: %s (%v)", ErrNotClone, o.Dir, err)
 	}
 	if !SameDir(top, o.Dir) {
@@ -274,11 +277,17 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 	if o.Prepare != nil {
-		o.Prepare(gitDir)
+		o.Prepare(ctx, gitDir)
+		if err := ctx.Err(); err != nil {
+			return res, fmt.Errorf("gitsync: preparing the sync: %w", err)
+		}
 	}
 
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
 	}
 	remote, branch, ok := strings.Cut(upstream, "/")
