@@ -58,7 +58,9 @@ convenience.
   `python -m pytest tests/ -q` && `mypy` && `ruff check .`, and for fleetd
   `gofmt -l ./cmd ./internal` (must print nothing) && `go vet ./...` && `go test ./... -count=1`
   (CI adds `-race` on Linux, which needs cgo; a Windows runner; five cross-compile targets; and the
-  Windows-only `scripts/install-fleetd.test.ps1`)
+  Windows-only `scripts/install-fleetd.test.ps1`). `go` downloads and runs at least the Go
+  named by go.mod's `toolchain` line; where that download is blocked, `GOTOOLCHAIN=local` uses
+  the installed Go, and only CI then shows the pinned toolchain passing.
 - `comms.sh` is the CLI entry point — source it, don't execute directly
 
 ### Task Protocol (A2A-Aligned — 7 States)

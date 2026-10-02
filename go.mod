@@ -1,6 +1,13 @@
 module github.com/BFlinkDesign/agent-comms
 
-// A minor-version floor rather than a patch pin. A patch pin makes every build
-// fetch that exact toolchain, which is a network dependency the collector does
-// not otherwise have; a floor lets the runner's preinstalled Go satisfy it.
+// The oldest Go the code compiles with.
 go 1.24
+
+// The oldest Go that builds and tests it, in CI and for every release; a newer
+// one already installed is used as is. Without this line they used whatever Go
+// the runner image had: go1.24.13 in September 2026, which no longer got
+// security fixes, since Go supports each major release only until there are two
+// newer ones. An older go command downloads this toolchain from the Go module
+// proxy and checks it against the Go checksum database before using it;
+// Renovate proposes each newer one.
+toolchain go1.27.1

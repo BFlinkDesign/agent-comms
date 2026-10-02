@@ -542,6 +542,12 @@ func TestTheUsersOwnSSHCommandIsRespected(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in ssh is a shell script")
 	}
+	// Each case below chooses its own ssh command, or none. A go command that
+	// switched to go.mod's toolchain hands the test binary a GIT_SSH_COMMAND of
+	// its own: cmd/go's modload.Init sets one whenever the user has none.
+	for _, key := range []string{"GIT_SSH", "GIT_SSH_COMMAND"} {
+		unsetenv(t, key)
+	}
 	cases := map[string]func(t *testing.T, clone, ssh string){
 		"GIT_SSH":         func(t *testing.T, _, ssh string) { t.Setenv("GIT_SSH", ssh) },
 		"GIT_SSH_COMMAND": func(t *testing.T, _, ssh string) { t.Setenv("GIT_SSH_COMMAND", ssh) },
@@ -582,6 +588,17 @@ func TestTheUsersOwnSSHCommandIsRespected(t *testing.T) {
 			t.Fatalf("with no ssh command chosen, ssh must run in batch mode; fetch ran with %q", fetch)
 		}
 	})
+}
+
+// unsetenv removes key from the environment until the test ends.
+func unsetenv(t *testing.T, key string) {
+	t.Helper()
+	if v, ok := os.LookupEnv(key); ok {
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Setenv(key, v) })
+	}
 }
 
 func TestARewrittenRemoteNamesTheWayBackAndKeepsUnpublishedRecords(t *testing.T) {

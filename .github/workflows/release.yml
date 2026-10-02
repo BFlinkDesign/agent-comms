@@ -72,6 +72,12 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
+          # A release is built with go.mod's toolchain or a newer Go, never an older one.
+          want="$(sed -n 's/^toolchain go//p' go.mod)"; have="$(go env GOVERSION)"; have="${have#go}"
+          if [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)" != "$want" ]; then
+            echo "::error::go$have is older than go.mod's toolchain go$want"
+            exit 1
+          fi
           mkdir dist
           for target in linux/amd64 linux/arm64 windows/amd64 windows/arm64 darwin/arm64; do
             os="${target%/*}"; arch="${target#*/}"
@@ -80,6 +86,8 @@ jobs:
               -o "dist/fleetd-$os-$arch$ext" ./cmd/fleetd
           done
           ./dist/fleetd-windows-amd64.exe version
+          # Which Go built the release, which go.mod's toolchain line sets.
+          go version ./dist/fleetd-windows-amd64.exe
           cp scripts/install-fleetd.ps1 dist/
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
 
