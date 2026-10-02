@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain lets a test run this package's own binary as fleetd, so a hook can be
@@ -16,7 +17,7 @@ import (
 func TestMain(m *testing.M) {
 	if os.Getenv("FLEETD_TEST_RUN_MAIN") == "1" {
 		if os.Getenv("FLEETD_TEST_PANIC_IN_HOOK") == "1" {
-			lookupRepo = func(string) (string, string, error) { panic("injected by the test") }
+			lookupRepo = func(string, time.Duration) (string, string, error) { panic("injected by the test") }
 		}
 		main()
 		os.Exit(0)

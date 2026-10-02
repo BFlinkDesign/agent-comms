@@ -12,6 +12,7 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -51,6 +52,10 @@ const (
 	// hookGitWait bounds the two git calls that name the repository and branch,
 	// together.
 	hookGitWait = 5 * time.Second
+	// codexGitWait is hookGitWait for Codex's own hooks: Codex gives a SessionEnd
+	// hook 1 second unless configured otherwise, and at most 3, and kills it
+	// after, so a slow git costs the record its repo and branch, not the record.
+	codexGitWait = 500 * time.Millisecond
 	// hookSyncTimeout is the default --timeout. With the waits above, a hook that
 	// syncs finishes within about 50 seconds; the configurations in AGENTS.md give
 	// a session-end hook 60, so fleetd stops a slow sync and releases its lock
@@ -239,20 +244,33 @@ func runHook(res *hookResult, args []string, stderr io.Writer) {
 
 	// A turn is recorded at most once per hookTurnGap per session, and that is
 	// checked before git is asked anything, so the hook a tool runs after every
-	// reply costs next to nothing when it records nothing.
+	// reply costs next to nothing when it records nothing. A turn dated in the
+	// future, by a clock that ran fast, does not count.
 	var warn bytes.Buffer
 	if kind == "turn" && res.Session != "" {
 		if fleetSalt, err := resolveSalt(*salt, journalDir, &warn); err == nil {
-			file := filepath.Join(journalDir, journal.FileName(identity(fleetSalt).ID)+".jsonl")
-			if at, ok := lastTurn(file, res.Tool, res.Session); ok && time.Since(at) < hookTurnGap {
+			h := identity(fleetSalt)
+			file := filepath.Join(journalDir, journal.FileName(h.ID)+".jsonl")
+			if at, ok := lastTurn(file, res.Tool, res.Session); ok && time.Since(at) >= 0 && time.Since(at) < hookTurnGap {
 				res.Skipped = fmt.Sprintf("this session's turn was recorded at %s, less than %s ago", at.UTC().Format(time.RFC3339), hookTurnGap)
+				// Codex's notify program is what publishes a Codex machine's
+				// records, and the turn may have been recorded by Codex's own
+				// Stop hook, which never syncs: so notify still syncs whatever
+				// this machine has not published.
+				if fromArgv && !*noSync && unsynced(journalDir, file) {
+					syncHook(res, journalDir, h, *timeout)
+				}
 				return
 			}
 		}
 		warn.Reset()
 	}
 
-	repo, branch, gitErr := lookupRepo(tool.cwd(p))
+	gitWait := hookGitWait
+	if res.Tool == "codex" && !fromArgv {
+		gitWait = codexGitWait
+	}
+	repo, branch, gitErr := lookupRepo(tool.cwd(p), gitWait)
 	if gitErr != nil {
 		res.problem("%v", gitErr)
 	}
@@ -281,21 +299,41 @@ func runHook(res *hookResult, args []string, stderr io.Writer) {
 	if *noSync || !(kind == "session" && tool.syncAtSessionEnd || fromArgv) {
 		return
 	}
+	syncHook(res, journalDir, rec.host, *timeout)
+}
+
+// syncHook syncs the journal for a hook and notes the outcome in res.
+func syncHook(res *hookResult, journalDir string, h hostOut, timeout time.Duration) {
 	var noted bytes.Buffer
-	synced, _, err := syncJournal(journalDir, rec.host, *timeout, &noted)
+	synced, _, err := syncJournal(journalDir, h, timeout, &noted)
 	if w := strings.TrimSpace(noted.String()); w != "" {
 		res.problem("%s", strings.TrimPrefix(w, "fleetd: warning: "))
 	}
 	switch {
 	case errors.Is(err, gitsync.ErrBusy):
 		// Another hook's sync of this journal is running, and the next sync
-		// publishes this record; nothing is wrong.
+		// publishes this machine's records; nothing is wrong.
 		res.Skipped = "another sync of this journal was running; the next sync publishes this record"
 	case err != nil:
 		res.problem("sync: %v", err)
 	default:
 		res.Synced, res.Sync = true, &synced
 	}
+}
+
+// unsynced reports whether this machine's journal file changed after its last
+// successful sync, or was never synced.
+func unsynced(journalDir, file string) bool {
+	info, err := os.Stat(file)
+	if err != nil {
+		return false
+	}
+	st, ok := readSyncStatus(journalDir)
+	if !ok || st.LastSuccess == nil {
+		return true
+	}
+	at, err := time.Parse(time.RFC3339, st.LastSuccess.At)
+	return err != nil || info.ModTime().After(at)
 }
 
 // lastTurn returns when this machine last recorded a turn of the given tool's
@@ -491,10 +529,21 @@ func firstWorkspaceRoot(p payload) string {
 	}
 	for _, r := range roots {
 		if strings.TrimSpace(r) != "" {
-			return r
+			return localPath(r, runtime.GOOS)
 		}
 	}
 	return ""
+}
+
+// localPath undoes the URI-style path Cursor on Windows gives a workspace root,
+// "/C:/Users/...", which Windows reads as a directory named "C:" on the current
+// drive. Anywhere else, and in any other form, the path is returned as it is.
+func localPath(p, goos string) string {
+	if goos == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' &&
+		(('a' <= p[1] && p[1] <= 'z') || ('A' <= p[1] && p[1] <= 'Z')) {
+		return p[1:]
+	}
+	return p
 }
 
 // eventKey folds the tools' spellings of one event together: Claude Code's
@@ -570,14 +619,14 @@ var lookupRepo = repoAndBranch
 // event is still recorded, since which machine did something is worth knowing
 // without them. A failure that silently drops them from every record, such as git
 // refusing a repository it does not trust, is returned so it gets logged.
-func repoAndBranch(cwd string) (repo, branch string, err error) {
+func repoAndBranch(cwd string, wait time.Duration) (repo, branch string, err error) {
 	if strings.TrimSpace(cwd) == "" {
 		return "", "", nil
 	}
 	if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
 		return "", "", fmt.Errorf("the event's working directory %s is not a directory on this machine, so repo and branch are not recorded", cwd)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), hookGitWait)
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	out, err := gitsync.Git(ctx, "", nil, "-C", cwd, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -585,7 +634,7 @@ func repoAndBranch(cwd string) (repo, branch string, err error) {
 		case errors.Is(err, osexec.ErrNotFound):
 			return "", "", errors.New("git is not on PATH, so repo and branch are not recorded")
 		case ctx.Err() != nil:
-			return "", "", fmt.Errorf("git did not name the repository at %s within %s", cwd, hookGitWait)
+			return "", "", fmt.Errorf("git did not name the repository at %s within %s", cwd, wait)
 		case !underGitCheckout(cwd):
 			// Not a repository: nothing to record, and nothing wrong.
 			return "", "", nil
@@ -607,7 +656,7 @@ func repoAndBranch(cwd string) (repo, branch string, err error) {
 	out, err = gitsync.Git(ctx, "", nil, "-C", cwd, "branch", "--show-current")
 	if err != nil {
 		if ctx.Err() != nil {
-			return repo, "", fmt.Errorf("git did not name the branch at %s within %s", cwd, hookGitWait)
+			return repo, "", fmt.Errorf("git did not name the branch at %s within %s", cwd, wait)
 		}
 		return repo, "", fmt.Errorf("git could not name the branch at %s: %v", cwd, err)
 	}

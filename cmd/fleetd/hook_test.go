@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -981,5 +982,114 @@ func TestWhereMentionsARecentHookProblem(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "hook logged a problem") || !strings.Contains(stdout, "not a JSON object") || !strings.Contains(stdout, logBeside(journal)) {
 		t.Fatalf("where does not mention the hook's problem:\n%s", stdout)
+	}
+}
+
+// Cursor on Windows gives a workspace root as "/C:/Users/...", which Windows
+// reads as a directory named "C:" on the current drive (cc-safety-net#174 shows
+// such a payload from Cursor 3.22.12 on Windows 11).
+func TestLocalPathUndoesCursorsWindowsDriveForm(t *testing.T) {
+	for _, c := range []struct{ in, goos, want string }{
+		{"/C:/Users/someone/git-repos/research", "windows", "C:/Users/someone/git-repos/research"},
+		{"/d:/work", "windows", "d:/work"},
+		{`C:\Users\someone`, "windows", `C:\Users\someone`},
+		{"/C:/Users/someone", "linux", "/C:/Users/someone"},
+		{"/home/someone/work", "linux", "/home/someone/work"},
+		{"/1:/x", "windows", "/1:/x"},
+	} {
+		if got := localPath(c.in, c.goos); got != c.want {
+			t.Errorf("localPath(%q, %s) = %q, want %q", c.in, c.goos, got, c.want)
+		}
+	}
+}
+
+// A turn written while the clock ran fast is in the future; it must not keep the
+// session's later turns from being recorded until the clock catches up.
+func TestHookIgnoresATurnDatedInTheFuture(t *testing.T) {
+	hookEnv(t)
+	journal := filepath.Join(t.TempDir(), "journal")
+	cwd := workRepo(t, "widget-shop", "main")
+	if _, _, err := exec(t, "record", "--dir", journal, "--salt", "s", "--type", "turn", "--note", "claude Stop",
+		"--agent", "claude", "--at", time.Now().Add(6*time.Hour).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	// The record above has no session; give the future turn this session's.
+	file := filepath.Join(journal, strings.ReplaceAll(hostID(t, "--salt", "s", "--dir", t.TempDir()), ":", "-")+".jsonl")
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec["data"].(map[string]any)["tool"], rec["data"].(map[string]any)["session"] = "claude", "fast-clock"
+	b, _ := json.Marshal(rec)
+	if err := os.WriteFile(file, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hook(t, event(t, docClaudeStop, map[string]any{"cwd": cwd, "session_id": "fast-clock"}), "claude", "--dir", journal, "--salt", "s")
+	if n := len(hookRecords(t, journal)); n != 2 {
+		t.Fatalf("got %d records, want this turn recorded despite the one dated in the future", n)
+	}
+}
+
+// Codex gives its own SessionEnd hook 1 second unless configured otherwise, and
+// at most 3, then kills it: its hooks ask git for at most half a second, so a
+// slow git costs the record its repo and branch, not the record. Its notify
+// program, which Codex does not limit, and the other tools keep the full wait.
+func TestCodexsOwnHooksBoundTheirGitLookup(t *testing.T) {
+	hookEnv(t)
+	journal := filepath.Join(t.TempDir(), "journal")
+	var waited []time.Duration
+	saved := lookupRepo
+	t.Cleanup(func() { lookupRepo = saved })
+	lookupRepo = func(cwd string, wait time.Duration) (string, string, error) {
+		waited = append(waited, wait)
+		return "", "", nil
+	}
+	hook(t, event(t, docCodexSessionEnd, nil), "codex", "--dir", journal, "--salt", "s", "--no-sync")
+	hook(t, "", "codex", "--dir", journal, "--salt", "s", "--no-sync", event(t, codexNotify, map[string]any{"thread-id": "another"}))
+	hook(t, event(t, docClaudeSessionEnd, nil), "claude", "--dir", journal, "--salt", "s", "--no-sync")
+	want := []time.Duration{codexGitWait, hookGitWait, hookGitWait}
+	if fmt.Sprint(waited) != fmt.Sprint(want) {
+		t.Fatalf("git waits = %v, want %v", waited, want)
+	}
+}
+
+// With both of Codex's mechanisms configured, its Stop hook records a turn
+// (and never syncs) and notify, for the same turn, finds it already recorded.
+// notify must still publish it: on a machine that runs only Codex, nothing else
+// would until a session ended elsewhere.
+func TestNotifyPublishesATurnCodexsStopHookRecorded(t *testing.T) {
+	hookEnv(t)
+	journal, _ := twoMachines(t)
+	cwd := workRepo(t, "widget-shop", "main")
+	stop := event(t, codexStop, map[string]any{"cwd": cwd, "session_id": "thr_1"})
+	hook(t, stop, "codex", "--dir", journal, "--salt", "s")
+	if n := publishedRecords(t, journal); n != 0 {
+		t.Fatalf("Codex's Stop hook published %d records; its hooks never sync", n)
+	}
+	hook(t, "", "codex", "--dir", journal, "--salt", "s", event(t, codexNotify, map[string]any{"cwd": cwd, "thread-id": "thr_1"}))
+	if n := len(hookRecords(t, journal)); n != 1 {
+		t.Fatalf("got %d records, want the one turn, recorded once", n)
+	}
+	if n := publishedRecords(t, journal); n != 1 {
+		t.Fatalf("the remote holds %d records, want the turn notify found recorded", n)
+	}
+}
+
+// The first machine's hooks all failing is exactly when where must say so,
+// though the journal has nothing in it yet.
+func TestWhereShowsAHookProblemWhenThereAreNoRecords(t *testing.T) {
+	hookEnv(t)
+	journal, _ := twoMachines(t)
+	hook(t, "not json", "claude", "--dir", journal, "--salt", "s")
+	stdout, _, err := exec(t, "where", "--dir", journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "hook logged a problem") || !strings.Contains(stdout, "no records") {
+		t.Fatalf("where with no records does not mention the hook's problem:\n%s", stdout)
 	}
 }
