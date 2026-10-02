@@ -708,8 +708,8 @@ func TestInitReclaimWhoseSyncFailedSaysToRunItAgain(t *testing.T) {
 	path := os.Getenv("PATH")
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
 	fleetFileAged(t, dir)
-	if _, _, err := exec(t, "init", "--dir", dir, "--reclaim", remote); err == nil || !strings.Contains(err.Error(), "init --reclaim") {
-		t.Fatalf("init --reclaim whose sync failed: %v, want an error saying to run it again", err)
+	if _, _, err := exec(t, "init", "--dir", dir, "--reclaim", remote); err == nil || !strings.Contains(err.Error(), "run the same `fleetd init --reclaim` command again") {
+		t.Fatalf("init --reclaim whose sync failed: %v, want an error saying to run the same command again", err)
 	}
 	stdout, _, err := exec(t, "init", "--dir", dir, remote)
 	if err != nil || !strings.Contains(stdout, "the next one retries") {
@@ -724,31 +724,103 @@ func TestInitReclaimWhoseSyncFailedSaysToRunItAgain(t *testing.T) {
 	}
 }
 
-// A sync error no later sync gets past, such as a commit made by hand in the
-// clone, makes init fail, with --json too, instead of promising a retry.
+// A sync error no later sync gets past, a commit made by hand in the clone or a
+// push the remote refuses, makes init fail, with --json too, instead of
+// promising a retry.
 func TestInitFailsWhenNoLaterSyncCanPublish(t *testing.T) {
-	remote := emptyJournalRemote(t)
-	dir := filepath.Join(t.TempDir(), "journal")
-	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "by hand")
-	fleetFileAged(t, dir)
-	if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrLocalCommits) {
-		t.Fatalf("init in a clone with a commit made by hand: %v, want ErrLocalCommits", err)
-	}
-	stdout, _, err := exec(t, "init", "--json", "--dir", dir, remote)
-	var out struct {
-		SyncError string `json:"sync_error"`
-	}
-	if !errors.Is(err, gitsync.ErrLocalCommits) || json.Unmarshal([]byte(stdout), &out) != nil || out.SyncError == "" {
-		t.Fatalf("init --json in a clone with a commit made by hand: %v, output %q; want ErrLocalCommits and sync_error", err, stdout)
+	for _, tc := range []struct {
+		name string
+		want error
+	}{
+		{"a commit made by hand", gitsync.ErrLocalCommits},
+		{"a push the remote refuses", gitsync.ErrRejected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == gitsync.ErrLocalCommits {
+				gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "by hand")
+			} else {
+				hook := filepath.Join(remote, "hooks", "pre-receive")
+				if err := os.WriteFile(hook, []byte("#!/bin/sh\necho 'protected branch' >&2\nexit 1\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "waits for the remote"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fleetFileAged(t, dir)
+			if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, tc.want) {
+				t.Fatalf("init: %v, want %v", err, tc.want)
+			}
+			stdout, _, err := exec(t, "init", "--json", "--dir", dir, remote)
+			var out struct {
+				SyncError string `json:"sync_error"`
+			}
+			if !errors.Is(err, tc.want) || json.Unmarshal([]byte(stdout), &out) != nil || out.SyncError == "" {
+				t.Fatalf("init --json: %v, output %q; want %v and sync_error", err, stdout, tc.want)
+			}
+		})
 	}
 }
 
-// Re-filing's git calls are bounded by the sync's --timeout, and a sync that runs
-// out of time while re-filing says so, rather than that the clone has no upstream.
+// Re-filing is bounded by the sync's --timeout, whether git stalls or a rename
+// keeps failing, and a sync that runs out of time while re-filing says so,
+// rather than that the clone has no upstream.
 func TestASyncThatRunsOutOfTimeWhileRefilingSaysSo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	for _, tc := range []struct{ name, stall string }{
+		{"git stalls reading a published copy", "ls-tree"},
+		{"git stalls saying whether a file is tracked", "ls-files"},
+		{"a rename keeps failing", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			recordWithout(t, dir, "--note", "written under no salt")
+			if tc.stall == "" {
+				// A rename onto a directory that holds a file fails every time, as
+				// one Windows refuses while another process has the file open does.
+				if err := os.MkdirAll(filepath.Join(dir, ".git", "fleetd-pre-init", "refiled.json", "inside"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				real, err := osexec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				bin := t.TempDir()
+				script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = " + tc.stall + " ] && exec sleep 30; done\nexec " + real + " \"$@\"\n"
+				if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			}
+			fleetFileAged(t, dir)
+			start := time.Now()
+			_, _, err := exec(t, "sync", "--dir", dir, "--timeout", "1s")
+			if elapsed := time.Since(start); elapsed > 4*time.Second {
+				t.Errorf("a sync with a 1s timeout took %v", elapsed)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, gitsync.ErrNoUpstream) {
+				t.Fatalf("sync: %v, want the deadline", err)
+			}
+		})
+	}
+}
+
+// An init whose sync runs out of time has still set the journal up, and the next
+// sync retries the rest: it says so and succeeds, rather than reporting commits
+// that are not there.
+func TestInitWhoseSyncRanOutOfTimeSaysTheNextOneRetries(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a shell script in place of git")
 	}
@@ -762,18 +834,14 @@ func TestASyncThatRunsOutOfTimeWhileRefilingSaysSo(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
-	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = ls-tree ] && exec sleep 30; done\nexec " + real + " \"$@\"\n"
+	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = merge-base ] && exec sleep 30; done\nexec " + real + " \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	fleetFileAged(t, dir)
-	start := time.Now()
-	_, _, err = exec(t, "sync", "--dir", dir, "--timeout", "3s")
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("a sync with a 3s timeout took %v", elapsed)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, gitsync.ErrNoUpstream) {
-		t.Fatalf("sync: %v, want the deadline", err)
+	stdout, _, err := exec(t, "init", "--dir", dir, "--timeout", "4s", remote)
+	if err != nil || !strings.Contains(stdout, "the next one retries") || !strings.Contains(stdout, context.DeadlineExceeded.Error()) {
+		t.Fatalf("init whose sync ran out of time: %v, %q; want success, saying the next sync retries", err, stdout)
 	}
 }

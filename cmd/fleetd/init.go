@@ -85,7 +85,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		published += r.Published
 	}
 
-	failed := finalSyncError(syncErr, *reclaim, url)
+	failed := finalSyncError(syncErr, *reclaim)
 	if *asJSON {
 		out := map[string]any{
 			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head, "started": res.Started,
@@ -122,19 +122,21 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 }
 
 // finalSyncError is the error init fails with when its sync failed and no later
-// sync makes up for it, else nil: the next sync retries whatever else stopped it.
-// Only init --reclaim puts this machine's published records back, so when its
-// sync failed, perhaps before doing that, it has to run again. A person has to
-// act on the others.
-func finalSyncError(syncErr error, reclaim bool, url string) error {
+// sync makes up for it, else nil: the next sync retries whatever else stopped it,
+// a timeout or a network failure. Only init --reclaim puts this machine's
+// published records back, so when its sync failed, perhaps before doing that, it
+// has to run again. A person has to act on the others: this machine's file not
+// starting with the remote's copy, commits fleetd did not make, and a push the
+// remote refuses.
+func finalSyncError(syncErr error, reclaim bool) error {
 	switch {
 	case syncErr == nil:
 		return nil
 	case reclaim:
 		return fmt.Errorf("the journal is set up, but its sync failed, perhaps before putting this machine's published "+
-			"records back, which no later sync does; run `fleetd init --reclaim %s` again: %w", url, syncErr)
+			"records back, which no later sync does; run the same `fleetd init --reclaim` command again: %w", syncErr)
 	case errors.Is(syncErr, gitsync.ErrSameFile), errors.Is(syncErr, gitsync.ErrLocalCommits),
-		errors.Is(syncErr, gitsync.ErrNoUpstream), errors.Is(syncErr, gitsync.ErrNotClone):
+		errors.Is(syncErr, gitsync.ErrRejected):
 		return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
 	}
 	return nil

@@ -291,3 +291,32 @@ func TestASecondMachineFollowsTheOnlyBranchWhenTheServerNamesNone(t *testing.T) 
 		t.Fatalf("the journal has branches %q, want main alone", heads)
 	}
 }
+
+// An init whose context ends while git is answering a question says the time ran
+// out, never what a failure there would otherwise mean: not a clone, a clone of
+// another repository, or no upstream.
+func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
+	for _, at := range []string{"--show-toplevel", "remote.origin.url", "@{u}"} {
+		t.Run(at, func(t *testing.T) {
+			remote := emptyRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			mustInit(t, InitOptions{URL: remote, Dir: dir, Salt: "s"})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_, err := Init(ctx, InitOptions{URL: remote, Dir: dir, Run: func(ctx context.Context, d string, stdin []byte, args ...string) (string, error) {
+				if slices.Contains(args, at) {
+					cancel()
+				}
+				return Git(ctx, d, stdin, args...)
+			}})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want the cancellation", err)
+			}
+			for _, wrong := range []error{ErrNotClone, ErrOtherRemote, ErrNoUpstream} {
+				if errors.Is(err, wrong) {
+					t.Fatalf("err = %v: the time running out reads as %v", err, wrong)
+				}
+			}
+		})
+	}
+}

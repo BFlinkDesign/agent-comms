@@ -420,6 +420,82 @@ func TestACloneWithoutAnUpstreamSaysHowToSetOne(t *testing.T) {
 	}
 }
 
+// A sync whose context ends while git is answering a question says the time ran
+// out, never what a failure there would otherwise mean: not a clone, no
+// upstream, a detached HEAD, or commits fleetd did not make.
+func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
+	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "merge-base", "prepare"} {
+		t.Run(at, func(t *testing.T) {
+			_, m := fleet(t, 1)
+			appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			o := options(m[0], "host-a")
+			o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+				if slices.Contains(args, at) {
+					cancel()
+				}
+				return Git(ctx, dir, stdin, args...)
+			}
+			o.Prepare = func(context.Context, string) {
+				if at == "prepare" {
+					cancel()
+				}
+			}
+			_, err := Sync(ctx, o)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err = %v, want the cancellation", err)
+			}
+			for _, wrong := range []error{ErrNotClone, ErrNoUpstream, ErrLocalCommits} {
+				if errors.Is(err, wrong) {
+					t.Fatalf("err = %v: the time running out reads as %v", err, wrong)
+				}
+			}
+			if strings.Contains(err.Error(), "detached") || at == "prepare" && !strings.Contains(err.Error(), "preparing the sync") {
+				t.Fatalf("err = %v, which does not say where the time ran out", err)
+			}
+		})
+	}
+}
+
+// A push the remote refuses for any reason but another machine's push, such as
+// branch protection, is reported as refused and not tried again: no later push
+// gets past it until a person changes the remote.
+func TestAPushTheRemoteRefusesIsReportedAsRefused(t *testing.T) {
+	remote, m := fleet(t, 1)
+	hook := filepath.Join(remote, "hooks", "pre-receive")
+	write(t, hook, "#!/bin/sh\necho 'protected branch' >&2\nexit 1\n")
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
+	res, err := Sync(context.Background(), options(m[0], "host-a"))
+	if !errors.Is(err, ErrRejected) || res.Attempts != 1 {
+		t.Fatalf("err = %v after %d attempts, want ErrRejected after one", err, res.Attempts)
+	}
+}
+
+// A rename Windows keeps refusing is retried for a few seconds, but never past
+// the caller's deadline.
+func TestARenameRetryStopsWhenTheContextEnds(t *testing.T) {
+	dir := t.TempDir()
+	from, to := filepath.Join(dir, "from"), filepath.Join(dir, "to")
+	write(t, from, "a record\n")
+	// Renaming onto a directory that holds a file fails every time.
+	if err := os.MkdirAll(filepath.Join(to, "inside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := RenameRetry(ctx, from, to); err == nil {
+		t.Fatal("the rename onto a directory worked")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("RenameRetry took %v with a 200ms deadline", elapsed)
+	}
+}
+
 // A repository with no commit yet has no index either; a sync there still says
 // what is missing rather than failing to fill the index.
 func TestARepositoryWithNoCommitSaysHowToSetAnUpstream(t *testing.T) {

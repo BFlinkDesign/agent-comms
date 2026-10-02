@@ -187,7 +187,7 @@ func moveAside(ctx context.Context, dir, gitDir, keep, name, rev string) ([]stri
 		if err != nil {
 			return dests, err
 		}
-		if err := gitsync.RenameRetry(filepath.Join(dir, name), dest); err != nil {
+		if err := gitsync.RenameRetry(ctx, filepath.Join(dir, name), dest); err != nil {
 			return dests, err
 		}
 		dests = append(dests, dest)
@@ -343,7 +343,7 @@ func fileMoved(ctx context.Context, dir, keep string, me hostOut, moved map[stri
 	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o600); err != nil {
 		return total, err
 	}
-	return total, gitsync.RenameRetry(path+".tmp", path)
+	return total, gitsync.RenameRetry(ctx, path+".tmp", path)
 }
 
 // publishedIDs returns the ids of the records name holds in this clone's HEAD

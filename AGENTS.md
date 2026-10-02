@@ -131,7 +131,8 @@ git directory, `fleetd-pre-init/`, puts the journal's copy back, and files the
 moved records the journal lacks after it. No later sync does that, so an
 `init --reclaim` whose sync fails exits non-zero and says to run it again. A
 plain init fails too when its sync stops for a reason no later sync gets past
-(this machine's file, or commits fleetd did not make); otherwise it says that
+(this machine's file, commits fleetd did not make, or a push the remote
+refuses); otherwise, after a timeout or a network failure, it says that
 the next sync retries.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
@@ -145,7 +146,9 @@ moves it aside. Instead it:
 - snapshots the file up to its last complete record;
 - builds a commit on top of the remote tip with git plumbing (`hash-object`,
   `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
-  lost a race to another machine, for at most three attempts in all;
+  lost a race to another machine, for at most three attempts in all. A push the
+  remote refuses for any other reason, such as branch protection or a ruleset
+  on the journal's branch, is not retried, and the error says it was refused;
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (an edit made by hand, say) is never overwritten;
   sync names it. A file that holds only the start of git's copy, such as one
@@ -163,7 +166,8 @@ always published with LF. The error also names the other cause: this machine's
 journal directory set up again over newer records, which `fleetd init --reclaim` repairs. A clone with commits fleetd did not make is refused,
 never pushed and never discarded; the error names
 `git reset --soft '@{upstream}'` as the way back, which keeps unpublished records.
-Every git call is bounded by `--timeout`, and when it runs out git and the
+Every git call, and every rename re-filing retries, is bounded by `--timeout`; a
+sync that runs out of time says so, whatever it was doing. When it runs out git and the
 processes it started (ssh, a remote helper) are killed: on Unix every process
 still in git's process group (one that starts a session of its own, as `setsid`
 does, leaves it), on Windows every process in git's job object. On Windows the job also ends anything git leaves running

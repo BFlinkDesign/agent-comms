@@ -62,7 +62,7 @@ func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, 
 	if err == nil {
 		tmp := path + ".tmp"
 		if err = os.WriteFile(tmp, append(data, '\n'), 0o644); err == nil {
-			err = gitsync.RenameRetry(tmp, path)
+			err = gitsync.RenameRetry(context.Background(), tmp, path)
 		}
 	}
 	if err != nil {

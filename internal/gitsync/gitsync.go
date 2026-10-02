@@ -64,6 +64,10 @@ var (
 	ErrLocalCommits = errors.New("gitsync: the journal clone has commits that are not on the remote")
 	// ErrBusy means another sync of the same clone is running.
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
+	// ErrRejected means the remote refused this machine's push for a reason
+	// other than another machine's push, such as branch protection or a
+	// ruleset. No later push gets past it until a person changes the remote.
+	ErrRejected = errors.New("gitsync: the remote refused this machine's push")
 )
 
 // gitConfig is the configuration every git command runs with. core.fsmonitor
@@ -296,6 +300,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	localRef, err := g.line("symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("gitsync: HEAD is detached in %s; check out %s", o.Dir, branch)
 	}
 	local, err := g.line("rev-parse", "--verify", "HEAD")
@@ -314,6 +321,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			return res, err
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
+			if ctx.Err() != nil {
+				return res, err
+			}
 			return res, fmt.Errorf("%w: %s. If they are not wanted, or the remote was rewritten, "+
 				"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
 				"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
@@ -333,6 +343,10 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 		// Only a push that lost a race to another machine is retried; anything
 		// else, such as a refused credential, is reported as it is.
+		if !lostRace(out) && strings.Contains(out, "[remote rejected]") {
+			return res, fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w",
+				ErrRejected, branch, err)
+		}
 		if !lostRace(out) || res.Attempts >= MaxAttempts {
 			return res, err
 		}
@@ -445,10 +459,14 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		published = []byte(out)
 	}
 	if !bytes.HasPrefix(complete, published) {
+		dir, err := filepath.Abs(filepath.Dir(file))
+		if err != nil {
+			dir = filepath.Dir(file)
+		}
 		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine's copy lacks. If this machine's journal "+
-			"directory was set up again, or restored from an older copy, `fleetd init --reclaim <journal URL>` puts them back "+
-			"and publishes this machine's newer records after them; otherwise another machine has this machine's id, and each "+
-			"needs a distinct one (see `fleetd host`)", ErrSameFile, own)
+			"directory was set up again, or restored from an older copy, `fleetd init --reclaim --dir \"%s\" <journal URL>` "+
+			"puts them back and publishes this machine's newer records after them; otherwise another machine has this "+
+			"machine's id, and each needs a distinct one (see `fleetd host`)", ErrSameFile, own, dir)
 	}
 	fresh := bytes.Count(complete, []byte{'\n'}) - bytes.Count(published, []byte{'\n'})
 	if fresh == 0 {

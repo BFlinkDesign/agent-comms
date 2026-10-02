@@ -215,7 +215,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := placeFleetFile(g, o.Dir, filepath.Join(tmp, ".git"), res.Head); err != nil {
 		return res, err
 	}
-	if err := RenameRetry(filepath.Join(tmp, ".git"), filepath.Join(o.Dir, ".git")); err != nil {
+	if err := RenameRetry(ctx, filepath.Join(tmp, ".git"), filepath.Join(o.Dir, ".git")); err != nil {
 		if _, statErr := os.Lstat(filepath.Join(o.Dir, ".git")); statErr == nil {
 			// Another init set Dir up first; finish as on any clone.
 			return initClone(ctx, o, url, run)
@@ -237,16 +237,26 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	g := git{ctx: ctx, dir: o.Dir, run: run}
 	top, err := g.line("rev-parse", "--show-toplevel")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("%w: %s (%v)", ErrNotClone, o.Dir, err)
 	}
 	if !SameDir(top, o.Dir) {
 		return res, fmt.Errorf("%w: %s is inside the repository at %s", ErrNotClone, o.Dir, top)
 	}
-	if origin, _ := g.line("config", "--get", "remote.origin.url"); !sameURL(origin, url) {
+	origin, err := g.line("config", "--get", "remote.origin.url")
+	if err != nil && ctx.Err() != nil {
+		return res, err
+	}
+	if !sameURL(origin, url) {
 		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
 	}
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
 	}
 	remote, branch, ok := strings.Cut(upstream, "/")
@@ -480,7 +490,7 @@ func placeFleetFile(g git, dir, gitDir, tip string) error {
 		err = cerr
 	}
 	if err == nil {
-		err = RenameRetry(f.Name(), path)
+		err = RenameRetry(g.ctx, f.Name(), path)
 	}
 	if err != nil {
 		os.Remove(f.Name())
@@ -521,7 +531,7 @@ func NotePastSalt(gitDir, salt string) error {
 	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o600); err != nil {
 		return err
 	}
-	return RenameRetry(path+".tmp", path)
+	return RenameRetry(context.Background(), path+".tmp", path)
 }
 
 // restoreMissing checks out every tracked file the work tree lacks, and returns
@@ -673,8 +683,9 @@ func randomSalt() (string, error) {
 }
 
 // RenameRetry renames, retrying for a few seconds while Windows refuses because
-// another process, such as a virus scanner or an indexer, has the file open.
-func RenameRetry(from, to string) error {
+// another process, such as a virus scanner or an indexer, has the file open. It
+// stops retrying once ctx ends.
+func RenameRetry(ctx context.Context, from, to string) error {
 	var err error
 	for delay := 50 * time.Millisecond; delay < 5*time.Second; delay *= 2 {
 		if err = os.Rename(from, to); err == nil {
@@ -683,7 +694,11 @@ func RenameRetry(from, to string) error {
 		if _, statErr := os.Stat(from); statErr != nil {
 			return err
 		}
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
 	}
 	return err
 }

@@ -232,8 +232,8 @@ func TestInitAgainAfterTheJournalDirectoryWasLostStillPublishes(t *testing.T) {
 	}
 	// The remote's copy no longer starts this machine's file. init cannot tell
 	// that from another machine having this one's id, so it says what to run.
-	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil || !strings.Contains(err.Error(), "--reclaim") {
-		t.Fatalf("init again: %v, want an error naming --reclaim", err)
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil || !strings.Contains(err.Error(), "fleetd init --reclaim --dir \""+dir+"\"") {
+		t.Fatalf("init again: %v, want an error naming the init --reclaim to run, with this journal's --dir", err)
 	}
 	stdout, _, err := exec(t, "init", "--json", "--dir", dir, remote)
 	var out struct {
