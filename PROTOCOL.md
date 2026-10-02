@@ -295,7 +295,8 @@ into `.git/fleetd-pre-init/`, puts the journal's copy back, and files the moved
 records the journal lacks after it. init exits non-zero when its sync failed with
 `--reclaim`, or for a reason no later sync gets past: this machine's file not
 starting with the journal's copy, commits fleetd did not make, or a push the
-remote refuses. After a timeout or a network failure the next sync retries.
+remote declines (a hook, branch protection, a ruleset). Any other failure, a
+credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository, with an upstream branch. It notes each outcome in the clone's
@@ -303,8 +304,8 @@ journal repository, with an upstream branch. It notes each outcome in the clone'
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never rewrites that file. A push rejected
 because another machine pushed first is retried, up to three attempts; a push
-the remote refuses for another reason (branch protection, a ruleset) fails at
-once, saying it was refused. It then
+the remote declines (a hook, branch protection, a ruleset) fails at once,
+saying it was refused. It then
 brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
 (`kept` in `--json`). Anything staged with `git add` and not committed is the

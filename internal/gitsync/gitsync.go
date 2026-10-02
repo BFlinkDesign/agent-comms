@@ -64,9 +64,9 @@ var (
 	ErrLocalCommits = errors.New("gitsync: the journal clone has commits that are not on the remote")
 	// ErrBusy means another sync of the same clone is running.
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
-	// ErrRejected means the remote refused this machine's push for a reason
-	// other than another machine's push, such as branch protection or a
-	// ruleset. No later push gets past it until a person changes the remote.
+	// ErrRejected means the remote declined this machine's push: a hook, branch
+	// protection or a ruleset. No later push gets past it until a person changes
+	// the remote.
 	ErrRejected = errors.New("gitsync: the remote refused this machine's push")
 )
 
@@ -343,7 +343,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 		// Only a push that lost a race to another machine is retried; anything
 		// else, such as a refused credential, is reported as it is.
-		if !lostRace(out) && strings.Contains(out, "[remote rejected]") {
+		if refused(out) {
 			return res, fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w",
 				ErrRejected, branch, err)
 		}
@@ -416,6 +416,15 @@ func lostRace(out string) bool {
 		}
 	}
 	return false
+}
+
+// refused reports whether the remote declined a push for good: a hook, branch
+// protection or a ruleset said no ("pre-receive hook declined", "protected branch
+// hook declined", "push declined due to ..."). A race, a credential that cannot
+// push, or a failure on the remote's side, such as its storage, is not refused:
+// the next push can get past it.
+func refused(out string) bool {
+	return strings.Contains(out, "[remote rejected]") && strings.Contains(out, "declined")
 }
 
 // batchSSH returns the arguments that keep ssh from waiting for a person, or none

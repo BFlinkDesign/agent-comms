@@ -1175,6 +1175,51 @@ func TestOnlyARaceIsRetried(t *testing.T) {
 	}
 }
 
+// Only a push the remote declines, by a hook, branch protection or a ruleset,
+// is refused for good. A race and a failure on the remote's side, such as its
+// storage, are not: a later push can get past them.
+func TestOnlyADeclinedPushIsRefused(t *testing.T) {
+	for out, want := range map[string]bool{
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n":                                                                          true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (protected branch hook declined)\n":                                                                     true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (push declined due to repository rule violations)\n":                                                    true,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (unpacker error)\n":                                                                                     false,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (cannot lock ref 'refs/heads/main': is at 3f1c but expected 1a2b)\n":                                    false,
+		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (failed to update ref)\n":                                                                               false,
+		"To github.com:o/journal.git\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n":                                                            false,
+		"remote: Permission to o/journal.git denied to someone.\nfatal: unable to access 'https://github.com/o/journal.git/': The requested URL returned error: 403\n": false,
+	} {
+		if got := refused(out); got != want {
+			t.Errorf("refused(%q) = %v, want %v", out, got, want)
+		}
+	}
+}
+
+// Another push that lands on the remote between this push's check and its update
+// is reported by the remote as [remote rejected], not by git as [rejected]. It is
+// a race like any other: the sync tries again and publishes.
+func TestARaceTheRemoteReportsIsRetried(t *testing.T) {
+	remote, m := fleet(t, 1)
+	hook := filepath.Join(remote, "hooks", "pre-receive")
+	write(t, hook, `#!/bin/sh
+if [ ! -f "$GIT_DIR/raced" ]; then
+	touch "$GIT_DIR/raced"
+	unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+	tip=$(git rev-parse refs/heads/main)
+	c=$(GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@example.invalid GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@example.invalid git commit-tree "$tip^{tree}" -p "$tip" -m "another machine")
+	git update-ref refs/heads/main "$c" "$tip"
+fi
+`)
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
+	res, err := Sync(context.Background(), options(m[0], "host-a"))
+	if err != nil || res.Attempts != 2 || res.Published != 1 {
+		t.Fatalf("result %+v, err %v; want the record published on the second attempt", res, err)
+	}
+}
+
 // A file that holds only the start of git's own copy, such as one restored from
 // an older backup, has no change of its own. A sync brings it up to date, both
 // when the remote changed it since and when it did not.

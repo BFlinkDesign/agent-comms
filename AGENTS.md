@@ -132,8 +132,9 @@ moved records the journal lacks after it. No later sync does that, so an
 `init --reclaim` whose sync fails exits non-zero and says to run it again. A
 plain init fails too when its sync stops for a reason no later sync gets past
 (this machine's file, commits fleetd did not make, or a push the remote
-refuses); otherwise, after a timeout or a network failure, it says that
-the next sync retries.
+declines by a hook, branch protection or a ruleset). Anything else, such as a
+timeout, the network, a credential that cannot push or the remote's own
+storage, is reported, and init says that the next sync retries.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never
@@ -147,8 +148,8 @@ moves it aside. Instead it:
 - builds a commit on top of the remote tip with git plumbing (`hash-object`,
   `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
   lost a race to another machine, for at most three attempts in all. A push the
-  remote refuses for any other reason, such as branch protection or a ruleset
-  on the journal's branch, is not retried, and the error says it was refused;
+  remote declines, by a hook, branch protection or a ruleset on the journal's
+  branch, is not retried, and the error says it was refused;
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (an edit made by hand, say) is never overwritten;
   sync names it. A file that holds only the start of git's copy, such as one

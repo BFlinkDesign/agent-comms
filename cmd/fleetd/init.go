@@ -127,7 +127,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 // published records back, so when its sync failed, perhaps before doing that, it
 // has to run again. A person has to act on the others: this machine's file not
 // starting with the remote's copy, commits fleetd did not make, and a push the
-// remote refuses.
+// remote declines.
 func finalSyncError(syncErr error, reclaim bool) error {
 	switch {
 	case syncErr == nil:
