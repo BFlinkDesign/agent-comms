@@ -281,7 +281,8 @@ once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
 an `about` line), on the branch it names as its default, else `main`; a repository
 that already holds records without one needs the salt its machines use (`--salt` or
-`$FLEET_SALT`). When the repository's default branch does not exist, the journal is
+`$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
+the ids they had). When the repository's default branch does not exist, the journal is
 on its only branch; with several, init is refused. A `fleetd.json` in the journal
 directory with another salt is replaced by the journal's. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
@@ -327,7 +328,8 @@ directory). `fleetd where` reports an
 error rather than "no records" when that directory does not exist, so a mistyped
 path is distinguishable from a machine that genuinely recorded nothing. For each
 host, `where --json` adds `last_published` (the ts of the newest record the
-remote has from that host, as of this clone's last sync) and `unpublished` (the
+remote has from that host, leaving out records re-filed after it, as of this
+clone's last sync) and `unpublished` (the
 host's complete records here that the remote lacks), when the journal directory is
 the top of a clone and git could say.
 
@@ -338,9 +340,12 @@ fleet, or one machine will appear as several. It is not a credential. A sync fil
 under this machine's fleet id the records it wrote under another salt (none or
 `$FLEET_SALT` before it knew the fleet's, a replaced `fleetd.json`'s, or the
 journal's previous one) that the old id never published, appending them to this
-machine's file with `refiled.from` set to the old id. It moves their file into
+machine's file with `refiled.from` set to the old id (left out when it would take
+the record past 4096 bytes). It moves their file into
 `.git/fleetd-pre-init/`, putting back a file git tracks as published, and files a
-record appended to the moved copy later at the next sync.
+record appended to the moved copy later at the next sync. A `--salt` or
+`$FLEET_SALT` a record was written under for want of `fleetd.json` is noted in
+`<journal directory>.salts`, beside it, so that sync need not have it set.
 
 DOES NOT EXIST (never use):
 - comms join

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -166,15 +167,24 @@ func unpublished(local, remote []byte) int {
 // newestTS is the ts of the last record in journal content that has one.
 func newestTS(content []byte) string {
 	ls := lines(content[:bytes.LastIndexByte(content, '\n')+1])
+	// A record re-filed from an identity this machine wrote under earlier is
+	// appended late, with the time it was written, so it says nothing about how
+	// recent the machine's newest record is, as `where` itself reads it.
+	refiledOnly := ""
 	for i := len(ls) - 1; i >= 0; i-- {
 		var rec struct {
-			TS string `json:"ts"`
+			TS   string                     `json:"ts"`
+			Data map[string]json.RawMessage `json:"data"`
 		}
-		if json.Unmarshal([]byte(ls[i]), &rec) == nil && rec.TS != "" {
+		if json.Unmarshal([]byte(ls[i]), &rec) != nil || rec.TS == "" {
+			continue
+		}
+		if _, refiled := rec.Data[refiledFrom]; !refiled {
 			return rec.TS
 		}
+		refiledOnly = cmp.Or(refiledOnly, rec.TS)
 	}
-	return ""
+	return refiledOnly
 }
 
 // ago says how long ago an RFC3339 instant was, roughly, for a person.

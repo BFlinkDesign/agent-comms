@@ -58,8 +58,9 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	case errors.Is(err, gitsync.ErrSaltMismatch) && from == "--salt":
 		return saltMismatch(from, url)
 	case errors.Is(err, gitsync.ErrNeedSalt):
-		return fmt.Errorf("%w. Its machines already derive their host ids with a salt; give init that salt with "+
-			"--salt or FLEET_SALT, so they keep their ids", err)
+		return fmt.Errorf("%w. Give init the salt its machines record with, with --salt or FLEET_SALT, so they keep "+
+			"their host ids. If they ran without one, as fleetd v0.1.0 allowed, give a new salt: their records so far "+
+			"stay under the ids they had, and each machine's new records go under a new one", err)
 	case err != nil:
 		return err
 	}
@@ -102,6 +103,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	switch {
 	case res.Started:
 		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with a new salt for this fleet\n", url, gitsync.FleetFile)
+	case res.WroteFleetFile && given == "":
+		fmt.Fprintf(stdout, "added %s to %s, with a new salt for this fleet\n", gitsync.FleetFile, url)
 	case res.WroteFleetFile:
 		fmt.Fprintf(stdout, "added %s to %s, with the salt this machine was given\n", gitsync.FleetFile, url)
 	}

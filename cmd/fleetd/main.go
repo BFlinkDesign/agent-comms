@@ -449,6 +449,11 @@ func appendRecord(req recordRequest, warn io.Writer) (recorded, error) {
 	if err := store.Append(h.ID, c); err != nil {
 		return recorded{}, err
 	}
+	if fleetSalt != "" {
+		if _, ok, err := gitsync.ReadFleet(journalDir); err == nil && !ok {
+			noteSalt(journalDir, fleetSalt, warn)
+		}
+	}
 	return recorded{id: c.ID, host: h, file: filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl")}, nil
 }
 
@@ -568,8 +573,9 @@ type whereEntry struct {
 	LastRepo string `json:"last_repo,omitempty"`
 	LastNote string `json:"last_note,omitempty"`
 	// LastPublished is the timestamp of the newest record the remote has for this
-	// host, as of this clone's last sync. Absent when the remote has no file for
-	// it, when the journal is not a clone, or when git could not say.
+	// host, records re-filed after it aside (see newestTS), as of this clone's last
+	// sync. Absent when the remote has no file for it, when the journal is not a
+	// clone, or when git could not say.
 	LastPublished string `json:"last_published,omitempty"`
 	// Unpublished counts this host's records here that the remote lacks: this
 	// machine's work not yet synced. Absent when it is none, or unknown.

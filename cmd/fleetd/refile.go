@@ -47,11 +47,13 @@ const refiledName = "refiled.json"
 var movedCopy = regexp.MustCompile(`^(host-[a-z0-9_-]{1,59})\.jsonl\.[0-9]+$`)
 
 // otherIdentities lists this machine under each salt it may have recorded with
-// besides the fleet's: none, FLEET_SALT, and every salt noted in the clone's git
-// directory as one the journal no longer uses.
-func otherIdentities(gitDir string, me hostOut) []hostOut {
+// besides the fleet's: none, FLEET_SALT, every salt noted in the clone's git
+// directory as one the journal no longer uses, and every salt noted beside the
+// journal directory as one a record was written under before it had fleetd.json.
+func otherIdentities(dir, gitDir string, me hostOut) []hostOut {
 	var out []hostOut
-	for _, salt := range append([]string{"", os.Getenv("FLEET_SALT")}, gitsync.PastSalts(gitDir)...) {
+	salts := append([]string{"", os.Getenv("FLEET_SALT")}, gitsync.PastSalts(gitDir)...)
+	for _, salt := range append(salts, notedSalts(dir)...) {
 		h := identity(salt)
 		if h.ID == me.ID || slices.ContainsFunc(out, func(o hostOut) bool { return o.ID == h.ID }) {
 			continue
@@ -61,13 +63,52 @@ func otherIdentities(gitDir string, me hostOut) []hostOut {
 	return out
 }
 
+// saltsNote is the file, beside the journal directory, that notes each salt a
+// record was written under for want of the journal's fleetd.json: --salt or
+// FLEET_SALT. Once the journal has fleetd.json, re-filing finds those records by
+// it, whatever the environment of the sync that files them.
+func saltsNote(dir string) string {
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".salts")
+}
+
+// noteSalt adds salt to dir's salts note, once.
+func noteSalt(dir, salt string, warn io.Writer) {
+	if slices.Contains(notedSalts(dir), salt) {
+		return
+	}
+	path := saltsNote(dir)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err == nil {
+		_, err = f.WriteString(salt + "\n")
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(warn, "fleetd: warning: could not note this record's salt in %s (%v); once the journal has %s, "+
+			"only a sync with the same salt in FLEET_SALT files it under the fleet's\n", path, err, gitsync.FleetFile)
+	}
+}
+
+// notedSalts returns the salts dir's salts note holds.
+func notedSalts(dir string) []string {
+	data, err := os.ReadFile(saltsNote(dir))
+	if err != nil {
+		return nil
+	}
+	return lines(data)
+}
+
 // refilePending reports whether dir holds a file refile would move.
 func refilePending(ctx context.Context, dir string, me hostOut) bool {
 	gitDir, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return false
 	}
-	for _, o := range otherIdentities(strings.TrimSpace(gitDir), me) {
+	for _, o := range otherIdentities(dir, strings.TrimSpace(gitDir), me) {
 		if movable(ctx, dir, journal.FileName(o.ID)+".jsonl") {
 			return true
 		}
@@ -118,7 +159,7 @@ func refile(ctx context.Context, dir, gitDir string, me hostOut, warn io.Writer)
 	if err != nil || time.Since(info.ModTime()) < refileSettle {
 		return 0, nil
 	}
-	others := otherIdentities(gitDir, me)
+	others := otherIdentities(dir, gitDir, me)
 	putBackDeleted(ctx, dir, gitDir, me, others)
 	keep := filepath.Join(gitDir, preInitDir)
 	moved := map[string]bool{}
@@ -380,7 +421,7 @@ func refileOne(store *journal.Store, path, from string, me hostOut, have, publis
 		if json.Unmarshal([]byte(line), &r) == nil && published[r.ID] {
 			continue
 		}
-		c, err := reencode(line, from, me.ID)
+		c, err := reencode(line, from, me.ID, true)
 		if err != nil {
 			skipped++
 			continue
@@ -388,7 +429,21 @@ func refileOne(store *journal.Store, path, from string, me hostOut, have, publis
 		if have[c.ID] {
 			continue
 		}
-		if err := store.Append(me.ID, c); err != nil {
+		err = store.Append(me.ID, c)
+		if errors.Is(err, journal.ErrTooLarge) {
+			// refiled.from took it past the limit. Unmarked it is the size it was
+			// written with, so it fits; `where` merely cannot tell it was filed late.
+			c, _ = reencode(line, from, me.ID, false)
+			if have[c.ID] {
+				continue
+			}
+			err = store.Append(me.ID, c)
+		}
+		if errors.Is(err, journal.ErrTooLarge) {
+			skipped++
+			continue
+		}
+		if err != nil {
 			return added, 0, skipped, err
 		}
 		have[c.ID] = true
@@ -398,11 +453,11 @@ func refileOne(store *journal.Store, path, from string, me hostOut, have, publis
 }
 
 // reencode rebuilds a record of host id from as one of host id to: the same
-// record with data's host.id replaced, and refiled.from naming the identity it
-// was written under, so that `where` can tell it was filed late. A record of to
-// itself comes back unchanged. Only values a journal record holds are accepted:
-// strings, booleans and integers.
-func reencode(line, from, to string) (cell.Cell, error) {
+// record with data's host.id replaced and, if mark is set, refiled.from naming
+// the identity it was written under, so that `where` can tell it was filed late.
+// A record of to itself comes back unchanged. Only values a journal record holds
+// are accepted: strings, booleans and integers.
+func reencode(line, from, to string, mark bool) (cell.Cell, error) {
 	var rec struct {
 		Type    string                     `json:"type"`
 		From    string                     `json:"from"`
@@ -445,7 +500,9 @@ func reencode(line, from, to string) (cell.Cell, error) {
 	}
 	if from != to {
 		data["host.id"] = cell.S(to)
-		data[refiledFrom] = cell.S(from)
+		if mark {
+			data[refiledFrom] = cell.S(from)
+		}
 	}
 	return cell.New(rec.Type, rec.From, rec.TS, rec.Channel, data, rec.Refs, rec.Tags, rec.TTL)
 }

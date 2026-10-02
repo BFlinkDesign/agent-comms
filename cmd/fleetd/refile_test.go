@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // remoteHolds reports whether any file on the remote's branch holds text.
@@ -640,6 +641,175 @@ func TestASecondMoveInTheSameClockTickKeepsTheFirstCopy(t *testing.T) {
 	}
 	if n := remoteCount(t, remote, "published under no salt"); n != 1 {
 		t.Errorf("the published record is on the remote %d times, want once", n)
+	}
+}
+
+// A record close to the size limit would grow past it when re-filing marks it
+// with refiled.from. It is filed all the same, unmarked, and it stops nothing:
+// the records around it, and later ones, are filed too.
+func TestARecordNearTheSizeLimitIsStillFiled(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	// A record of about 4085 bytes, newline included: within the limit as
+	// written, past it with the marker.
+	long := "long " + strings.Repeat("x", journal.MaxRecordBytes-11-len(recordLine(t, "x"))+1)
+	for _, note := range []string{"first, before the long one", long, "third, after the long one"} {
+		recordWithout(t, dir, "--note", note)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "fourth, written later")
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range []string{"first, before the long one", long, "third, after the long one", "fourth, written later"} {
+		if _, ok := remoteHostRecords(t, remote, "s", note); !ok {
+			t.Errorf("%.30q is on no remote file", note)
+		}
+	}
+}
+
+// A record written with FLEET_SALT before the journal had fleetd.json is filed
+// under the fleet's id even when FLEET_SALT is gone by the time init runs.
+func TestARecordWrittenUnderFleetSaltBeforeInitIsFiledWithoutIt(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	t.Setenv("FLEET_SALT", "a-salt-of-its-own")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under FLEET_SALT"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "written under FLEET_SALT"); !ok {
+		t.Fatal("a record written under FLEET_SALT before init is on no remote file")
+	}
+}
+
+// A record an older fleetd wrote under FLEET_SALT has no note of its salt. A sync
+// that still has FLEET_SALT set files it.
+func TestARecordUnderAnUnnotedFleetSaltIsFiledWhileItIsSet(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	t.Setenv("FLEET_SALT", "an-older-salt")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written by an older fleetd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(saltsNote(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "written by an older fleetd"); !ok {
+		t.Fatal("a record written under FLEET_SALT is on no remote file while FLEET_SALT is set")
+	}
+}
+
+// Re-filing runs under the sync's lock: a sync that cannot take it, because
+// another sync of the journal is running, moves and files nothing.
+func TestASyncThatCannotTakeTheLockRefilesNothing(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "waits for the lock")
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	lock := filepath.Join(dir, ".git", "fleetd-sync.lock")
+	if err := os.WriteFile(lock, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrBusy) {
+		t.Fatalf("sync with the lock held: %v, want ErrBusy", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, plain)); err != nil {
+		t.Fatalf("a sync without the lock moved the file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git", "fleetd-pre-init")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a sync without the lock re-filed: %v", err)
+	}
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "waits for the lock"); !ok {
+		t.Fatal("once the lock was free, the record was still not filed")
+	}
+}
+
+// where's last_published is the time of the newest record the remote has from a
+// machine, even when records re-filed after it were written earlier; while
+// every record it has from the machine was re-filed, it is the last of those.
+func TestLastPublishedIsTheNewestRecordNotTheLastRefiledOne(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	lastPublished := func() time.Time {
+		t.Helper()
+		stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hosts []struct {
+			Host          string `json:"host"`
+			LastPublished string `json:"last_published"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &hosts); err != nil {
+			t.Fatalf("where --json: %v\n%s", err, stdout)
+		}
+		me := strings.ReplaceAll(hostID(t, "--dir", dir), ":", "-")
+		for _, h := range hosts {
+			if h.Host == me {
+				at, err := time.Parse(time.RFC3339, h.LastPublished)
+				if err != nil {
+					t.Fatalf("last_published = %q: %v", h.LastPublished, err)
+				}
+				return at
+			}
+		}
+		t.Fatalf("where --json lists no entry for this machine:\n%s", stdout)
+		return time.Time{}
+	}
+	weekAgo := time.Now().Add(-7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	recordWithout(t, dir, "--note", "a week ago", "--at", weekAgo.Format(time.RFC3339))
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if at := lastPublished(); !at.Equal(weekAgo) {
+		t.Fatalf("with only a re-filed record published, last_published = %v, want %v", at, weekAgo)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "current work"); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "also a week ago", "--at", weekAgo.Format(time.RFC3339))
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if at := lastPublished(); time.Since(at) > time.Hour {
+		t.Fatalf("last_published = %v, want the time of the record just published", at)
 	}
 }
 

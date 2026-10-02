@@ -420,6 +420,8 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 					return err
 				}
 			}
+		case refused(out):
+			return fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w", ErrRejected, res.Branch, err)
 		case !lostRace(out):
 			return err
 		}

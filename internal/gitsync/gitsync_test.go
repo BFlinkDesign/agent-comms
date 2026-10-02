@@ -1183,6 +1183,8 @@ func TestOnlyADeclinedPushIsRefused(t *testing.T) {
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n":                                                                          true,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (protected branch hook declined)\n":                                                                     true,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (push declined due to repository rule violations)\n":                                                    true,
+		"To https://example.invalid/declined/journal.git\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n":                   true,
+		"To https://example.invalid/declined/journal.git\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (failed to update ref)\nDone\n":                        false,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (unpacker error)\n":                                                                                     false,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (cannot lock ref 'refs/heads/main': is at 3f1c but expected 1a2b)\n":                                    false,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (failed to update ref)\n":                                                                               false,
@@ -1192,6 +1194,29 @@ func TestOnlyADeclinedPushIsRefused(t *testing.T) {
 		if got := refused(out); got != want {
 			t.Errorf("refused(%q) = %v, want %v", out, got, want)
 		}
+	}
+}
+
+// git for Windows checks files out with CRLF line endings. A file that holds only
+// the start of git's copy in that form has nothing of its own either, and a sync
+// brings it up to date.
+func TestASyncUpdatesACRLFCopyThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	run(t, a, "config", "core.autocrlf", "true")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:1"}`, `{"id":"hive:2"}`)
+	mustSync(t, options(b, "host-b"))
+	mustSync(t, options(a, "host-a"))
+	write(t, filepath.Join(a, "host-b.jsonl"), "{\"id\":\"hive:1\"}\r\n")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:3"}`)
+	mustSync(t, options(b, "host-b"))
+	if res := mustSync(t, options(a, "host-a")); len(res.Kept) != 0 {
+		t.Fatalf("a CRLF copy behind git's was kept: %+v", res)
+	}
+	got, err := os.ReadFile(filepath.Join(a, "host-b.jsonl"))
+	want := "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n{\"id\":\"hive:3\"}\n"
+	if err != nil || strings.ReplaceAll(string(got), "\r\n", "\n") != want {
+		t.Fatalf("host-b.jsonl holds %q (%v), want %q", got, err, want)
 	}
 }
 

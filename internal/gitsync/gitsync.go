@@ -424,7 +424,13 @@ func lostRace(out string) bool {
 // push, or a failure on the remote's side, such as its storage, is not refused:
 // the next push can get past it.
 func refused(out string) bool {
-	return strings.Contains(out, "[remote rejected]") && strings.Contains(out, "declined")
+	for _, line := range strings.Split(out, "\n") {
+		_, reason, ok := strings.Cut(line, "\t[remote rejected] (")
+		if ok && strings.HasPrefix(line, "!") && strings.Contains(reason, "declined") {
+			return true
+		}
+	}
+	return false
 }
 
 // batchSSH returns the arguments that keep ssh from waiting for a person, or none

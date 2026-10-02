@@ -320,3 +320,62 @@ func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 		})
 	}
 }
+
+// Two machines start the same empty journal at once, one told the default branch
+// by the server (trunk) and one not (main). The one that finds both branches is
+// told to delete one, instead of the fleet ending with two salts on two branches.
+func TestTwoMachinesStartingTwoBranchesAtOnceAreToldSo(t *testing.T) {
+	requireGit(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "journal.git")
+	run(t, root, "init", "--quiet", "--bare", "--initial-branch=trunk", remote)
+	raced := false
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(root, "b"), Salt: "b",
+		Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+			if !raced && slices.Contains(args, "push") {
+				raced = true
+				mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(root, "a"), Salt: "a"})
+			}
+			// This machine's git is not told the default branch (protocol v0).
+			return Git(ctx, dir, stdin, append([]string{"-c", "protocol.version=0"}, args...)...)
+		}})
+	if !raced || err == nil || !strings.Contains(err.Error(), "two branches at once") {
+		t.Fatalf("raced %v, err = %v; want the second machine told the journal was started on two branches", raced, err)
+	}
+}
+
+// A first push that fails for any reason but a race is reported as it is, at
+// once: one the remote declines as refused, and one the network fails as that
+// failure. init neither tries again nor says the journal still lacks fleetd.json.
+func TestInitReportsAFirstPushThatFailsAtOnce(t *testing.T) {
+	network := errors.New("network down")
+	for _, tc := range []struct {
+		name string
+		want error
+	}{{"declined", ErrRejected}, {"network", network}} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := emptyRemote(t)
+			if tc.want == ErrRejected {
+				hook := filepath.Join(remote, "hooks", "pre-receive")
+				write(t, hook, "#!/bin/sh\necho 'protected branch' >&2\nexit 1\n")
+				if err := os.Chmod(hook, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pushes := 0
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal"), Salt: "s",
+				Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+					if slices.Contains(args, "push") {
+						pushes++
+						if tc.want == network {
+							return "", network
+						}
+					}
+					return Git(ctx, dir, stdin, args...)
+				}})
+			if !errors.Is(err, tc.want) || pushes != 1 {
+				t.Fatalf("err = %v after %d pushes, want %v after one", err, pushes, tc.want)
+			}
+		})
+	}
+}

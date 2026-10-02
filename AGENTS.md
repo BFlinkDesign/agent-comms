@@ -106,7 +106,10 @@ uses its salt, and only then moves the clone's git directory in and checks out t
 files the directory lacks. When the repository is empty, its first commit holds
 `fleetd.json` with a new salt for the fleet, on the branch the repository names as
 its default, else `main`. One that already holds records needs the salt its
-machines use (`--salt` or `FLEET_SALT`); init never invents one for it. When the
+machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A fleet
+that ran without a salt, as v0.1.0 allowed, gives a new one: its machines'
+records so far stay under the ids they had, and their new records go under new
+ones. When the
 repository's default branch does not exist but it has exactly one branch, the
 journal is on that branch; a server that does not advertise an empty repository's
 default leaves the first machine starting `main` whatever the repository's HEAD
@@ -244,7 +247,7 @@ Two defaults are deliberate and worth knowing before you use it:
   the clone's git directory, and `where` reports it: when this machine last
   synced, and whether its last sync failed and why, even when there are no records
   to show. For each machine it gives the time of the newest record the remote has
-  from it (`last_published` in `--json`) and how many of its records this machine
+  from it, records re-filed after it aside (`last_published` in `--json`), and how many of its records this machine
   holds that the remote lacks (`unpublished`), read from the remote's copy of each
   file rather than its history. A machine whose syncs keep failing shows up there
   rather than looking idle. A journal directory that is not the top of a clone
@@ -266,7 +269,10 @@ was wrong:
   directory, is used until a sync brings in a fixed one. Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
-  are filed under the fleet's id by the next sync, while it holds its lock. It
+  are filed under the fleet's id by the next sync, while it holds its lock. A
+  salt a record was written under for want of `fleetd.json` (`--salt` or
+  `FLEET_SALT`) is noted in `journal.salts` beside the journal directory, so the
+  sync that files those records need not have it set. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
   published, and one a killed sync left missing is put back too. A file git
@@ -274,7 +280,8 @@ was wrong:
   still had the file open appends to the moved copy, and the next sync files that
   record too. A re-filed record carries
   `refiled.from`, the id it was written under, and `where` does not take it for
-  the machine's latest activity. When no stable source is readable it
+  the machine's latest activity; one that the mark would take past the 4096-byte
+  record limit is filed without it. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
   change if the machine is renamed and may collide with another machine of that
   name. A weak identity is labelled weak rather than presented as a strong one.
