@@ -129,10 +129,11 @@ ended, and that git command counts as failed. Automatic `gc` and `maintenance`
 are off for every command a sync runs, so a sync never starts them inside its
 deadline. Instead, once a sync has done its work and the clone holds a thousand
 loose objects, it runs `git gc` with what is left of its deadline (`packed` in
-`--json`), so the clone does not grow without end. A git command killed on timeout
-can still leave a lock file (an `index.lock`, or a `.lock` under `refs/`); once
-fleetd holds its own sync lock, it removes any git lock in the clone older than ten
-minutes and says so (`cleared` in `--json`, and on stderr when the sync then
+`--json`), so the clone does not grow without end. That gc packs objects and does
+nothing else, so one the deadline kills leaves no lock behind. A git command killed
+on timeout can still leave a lock file (an `index.lock`, or a `.lock` under
+`refs/`); once fleetd holds its own sync lock, it removes any git lock file older
+than ten minutes outside the object store, where fleetd takes none, and says so (`cleared` in `--json`, and on stderr when the sync then
 fails), and leaves a newer one alone. A git command a person leaves running in the
 clone for over ten minutes, such as a commit with its editor open, loses its lock
 the same way: the clone is fleetd's. If Windows will
@@ -157,7 +158,10 @@ journal lives at `$COMMS_CHANNELS/journal/<host>.jsonl`, one file per host; with
 directory. On Windows `~` is `%USERPROFILE%`, which is not always Git Bash's `~`:
 Git Bash sets `HOME` to `%HOMEDRIVE%%HOMEPATH%` when that exists, as it can on a
 domain PC with a network home folder, so clone the journal into
-`%USERPROFILE%\.ai\channels\journal`, not `$HOME/.ai/channels/journal`.
+`%USERPROFILE%\.ai\channels\journal`, not `$HOME/.ai/channels/journal`. A record
+appended after a torn one (a crash partway through a write) starts on a line of its
+own, so the fragment stays one malformed line. `PROTOCOL.md` carries the cell schema
+and the full command reference.
 
 **Upgrading from fleetd-v0.1.0: run `fleetd sync` with the old version first.**
 Two changes in how fleetd finds things could otherwise leave records behind that
@@ -165,9 +169,13 @@ the old version wrote and never synced:
 - The default journal directory is now the home directory, where v0.1.0 used the
   current directory.
 - On a Windows PC where `reg.exe` could not be read, the host id is now derived
-  from MachineGuid, where v0.1.0 fell back to the hostname. A record appended after a torn one (a crash partway through a write)
-starts on a line of its own, so the fragment stays one malformed line.
-`PROTOCOL.md` carries the cell schema and the full command reference.
+  from MachineGuid, where v0.1.0 fell back to the hostname.
+
+That sync publishes what the old version finds on that run: its journal directory,
+under the id it derives then. It cannot publish records v0.1.0 wrote into a
+project's `./channels/journal`, which lies inside that project's repository, or
+records filed under the hostname id on an earlier run when `reg.exe` failed and this
+run's does not. Those stay where they are.
 
 Two defaults are deliberate and worth knowing before you use it:
 

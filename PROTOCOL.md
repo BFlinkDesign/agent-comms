@@ -274,7 +274,8 @@ brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
 (`kept` in `--json`). Anything staged with `git add` and not committed is the
 exception: sync resets a staged edit to the remote's version and deletes a
-staged new file (`git fsck --lost-found` recovers either). A git lock file older
+staged new file (`git fsck --lost-found` recovers either until the gc a sync runs
+prunes it, which it may as soon as the content is two weeks old). A git lock file older
 than ten minutes is removed, as left by a git command a timeout killed
 (`cleared` in `--json`, and on stderr when the sync then fails). Once the clone
 holds a thousand loose objects, a sync that did its work runs `git gc` (`packed`

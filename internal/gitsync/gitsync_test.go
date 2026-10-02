@@ -927,6 +927,35 @@ func TestAJournalCloneIsPackedOnceItHoldsPackLimitLooseObjects(t *testing.T) {
 	t.Fatalf("count-objects said %q", out)
 }
 
+// A gc the deadline kills partway leaves behind every lock it held, and a lock on
+// a ref, a reflog or the commit graph fails every later sync until it is ten
+// minutes old. So the gc a sync runs packs objects and nothing else.
+func TestPackingTouchesOnlyObjects(t *testing.T) {
+	saved := packLimit
+	t.Cleanup(func() { packLimit = saved })
+	packLimit = 12
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	packed := false
+	for i := 0; i < 20 && !packed; i++ {
+		appendLines(t, filepath.Join(b, "host-b.jsonl"), fmt.Sprintf(`{"id":"hive:b%d"}`, i))
+		mustSync(t, options(b, "host-b"))
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), fmt.Sprintf(`{"id":"hive:a%d"}`, i))
+		packed = mustSync(t, options(a, "host-a")).Packed
+	}
+	if !packed {
+		t.Fatal("machine a's clone was never packed")
+	}
+	gitDir := filepath.Join(a, ".git")
+	branch := run(t, a, "symbolic-ref", "--short", "HEAD")
+	if _, err := os.Stat(filepath.Join(gitDir, "refs", "heads", branch)); err != nil {
+		t.Errorf("gc packed the branch's ref, taking its lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(gitDir, "objects", "info", "commit-graph")); err == nil {
+		t.Error("gc wrote a commit graph, taking its lock")
+	}
+}
+
 // Journal commits are fleetd's, not the person's: a PC's git identity may be a
 // private address GitHub refuses to publish (GH007), may be missing altogether,
 // and does not belong in a shared journal's history either way.

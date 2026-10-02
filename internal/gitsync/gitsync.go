@@ -329,8 +329,12 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 // clone nothing packs grows without end. git's automatic gc is off for every
 // command above, so that none starts inside a fetch; this runs gc at the end
 // instead, once the sync has done its work, with what is left of its deadline.
-// It is best effort: a clone that is not packed still syncs, and a gc the
-// deadline kills leaves lock files that a later sync clears.
+// It is best effort: a clone that is not packed still syncs.
+//
+// The gc packs objects and does nothing else. Packing refs, expiring reflogs and
+// writing the commit graph each take a lock, and a gc the deadline kills leaves
+// it behind, which fails every later sync until it is staleLock old. Packing
+// objects takes none.
 func pack(g git) bool {
 	out, err := g.line("count-objects", "-v")
 	if err != nil {
@@ -341,7 +345,8 @@ func pack(g git) bool {
 			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose < packLimit {
 				return false
 			}
-			_, err := g.line("gc", "--quiet")
+			_, err := g.line("-c", "gc.packRefs=false", "-c", "gc.reflogExpire=never",
+				"-c", "gc.reflogExpireUnreachable=never", "-c", "gc.writeCommitGraph=false", "gc", "--quiet")
 			return err == nil
 		}
 	}
@@ -620,8 +625,9 @@ const syncLockName = "fleetd-sync.lock"
 // timeout leaves the .lock, and git never removes it, so every later command
 // that needs the file fails until someone deletes it. The caller holds fleetd's
 // sync lock on a clone fleetd owns, so a lock this old was left by a killed
-// command, not taken by a running one. The object store is not searched: only
-// gc and maintenance lock files there, and fleetd runs neither.
+// command, not taken by a running one. The object store is not searched: the gc
+// pack runs takes no lock there, and git's automatic maintenance, which would,
+// is off.
 func clearStaleLocks(gitDir string) []string {
 	var cleared []string
 	_ = filepath.WalkDir(gitDir, func(path string, d os.DirEntry, err error) error {
