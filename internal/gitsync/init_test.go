@@ -92,15 +92,92 @@ func TestInitAddsTheSaltToAJournalThatHasNone(t *testing.T) {
 	}
 }
 
+// A salt given explicitly that contradicts the journal's is refused; one taken
+// from the environment is overridden, and said to be.
 func TestInitRefusesASaltThatContradictsTheJournals(t *testing.T) {
 	remote := emptyRemote(t)
 	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "a"), Salt: "first"})
-	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "b"), Salt: "second"})
+	b := filepath.Join(t.TempDir(), "b")
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: b, Salt: "second", Strict: true})
 	if !errors.Is(err, ErrSaltMismatch) {
 		t.Fatalf("err = %v, want ErrSaltMismatch", err)
 	}
+	if _, err := os.Stat(b); !os.IsNotExist(err) {
+		t.Fatalf("a refused init left %s behind: %v", b, err)
+	}
+	res := mustInit(t, InitOptions{URL: remote, Dir: b, Salt: "second"})
+	if !res.SaltDiffers || res.Salt != "first" {
+		t.Fatalf("result = %+v, want the journal's salt, said to differ", res)
+	}
 	if !strings.Contains(remoteFile(t, remote, FleetFile), `"salt": "first"`) {
 		t.Fatal("the journal's salt changed")
+	}
+}
+
+// A repository that already holds records has machines deriving ids with some
+// salt. Init without one would give them all a second id, so it refuses, and
+// pushes nothing.
+func TestInitNeedsTheSaltOfAJournalThatHoldsRecords(t *testing.T) {
+	remote, m := fleet(t, 1)
+	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(m[0], "host-a"))
+	before := run(t, m[0], "ls-remote", remote, "refs/heads/main")
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal")})
+	if !errors.Is(err, ErrNeedSalt) {
+		t.Fatalf("err = %v, want ErrNeedSalt", err)
+	}
+	if after := run(t, m[0], "ls-remote", remote, "refs/heads/main"); after != before {
+		t.Fatalf("init pushed to a journal it refused: %s became %s", before, after)
+	}
+}
+
+// A journal file is host-<id>.jsonl, and a journal holds no directories:
+// training data in JSON Lines is not a journal, however few its other files.
+func TestInitRefusesJSONLinesDataAndDirectories(t *testing.T) {
+	requireGit(t)
+	for name, files := range map[string]map[string]string{
+		"eval data":   {"train.jsonl": "{}\n", "README.md": "data\n"},
+		"a directory": {"host-a.jsonl": "{}\n", "readme-assets/main.go": "package main\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			remote := filepath.Join(root, "repo.git")
+			run(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
+			seed := filepath.Join(root, "seed")
+			run(t, root, "clone", "--quiet", remote, seed)
+			identify(t, seed)
+			for path, content := range files {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(seed, path)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(seed, path), content)
+			}
+			run(t, seed, "add", ".")
+			run(t, seed, "commit", "--quiet", "-m", "data")
+			run(t, seed, "push", "--quiet", "-u", "origin", "main")
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(root, "journal"), Salt: "s"})
+			if !errors.Is(err, ErrNotJournal) {
+				t.Fatalf("err = %v, want ErrNotJournal", err)
+			}
+		})
+	}
+}
+
+// Two machines starting the same empty journal must start the same branch, so
+// neither may use its own git's default: the remote's, else main.
+func TestInitStartsAnEmptyJournalOnTheRemotesBranchNotThisMachinesDefault(t *testing.T) {
+	remote := emptyRemote(t)
+	config := filepath.Join(t.TempDir(), "gitconfig")
+	// Protocol v0 does not advertise an empty repository's unborn HEAD, as some
+	// servers do not, so the clone falls back to this machine's default.
+	write(t, config, "[init]\n\tdefaultBranch = master\n[protocol]\n\tversion = 0\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", config)
+	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal"), Salt: "s"})
+	if res.Branch != "main" {
+		t.Fatalf("started branch %q, want main", res.Branch)
+	}
+	if heads := run(t, t.TempDir(), "ls-remote", "--heads", remote); strings.Count(heads, "refs/heads/") != 1 {
+		t.Fatalf("the journal has branches %q, want main alone", heads)
 	}
 }
 

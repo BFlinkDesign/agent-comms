@@ -6,8 +6,10 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
@@ -67,28 +69,52 @@ func TestWithoutFleetSaltTheJournalsSaltStillGivesTheFleetsID(t *testing.T) {
 	}
 }
 
-func TestASaltThatContradictsTheJournalsIsRefusedAndNothingIsWritten(t *testing.T) {
+// --salt that contradicts the journal's is a mistake made on purpose, and is
+// refused before anything is written.
+func TestAnExplicitSaltThatContradictsTheJournalsIsRefusedAndNothingIsWritten(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "the-fleets"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("FLEET_SALT", "a-stale-one")
+	t.Setenv("FLEET_SALT", "")
 	for _, args := range [][]string{
-		{"record", "--dir", dir, "--type", "note", "--note", "should not be written"},
-		{"sync", "--dir", dir},
-		{"host", "--dir", dir},
+		{"record", "--dir", dir, "--salt", "another", "--type", "note", "--note", "should not be written"},
+		{"sync", "--dir", dir, "--salt", "another"},
+		{"host", "--dir", dir, "--salt", "another"},
 	} {
-		if _, _, err := exec(t, args...); !errors.Is(err, gitsync.ErrSaltMismatch) || !strings.Contains(err.Error(), "FLEET_SALT") {
-			t.Fatalf("%s: err = %v, want a salt mismatch naming FLEET_SALT", args[0], err)
+		if _, _, err := exec(t, args...); !errors.Is(err, gitsync.ErrSaltMismatch) || !strings.Contains(err.Error(), "--salt") {
+			t.Fatalf("%s: err = %v, want a salt mismatch naming --salt", args[0], err)
 		}
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 		t.Fatalf("the journal directory holds %d entries, want only fleetd.json", len(entries))
 	}
 	// Repeating the journal's salt is fine.
-	t.Setenv("FLEET_SALT", "the-fleets")
-	if _, _, err := exec(t, "host", "--dir", dir); err != nil {
+	if _, _, err := exec(t, "host", "--dir", dir, "--salt", "the-fleets"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A FLEET_SALT left over from before the journal had fleetd.json would otherwise
+// stop every hook on the machine from recording: the journal's salt is used, and
+// the stale one is named.
+func TestAStaleFleetSaltStillRecordsUnderTheJournalsSalt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "the-fleets"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "a-stale-one")
+	_, stderr, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "recorded all the same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "FLEET_SALT differs") {
+		t.Errorf("stderr does not name the stale FLEET_SALT: %q", stderr)
+	}
+	t.Setenv("FLEET_SALT", "")
+	want := strings.ReplaceAll(hostID(t, "--salt", "the-fleets", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
+		t.Fatalf("the record is not in the fleet id's file %s: %v", want, err)
 	}
 }
 
@@ -104,6 +130,9 @@ func TestInitSetsUpTheJournalAndEveryMachineGetsTheSameSalt(t *testing.T) {
 	}
 	if stdout, _, err = exec(t, "init", "--dir", b, remote); err != nil || strings.Contains(stdout, "started") {
 		t.Fatalf("second machine: %q, %v", stdout, err)
+	}
+	if _, err := os.Stat(filepath.Join(b, gitsync.FleetFile)); err != nil {
+		t.Fatalf("the second machine's journal has no %s: %v", gitsync.FleetFile, err)
 	}
 	if hostID(t, "--dir", a) != hostID(t, "--dir", b) {
 		t.Fatal("two clones of one journal on one machine give two host ids")
@@ -135,11 +164,8 @@ func TestInitKeepsRecordsWrittenBeforeIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout, "kept 1 record") {
+	if !strings.Contains(stdout, "published 1 record") {
 		t.Fatalf("stdout = %q", stdout)
-	}
-	if stdout, _, err := exec(t, "sync", "--dir", dir); err != nil || !strings.Contains(stdout, "published 1 record") {
-		t.Fatalf("sync: %q, %v", stdout, err)
 	}
 	if stdout, _, _ := exec(t, "where", "--dir", dir); !strings.Contains(stdout, "written before the journal existed") {
 		t.Fatalf("where lost the record: %q", stdout)
@@ -220,5 +246,277 @@ func TestWhereSaysWhenThisMachinesSyncFailedAndWhatIsUnpublished(t *testing.T) {
 	}
 	if entries[0].Unpublished != 1 || entries[0].LastPublished == "" {
 		t.Fatalf("where --json: unpublished %d, last_published %q; want 1 and a time", entries[0].Unpublished, entries[0].LastPublished)
+	}
+}
+
+// fleetFileAged makes the journal's fleetd.json old enough that a sync files the
+// records this machine wrote under another identity, as it is on any machine
+// past the moment init put it there.
+func fleetFileAged(t *testing.T, dir string) {
+	t.Helper()
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, gitsync.FleetFile), old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// remoteHostRecords counts the records the remote holds in the fleet identity's
+// file, and says whether one carries note.
+func remoteHostRecords(t *testing.T, remote, salt, note string) (int, bool) {
+	t.Helper()
+	name := strings.ReplaceAll(hostID(t, "--salt", salt, "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	out, err := osexec.Command("git", "--git-dir", remote, "show", "main:"+name).CombinedOutput()
+	if err != nil {
+		return 0, false
+	}
+	return strings.Count(string(out), "\n"), strings.Contains(string(out), note)
+}
+
+// A hook that fires while init is cloning appends to the journal directory under
+// whatever salt it has. Init used to list the directory before cloning and delete
+// it after, taking that record with it; now nothing in the directory is moved or
+// removed, and the record is published under the fleet's id.
+func TestInitKeepsARecordAHookAppendsWhileItRuns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("slows git down with a shell script wrapper")
+	}
+	remote := emptyJournalRemote(t)
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	cloning := filepath.Join(t.TempDir(), "cloning")
+	wrapper := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = clone ] && { : > " + cloning + "; sleep 2; }; done\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := filepath.Join(t.TempDir(), "journal")
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote)
+		done <- err
+	}()
+	for i := 0; ; i++ {
+		if _, err := os.Stat(cloning); err == nil {
+			break
+		}
+		if i > 200 {
+			t.Fatal("init never started cloning")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The hook has no salt: it fired before the journal's was known.
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "appended during init"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := remoteHostRecords(t, remote, "s", "appended during init"); !ok {
+		t.Fatalf("the remote's file for this machine holds %d records and not the one appended during init", n)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(dir))
+	if len(entries) != 1 {
+		t.Fatalf("init left %v beside the journal", entries)
+	}
+}
+
+// A journal its machines already record into has a salt, whether or not
+// fleetd.json says so. Without one given, init refuses rather than invent another.
+func TestInitWithoutASaltRefusesAJournalThatHoldsRecords(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
+	if err := os.WriteFile(filepath.Join(seed, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "a machine's records")
+	gitIn(t, seed, "push", "--quiet", "-u", "origin", "main")
+
+	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote)
+	if !errors.Is(err, gitsync.ErrNeedSalt) || !strings.Contains(err.Error(), "FLEET_SALT") {
+		t.Fatalf("err = %v, want ErrNeedSalt saying how to give the salt", err)
+	}
+	t.Setenv("FLEET_SALT", "the-fleets")
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote); err != nil {
+		t.Fatal(err)
+	}
+	out, err := osexec.Command("git", "--git-dir", remote, "show", "main:"+gitsync.FleetFile).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), `"salt": "the-fleets"`) {
+		t.Fatalf("the journal's fleetd.json is %q (%v), want FLEET_SALT's salt", out, err)
+	}
+}
+
+// A hook that ran before init filed its records under this machine's id with no
+// salt. Nothing would ever publish those: a sync files them under the fleet's id
+// and keeps the original file in the clone's git directory.
+func TestRecordsWrittenBeforeInitUnderAnotherSaltArePublished(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "before the salt was known"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "before the salt was known"); !ok {
+		t.Fatal("the remote's file for this machine lacks the record written before init")
+	}
+	unsalted := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	if _, err := os.Stat(filepath.Join(dir, unsalted)); !os.IsNotExist(err) {
+		t.Fatalf("%s is still in the journal: %v", unsalted, err)
+	}
+	kept, _ := filepath.Glob(filepath.Join(dir, ".git", "fleetd-pre-init", unsalted+".*"))
+	if len(kept) != 1 {
+		t.Fatalf("the original is not kept in .git/fleetd-pre-init: %v", kept)
+	}
+	// A sync later on finds nothing more to file, and publishes nothing twice.
+	fleetFileAged(t, dir)
+	if stdout, _, err := exec(t, "sync", "--dir", dir); err != nil || !strings.Contains(stdout, "published 0 records") {
+		t.Fatalf("sync after init: %q, %v", stdout, err)
+	}
+}
+
+func TestInitSetsUpAnExistingEmptyDirectory(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An invalid fleetd.json reaching a machine by sync must not stop it recording,
+// nor stop the sync that brings in the fix.
+func TestAnInvalidFleetFileDoesNotStopRecordingOrSyncing(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	a, b := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+	for _, dir := range []string{a, b} {
+		if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+			t.Fatal(err)
+		}
+	}
+	editor := filepath.Join(t.TempDir(), "editor")
+	gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
+	edit := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(editor, gitsync.FleetFile), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "edit")
+		gitIn(t, editor, "push", "--quiet")
+	}
+	edit(`{"salt": "s",}`)
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "with a broken fleetd.json")
+	if err != nil || !strings.Contains(stderr, "not valid JSON") {
+		t.Fatalf("record with a broken fleetd.json: %v, stderr %q", err, stderr)
+	}
+	edit(`{"salt": "s"}` + "\n")
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatalf("the sync that brings the fix: %v", err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "with a broken fleetd.json"); !ok {
+		t.Fatal("the record made while fleetd.json was broken was not published under the fleet's id")
+	}
+}
+
+// A sync that cannot even start has failed, and where says so.
+func TestWhereSaysASyncThatCouldNotStartFailed(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir, "--salt", "another"); err == nil {
+		t.Fatal("a sync with a contradicting --salt succeeded")
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir)
+	if err != nil || !strings.Contains(stdout, "FAILED") {
+		t.Fatalf("where: %v\n%s", err, stdout)
+	}
+}
+
+// A journal directory inside another repository, such as dotfiles kept in the
+// home directory, is not a clone of the journal, and where claims nothing about
+// what the journal has published.
+func TestWhereInsideAnotherRepositoryClaimsNothingAboutPublishing(t *testing.T) {
+	dotfiles := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "clone", "--quiet", dotfiles, seed)
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "dotfiles")
+	gitIn(t, seed, "push", "--quiet", "-u", "origin", "main")
+	home := filepath.Join(t.TempDir(), "home")
+	gitIn(t, filepath.Dir(home), "clone", "--quiet", dotfiles, home)
+	dir := filepath.Join(home, ".ai", "channels", "journal")
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "s", "--type", "note", "--note", "inside dotfiles"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range []string{"published", "NOT PUBLISHED", "has not synced"} {
+		if strings.Contains(stdout, claim) {
+			t.Errorf("where says %q about a journal that is not a clone:\n%s", claim, stdout)
+		}
+	}
+}
+
+func TestInitRefusesACloneOfAnotherRepository(t *testing.T) {
+	one, two := emptyJournalRemote(t), emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", one); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", two); !errors.Is(err, gitsync.ErrOtherRemote) {
+		t.Fatalf("err = %v, want ErrOtherRemote", err)
+	}
+}
+
+// Two records written with the same --at are the same bytes. With one of them
+// published, the other is still unpublished.
+func TestWhereCountsIdenticalRecordsAsUnpublished(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	same := []string{"record", "--dir", dir, "--type", "note", "--note", "twice", "--at", "2026-10-01T12:00:00Z"}
+	if _, _, err := exec(t, same...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, same...); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil || len(entries) != 1 || entries[0].Unpublished != 1 {
+		t.Fatalf("where --json: %v\n%s", err, stdout)
+	}
+}
+
+func TestInitTakesARelativePathToALocalRepository(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	t.Chdir(filepath.Dir(remote))
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", "./"+filepath.Base(remote)); err != nil {
+		t.Fatal(err)
 	}
 }

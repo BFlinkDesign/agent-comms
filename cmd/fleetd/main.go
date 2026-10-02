@@ -60,15 +60,19 @@ The journal directory is --dir, else $COMMS_CHANNELS/journal, else ~/.ai/channel
 The where command reports an error, rather than "no records", when that
 directory does not exist -- usually the sign of a mistyped path.
 
-init clones the journal repository URL into the journal directory, once per
-machine. An empty repository gets its first commit, holding fleetd.json with a
-salt for the fleet; records written before init are kept, for sync to publish.
+init makes the journal directory a clone of the journal repository URL, once per
+machine, without moving or deleting anything in it, and then syncs. An empty
+repository gets its first commit, holding fleetd.json with a salt for the fleet;
+one that already holds records needs the salt its machines use, from --salt or
+$FLEET_SALT.
 
 The salt is the one in the journal's fleetd.json, so every machine that clones the
-journal uses the same one. --salt or $FLEET_SALT may repeat it but not contradict
-it; without fleetd.json they supply it. It separates this fleet's host digests
-from any other and must be the same on every machine, or one machine will appear
-as several. It is not a credential.
+journal uses the same one. --salt may repeat it but not contradict it; $FLEET_SALT
+that contradicts it is overridden, with a warning. Without fleetd.json they supply
+it. It separates this fleet's host digests from any other and must be the same on
+every machine, or one machine will appear as several. It is not a credential.
+Records this machine wrote under another salt before it knew the fleet's are
+filed under the fleet's by the next sync.
 
 sync needs the journal directory to be the root of a clone of the journal
 repository, used for nothing else. It publishes only this machine's file, as of
@@ -171,31 +175,73 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-// resolveSalt finds the fleet salt: the one in the journal's fleetd.json, which
-// --salt or $FLEET_SALT may repeat but not contradict, else --salt, else
-// $FLEET_SALT. A contradiction is an error, not a choice: either salt would file
-// this machine's records under an id the other machines' records do not share.
-// An empty salt still produces stable digests; it just does not separate this
-// fleet from another using the same scheme, so the caller is told rather than
-// silently given a weaker identity.
+// resolveSalt finds the fleet salt. The journal's fleetd.json decides, since every
+// machine must derive host ids the same way: --salt may repeat it but not
+// contradict it, which is an error. $FLEET_SALT that contradicts it is overridden
+// with a warning instead: refusing would drop every record of a hook started with
+// a stale one. A journal without fleetd.json uses --salt, else $FLEET_SALT.
+//
+// A fleetd.json that is not valid is not trusted. The salt it last held, kept in
+// the clone's git directory, is used instead, with a warning, so that a sync can
+// still bring in a fixed file. An empty salt still produces stable digests; it
+// just does not separate this fleet from another using the same scheme, so the
+// caller is told rather than silently given a weaker identity.
 func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error) {
-	given, from := flagValue, "--salt"
-	if given == "" {
-		given, from = os.Getenv("FLEET_SALT"), "FLEET_SALT"
-	}
 	fleet, ok, err := gitsync.ReadFleet(journalDir)
+	if err != nil {
+		if !errors.Is(err, gitsync.ErrBadFleetFile) {
+			return "", err
+		}
+		if cached := cachedSalt(journalDir); cached != "" {
+			fmt.Fprintf(stderr, "fleetd: warning: %v; the salt it last held is used until a sync brings in a fixed one\n", err)
+			fleet, ok = gitsync.Fleet{Salt: cached}, true
+		} else {
+			fmt.Fprintf(stderr, "fleetd: warning: %v; it is ignored until a sync brings in a fixed one\n", err)
+		}
+	}
+	env := os.Getenv("FLEET_SALT")
 	switch {
-	case err != nil:
-		return "", err
-	case ok && given != "" && given != fleet.Salt:
-		return "", saltMismatch(from, journalDir)
+	case ok && flagValue != "" && flagValue != fleet.Salt:
+		return "", saltMismatch("--salt", journalDir)
 	case ok:
+		if flagValue == "" && env != "" && env != fleet.Salt {
+			fmt.Fprintf(stderr, "fleetd: warning: FLEET_SALT differs from the salt in %s's %s, which is used; unset FLEET_SALT\n",
+				journalDir, gitsync.FleetFile)
+		}
+		cacheSalt(journalDir, fleet.Salt)
 		return fleet.Salt, nil
-	case given != "":
-		return given, nil
+	case flagValue != "":
+		return flagValue, nil
+	case env != "":
+		return env, nil
 	}
 	fmt.Fprintln(stderr, "fleetd: warning: no fleetd.json in the journal, no --salt and no FLEET_SALT; host digests are unseparated")
 	return "", nil
+}
+
+// saltCacheName is the file, in a clone's .git directory, that keeps the last
+// valid salt fleetd.json held.
+const saltCacheName = "fleetd-salt"
+
+func cachedSalt(journalDir string) string {
+	data, err := os.ReadFile(filepath.Join(journalDir, ".git", saltCacheName))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// cacheSalt keeps salt for cachedSalt, in a clone only, and only when it changed.
+// It is best effort: without it, an invalid fleetd.json is merely ignored.
+func cacheSalt(journalDir, salt string) {
+	gitDir := filepath.Join(journalDir, ".git")
+	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() || cachedSalt(journalDir) == salt {
+		return
+	}
+	path := filepath.Join(gitDir, saltCacheName)
+	if err := os.WriteFile(path+".tmp", []byte(salt+"\n"), 0o600); err == nil {
+		_ = gitsync.RenameRetry(path+".tmp", path)
+	}
 }
 
 // resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,
@@ -414,6 +460,8 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	}
 	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
 	if err != nil {
+		// A sync that cannot start has still failed, and `where` says so.
+		noteSync(journalDir, gitsync.Result{}, err, stderr)
 		return err
 	}
 	h := identity(fleetSalt)
@@ -434,8 +482,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		plural(res.Published, "record"), h.Name, plural(res.Received, "commit"), res.Head)
 	if len(res.Kept) > 0 {
 		fmt.Fprintf(stdout, "kept this machine's copy of %s: it has changes the remote does not have.\n"+
-			"  Another identity's journal file is published by syncing with that identity's salt. For anything else,\n"+
-			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
+			"  To take the remote's copy:  git -C %s checkout '@{upstream}' -- <file>\n",
 			strings.Join(res.Kept, ", "), storeDir)
 	}
 	if len(res.Cleared) > 0 {
@@ -447,11 +494,16 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 
 // syncJournal publishes host h's journal file in journalDir, brings in every
 // other host's, gives up after timeout, and notes the outcome for `where`.
-// `fleetd sync` and `fleetd hook` both sync through it.
+// `fleetd sync`, `fleetd hook` and `fleetd init` all sync through it. It first
+// files under h the records this machine wrote under another identity; see
+// refile.
 func syncJournal(journalDir string, h hostOut, timeout time.Duration, stderr io.Writer) (gitsync.Result, string, error) {
 	store, err := journal.Open(journalDir)
 	if err != nil {
 		return gitsync.Result{}, "", err
+	}
+	if _, err := refile(store.Dir(), h, stderr); err != nil {
+		fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -464,6 +516,25 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, stderr io.
 	return res, store.Dir(), err
 }
 
+// printSyncStatus says how fresh the answer is: a clone holds the other machines'
+// records as of this machine's last successful sync.
+func printSyncStatus(stdout io.Writer, dir string) {
+	if info, err := os.Stat(filepath.Join(dir, ".git")); err != nil || !info.IsDir() {
+		return
+	}
+	switch st, ok := readSyncStatus(dir); {
+	case !ok:
+		fmt.Fprintln(stdout, "this machine has not synced this journal yet; the other machines' records may be missing")
+	case st.LastAttempt != nil && st.LastAttempt.Error != "":
+		fmt.Fprintf(stdout, "this machine's last sync, %s, FAILED: %s\n", ago(st.LastAttempt.At), st.LastAttempt.Error)
+		if st.LastSuccess != nil {
+			fmt.Fprintf(stdout, "the records below are as of its last successful sync, %s\n", ago(st.LastSuccess.At))
+		}
+	case st.LastSuccess != nil:
+		fmt.Fprintf(stdout, "the records below are as of this machine's last sync, %s\n", ago(st.LastSuccess.At))
+	}
+}
+
 type whereEntry struct {
 	Host     string `json:"host"`
 	HostName string `json:"host_name"`
@@ -474,13 +545,12 @@ type whereEntry struct {
 	LastType string `json:"last_type,omitempty"`
 	LastRepo string `json:"last_repo,omitempty"`
 	LastNote string `json:"last_note,omitempty"`
-	// LastPublished is when the remote, as of this clone's last sync, last took
-	// a record from this host, by the publishing machine's clock. Absent when the
-	// remote never had this host's file, or the journal is not a clone.
+	// LastPublished is the timestamp of the newest record the remote has for this
+	// host, as of this clone's last sync. Absent when the remote has no file for
+	// it, when the journal is not a clone, or when git could not say.
 	LastPublished string `json:"last_published,omitempty"`
 	// Unpublished counts this host's records here that the remote lacks: this
-	// machine's work not yet synced, or records under a second identity of this
-	// machine that no sync publishes.
+	// machine's work not yet synced. Absent when it is none, or unknown.
 	Unpublished int `json:"unpublished,omitempty"`
 	// Recent is the entries before the last one, newest first, bounded by
 	// --limit. It is emitted in JSON as well as to a terminal, so a program and a
@@ -497,6 +567,8 @@ type whereEntry struct {
 	// does not appear in the JSON: the timestamp is already there as last_ts, and
 	// a second rendering of the same fact could only disagree with it.
 	lastAt time.Time
+	// publicationKnown is set when git said what the remote has for this host.
+	publicationKnown bool
 }
 
 type recentEntry struct {
@@ -530,6 +602,15 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	records, readErr := store.ReadAll()
+	// A hook's problems and a failed sync go nowhere a person looks, so they
+	// surface here, before anything else: most of all when there is nothing else
+	// to show.
+	if !*asJSON {
+		if path, last, ok := hookProblem(store.Dir()); ok {
+			fmt.Fprintf(stdout, "a hook logged a problem in %s; the last one:\n  %s\n", path, last)
+		}
+		printSyncStatus(stdout, store.Dir())
+	}
 	// A store that does not exist is a different answer from a store with nothing
 	// in it, and the difference matters: the first usually means a mistyped path.
 	if errors.Is(readErr, journal.ErrNoStore) {
@@ -598,9 +679,17 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		stems = append(stems, e.Host)
 	}
 	pubs, cloned := publications(store.Dir(), stems)
+	unknown := 0
 	for i := range out {
 		p := pubs[out[i].Host]
-		out[i].LastPublished, out[i].Unpublished = p.At, p.Unpublished
+		if cloned && !p.Known {
+			unknown++
+		}
+		out[i].LastPublished, out[i].Unpublished, out[i].publicationKnown = p.At, p.Unpublished, p.Known
+	}
+	if unknown > 0 {
+		fmt.Fprintf(stderr, "fleetd: warning: git could not say what the remote has for %s; their publication is left out\n",
+			plural(unknown, "machine"))
 	}
 	// Compared as instants, not as strings. Lexical comparison of RFC3339 is only
 	// correct when every timestamp is in UTC "Z" form, and it is not: --at accepts
@@ -619,24 +708,6 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 
 	if *asJSON {
 		return writeJSON(stdout, out)
-	}
-	if cloned {
-		// How fresh the answer below is: it holds the other machines' records as
-		// of this machine's last successful sync.
-		switch st, ok := readSyncStatus(store.Dir()); {
-		case !ok:
-			fmt.Fprintln(stdout, "this machine has not synced this journal yet; the other machines' records may be missing")
-		case st.LastAttempt != nil && st.LastAttempt.Error != "":
-			fmt.Fprintf(stdout, "this machine's last sync, %s, FAILED: %s\n", ago(st.LastAttempt.At), st.LastAttempt.Error)
-			if st.LastSuccess != nil {
-				fmt.Fprintf(stdout, "the records below are as of its last successful sync, %s\n", ago(st.LastSuccess.At))
-			}
-		case st.LastSuccess != nil:
-			fmt.Fprintf(stdout, "the records below are as of this machine's last sync, %s\n", ago(st.LastSuccess.At))
-		}
-	}
-	if path, last, ok := hookProblem(store.Dir()); ok {
-		fmt.Fprintf(stdout, "a hook logged a problem in %s; the last one:\n  %s\n", path, last)
 	}
 	for _, e := range out {
 		name := e.HostName
@@ -659,11 +730,11 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		if e.LastNote != "" {
 			fmt.Fprintf(stdout, "  note  %s\n", e.LastNote)
 		}
-		if cloned {
+		if e.publicationKnown {
 			if e.LastPublished != "" {
-				fmt.Fprintf(stdout, "  published  %s\n", ago(e.LastPublished))
+				fmt.Fprintf(stdout, "  published up to  %s\n", ago(e.LastPublished))
 			} else {
-				fmt.Fprintln(stdout, "  published  never")
+				fmt.Fprintln(stdout, "  published  none: the remote has no file for this machine")
 			}
 			if e.Unpublished > 0 {
 				fmt.Fprintf(stdout, "  NOT PUBLISHED: %s here that the remote does not have\n", plural(e.Unpublished, "record"))

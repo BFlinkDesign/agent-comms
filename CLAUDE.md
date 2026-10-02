@@ -113,8 +113,9 @@ directly in `tests/test_mcp_server.py` without subprocess overhead. Available to
 
 **fleetd** (Go: `cmd/fleetd`, `internal/{cell,hostid,journal,gitsync}`) is a separate static binary
 that records which machine did the work. `fleetd init` sets a machine's journal up once. The fleet's
-salt lives in the journal's committed `fleetd.json`; a flag or `FLEET_SALT` that contradicts it is an
-error, never a second identity. Its spec is the "fleetd — the native writer" section of
+salt lives in the journal's committed `fleetd.json`; a `--salt` that contradicts it is an error, a
+`FLEET_SALT` that does is overridden with a warning, and a sync files records written under another
+salt under the fleet's id. init never moves, rewrites or deletes a record. Its spec is the "fleetd — the native writer" section of
 `AGENTS.md` plus the `internal/gitsync` package comment. Sync rules (read `gitsync_test.go` before
 changing any of them):
 

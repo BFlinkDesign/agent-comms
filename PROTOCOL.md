@@ -276,12 +276,14 @@ are recorded at most once every 30 minutes. A session end, and a turn Codex's
 problem to `fleetd-hook.log` beside the journal directory, which `fleetd where`
 mentions for a week.
 
-`fleetd init URL` sets up the journal directory as a clone of the journal
-repository, once per machine. An empty repository gets a first commit holding
-`fleetd.json` (`{"salt": ...}`, plus an `about` line). A repository whose top level
-holds anything but `*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
-`.gitattributes` is refused. A journal directory holding records written before
-init keeps them in the clone; one holding anything else is refused.
+`fleetd init URL` makes the journal directory a clone of the journal repository,
+once per machine, without moving or deleting anything in it, and then syncs. An
+empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
+an `about` line); a repository that already holds records without one needs the
+salt its machines use (`--salt` or `$FLEET_SALT`). A repository whose top level
+holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
+`.gitattributes`, or a directory, is refused; so is a journal directory holding
+anything but journal files and `fleetd.json`, or a clone of another repository.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository, with an upstream branch. It notes each outcome in the clone's
@@ -309,15 +311,18 @@ the journal clone.
 directory). `fleetd where` reports an
 error rather than "no records" when that directory does not exist, so a mistyped
 path is distinguishable from a machine that genuinely recorded nothing. For each
-host, `where --json` adds `last_published` (when the remote, as of this clone's
-last sync, last took the host's records, by the publisher's clock) and
-`unpublished` (the host's complete records here that the remote lacks), when the
-journal is a clone.
+host, `where --json` adds `last_published` (the ts of the newest record the
+remote has from that host, as of this clone's last sync) and `unpublished` (the
+host's complete records here that the remote lacks), when the journal directory is
+the top of a clone and git could say.
 
-The salt is the one in the journal's `fleetd.json`. `--salt` (or `$FLEET_SALT`)
-may repeat it but not contradict it; without `fleetd.json` they supply it. It
-must be identical on every machine in the fleet, or one machine will appear as
-several. It is not a credential.
+The salt is the one in the journal's `fleetd.json`. `--salt` may repeat it but not
+contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning.
+Without `fleetd.json` they supply it. It must be identical on every machine in the
+fleet, or one machine will appear as several. It is not a credential. A sync files
+under this machine's fleet id the records it wrote, before it knew the fleet's
+salt, under no salt or `$FLEET_SALT`, and keeps their original file in
+`.git/fleetd-pre-init/`.
 
 DOES NOT EXIST (never use):
 - comms join

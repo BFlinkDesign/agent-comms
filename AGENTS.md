@@ -97,14 +97,22 @@ fleetd where                    per machine, what it was last doing, and how fre
 fleetd hook <tool>              record a Claude Code, Cursor, Codex or Grok event
 ```
 
-`fleetd init URL` sets a machine up, once. It clones the journal repository into
-the journal directory. When the repository is empty, its first commit holds
-`fleetd.json` with a salt for the fleet, and every later machine that clones it
-uses that salt. It refuses a repository whose files are not a journal's, and a
-directory holding anything but journal files. Records written there before init
-(by a hook installed first, say) are kept in the clone, for the next sync to
-publish. When two machines start the same empty repository at once, the one whose
-push loses takes the other's commit and salt.
+`fleetd init URL` sets a machine up, once, and then syncs. It makes the journal
+directory a clone of the journal repository without moving, rewriting or deleting
+anything in it, because a hook may be appending a record at any moment: it clones
+without a work tree beside the directory, makes sure the repository has
+`fleetd.json`, writes that file into the directory so every record from then on
+uses its salt, and only then moves the clone's git directory in and checks out the
+files the directory lacks. When the repository is empty, its first commit holds
+`fleetd.json` with a new salt for the fleet. One that already holds records needs
+the salt its machines use (`--salt` or `FLEET_SALT`); init never invents one for
+it. A repository with anything but host journal files, `fleetd.json`, a README, a
+LICENSE, `.gitignore` or `.gitattributes`, or with a directory, is refused, and so
+is a journal directory holding anything but journal files and `fleetd.json`. A
+directory that is already a clone of another repository is refused too. When two
+machines start the same empty repository at once, the one whose push loses takes
+the other's commit and salt. Running init again finishes what an interrupted run
+began.
 
 `fleetd sync` is what makes the answer cross-machine. The journal directory is
 the root of a clone of one journal repository that fleetd owns. Sync never
@@ -116,8 +124,8 @@ rebases, merges or stashes, and never writes this machine's own file, which
   `mktree`, `commit-tree`) and pushes exactly that commit, retrying a push that
   lost a race to another machine, for at most three attempts in all;
 - then brings in every file the remote changed or deleted. A file with changes
-  the remote does not have (another identity's unpublished records on this
-  machine, or an edit made by hand) is never overwritten; sync names it. The
+  the remote does not have (an edit made by hand, say) is never overwritten;
+  sync names it. The
   exception is anything staged with `git add` and not committed: the clone is
   fleetd's, so sync resets a staged edit to the remote's version and deletes a
   staged new file, even one the remote never had. `git fsck --lost-found`
@@ -203,11 +211,14 @@ Two defaults are deliberate and worth knowing before you use it:
   saying which machine did something.
 - **`fleetd where` says how fresh its answer is.** Every sync notes its outcome in
   the clone's git directory, and `where` reports it: when this machine last
-  synced, and whether its last sync failed and why. For each machine it gives when
-  the remote last received its records (`last_published` in `--json`) and how
-  many of them this machine holds that the remote lacks (`unpublished`). A
-  machine whose syncs keep failing, or a second identity whose records no sync
-  publishes, shows up there rather than looking idle.
+  synced, and whether its last sync failed and why, even when there are no records
+  to show. For each machine it gives the time of the newest record the remote has
+  from it (`last_published` in `--json`) and how many of its records this machine
+  holds that the remote lacks (`unpublished`), read from the remote's copy of each
+  file rather than its history. A machine whose syncs keep failing shows up there
+  rather than looking idle. A journal directory that is not the top of a clone
+  gets no such lines, and a machine git cannot answer for is left out of them, not
+  reported as unpublished.
 
 Three things about it are load-bearing, and each exists because the naive version
 was wrong:
@@ -217,9 +228,16 @@ was wrong:
   publishes only a salted digest of it — a hardware fingerprint committed to a
   repository has left the machine. The salt is the one in the journal's
   `fleetd.json`, so every machine that clones the journal uses the same one, with
-  nothing to set in its environment. `--salt` or `FLEET_SALT` may repeat it but
-  not contradict it: fleetd refuses rather than file this machine's records under
-  a second id that no sync would publish. When no stable source is readable it
+  nothing to set in its environment. `--salt` may repeat it but not contradict it.
+  A `FLEET_SALT` that contradicts it is overridden with a warning, since refusing
+  would drop every record of a hook started with a stale one. An invalid
+  `fleetd.json` is not trusted: the salt it last held, kept in the clone's git
+  directory, is used until a sync brings in a fixed one. Records this machine
+  wrote under another salt before it knew the fleet's (a hook that fired before
+  `fleetd init`, say) are filed under the fleet's id by the next sync, which keeps
+  their original file in the clone's git directory, `fleetd-pre-init/`; only files
+  git does not track are filed, since a tracked one was published under its own
+  id. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
   change if the machine is renamed and may collide with another machine of that
   name. A weak identity is labelled weak rather than presented as a strong one.
@@ -318,8 +336,8 @@ a hook's exit code and output a meaning:
 So `fleetd hook` prints nothing and always exits 0, even for a bad flag, `-h` or a
 panic. It appends any problem to **`fleetd-hook.log` beside the journal
 directory**: with the default journal, `~/.ai/channels/fleetd-hook.log`. Problems
-include a payload that isn't JSON, a salt that contradicts the journal's, or a
-sync that failed or timed out. `fleetd where` names the log and quotes its last
+include a payload that isn't JSON, a `FLEET_SALT` the journal's salt overrides,
+or a sync that failed or timed out. `fleetd where` names the log and quotes its last
 line while a problem is less than a week old. Once the log reaches 256 KiB it is
 moved to `fleetd-hook.log.1`, replacing the previous copy, so the log never
 grows past two files. `--json` prints what the hook did, for trying it by hand.
@@ -349,9 +367,10 @@ only Claude Code's hook configured, Cursor and Grok sessions are not recorded.
 1. `install-fleetd.ps1` puts `fleetd.exe` in `%USERPROFILE%\bin` and on the
    user PATH. That is how the configurations below find it.
 2. Run `fleetd init <journal repository URL>` once, from any directory. It
-   clones the journal to `%USERPROFILE%\.ai\channels\journal`, with the fleet's
+   sets the journal up at `%USERPROFILE%\.ai\channels\journal`, with the fleet's
    salt in it, so no environment variable needs setting. The first PC to run it
-   on an empty repository starts the journal.
+   on an empty repository starts the journal. On a journal its machines already
+   record into without `fleetd.json`, give the salt they use: `--salt`.
 3. Add the configurations below, then restart each tool so it reads them.
 
 Each tool's session-end entry allows 60 seconds, so that fleetd's own 40-second
@@ -400,11 +419,12 @@ adds the event as the last argument, and a turn it records is synced at once:
 notify = ["fleetd.exe", "hook", "codex"]
 ```
 
-Codex's hooks work too, instead of `notify` rather than as well as it, or every
-turn is recorded twice. Codex skips a hook until you trust it, and trust is tied
-to the hook's exact definition, so run `/hooks` in Codex after adding or editing
-these. Codex's hooks never sync; the machine's next sync publishes their
-records.
+Codex's hooks work too, alone or as well as `notify`. A turn its Stop hook
+records is not recorded again by `notify`, which still publishes it, since Codex's
+hooks never sync. Codex skips a hook until you trust it, and trust is tied to the
+hook's exact definition, so run `/hooks` in Codex after adding or editing these.
+Codex gives a SessionEnd hook 1 second unless configured otherwise, and at most 3,
+so its hooks ask git for the repository and branch for at most half a second.
 
 ```toml
 [[hooks.Stop]]

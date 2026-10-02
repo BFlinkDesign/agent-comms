@@ -1,31 +1,28 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
 
-// cmdInit sets up this machine's journal: a clone of the journal repository at
-// the journal directory, with the fleet's salt in it. Records written before
-// the journal was set up are kept, in the clone, for the next sync to publish.
+// cmdInit sets up this machine's journal: the journal directory becomes a clone
+// of the journal repository, with the fleet's salt in it. Records written there
+// before init stay where they are; the sync init ends with publishes them, and
+// files those this machine wrote under another identity under its fleet one.
 func cmdInit(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt for a journal that has none yet (else $FLEET_SALT, else a random one)")
+	salt := fs.String("salt", "", "fleet salt for a journal that has none yet (else $FLEET_SALT, else a random one for a journal with no records)")
 	timeout := fs.Duration("timeout", 2*time.Minute, "give up after this long")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -49,98 +46,69 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	if info, err := os.Stat(filepath.Join(journalDir, ".git")); err == nil && info.IsDir() {
-		// Already a clone. It is left exactly as it is.
-		fleet, ok, err := gitsync.ReadFleet(journalDir)
-		switch {
-		case err != nil:
-			return err
-		case !ok:
-			return fmt.Errorf("%s is a journal clone from before fleetd.json: publish its records with "+
-				"`fleetd sync --dir %s`, then delete it and run fleetd init again", journalDir, journalDir)
-		case given != "" && given != fleet.Salt:
-			return saltMismatch(from, journalDir)
-		}
-		if *asJSON {
-			return writeJSON(stdout, map[string]any{"dir": journalDir, "already": true})
-		}
-		fmt.Fprintf(stdout, "the journal at %s is already set up\n", journalDir)
-		return nil
-	}
-	earlier, err := recordsOnly(journalDir)
-	if err != nil {
-		return err
-	}
-
-	parent := filepath.Dir(journalDir)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return err
-	}
-	clone, err := os.MkdirTemp(parent, filepath.Base(journalDir)+".init-")
-	if err != nil {
-		return err
-	}
-	keepClone := false
-	defer func() {
-		if !keepClone {
-			os.RemoveAll(clone)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	deadline := time.Now().Add(*timeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	res, err := gitsync.Init(ctx, gitsync.InitOptions{URL: url, Dir: clone, Salt: given})
-	if errors.Is(err, gitsync.ErrSaltMismatch) {
+	res, err := gitsync.Init(ctx, gitsync.InitOptions{
+		URL: url, Dir: journalDir, Salt: given, Strict: from == "--salt" && given != "",
+	})
+	switch {
+	case errors.Is(err, gitsync.ErrSaltMismatch) && from == "--salt":
 		return saltMismatch(from, url)
-	}
-	if err != nil {
+	case errors.Is(err, gitsync.ErrNeedSalt):
+		return fmt.Errorf("%w. Its machines already derive their host ids with a salt; give init that salt with "+
+			"--salt or FLEET_SALT, so they keep their ids", err)
+	case err != nil:
 		return err
 	}
+	if res.SaltDiffers {
+		fmt.Fprintf(stderr, "fleetd: warning: %s differs from the salt in %s's %s, which is used; unset %s\n",
+			from, url, gitsync.FleetFile, from)
+	}
 
-	// Records written before the journal was set up move into the clone. The
-	// directory is renamed aside first, so an append that races this finds no
-	// file to write to rather than one about to be deleted.
-	kept, aside := 0, ""
-	if earlier != nil {
-		aside = journalDir + ".before-init-" + randomSuffix()
-		if err := renameRetry(journalDir, aside); err != nil {
-			return err
+	// The journal is set up. Syncing now publishes this machine's records, brings
+	// the journal's fleetd.json into a clone that lacked it, and, once it has
+	// been in place long enough for every hook to use it, files under this
+	// machine's fleet identity the records it wrote under another.
+	h := identity(res.Salt)
+	var published int
+	var syncErr error
+	for pass := 0; pass < 2 && syncErr == nil; pass++ {
+		if pass == 1 && !refilePending(journalDir, h) {
+			break
 		}
-		for _, name := range earlier {
-			n, err := adopt(filepath.Join(aside, name), filepath.Join(clone, name))
-			if err != nil {
-				return fmt.Errorf("%w; the records written before init are in %s", err, aside)
-			}
-			kept += n
-		}
-	}
-	if err := renameRetry(clone, journalDir); err != nil {
-		keepClone = true
-		return fmt.Errorf("%w; the new clone is at %s and the records written before init are in %s", err, clone, aside)
-	}
-	keepClone = true
-	if aside != "" {
-		// Every record in it is in the clone now.
-		if err := os.RemoveAll(aside); err != nil {
-			fmt.Fprintf(stderr, "fleetd: warning: could not remove %s, whose records are all in the journal: %v\n", aside, err)
-		}
+		waitForFleetFile(journalDir, deadline)
+		var r gitsync.Result
+		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), stderr)
+		published += r.Published
 	}
 
 	if *asJSON {
-		return writeJSON(stdout, map[string]any{
-			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head,
-			"started": res.Started, "wrote_fleet_file": res.WroteFleetFile, "kept": kept,
-		})
+		out := map[string]any{
+			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head, "started": res.Started,
+			"wrote_fleet_file": res.WroteFleetFile, "cloned": res.Cloned, "restored": res.Restored, "published": published,
+		}
+		if syncErr != nil {
+			out["sync_error"] = syncErr.Error()
+		}
+		return writeJSON(stdout, out)
 	}
 	switch {
 	case res.Started:
-		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with this fleet's salt\n", url, gitsync.FleetFile)
+		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with a new salt for this fleet\n", url, gitsync.FleetFile)
 	case res.WroteFleetFile:
-		fmt.Fprintf(stdout, "added %s, with this fleet's salt, to %s\n", gitsync.FleetFile, url)
+		fmt.Fprintf(stdout, "added %s to %s, with the salt this machine was given\n", gitsync.FleetFile, url)
 	}
-	fmt.Fprintf(stdout, "the journal is set up at %s, following %s\n", journalDir, res.Branch)
-	if kept > 0 {
-		fmt.Fprintf(stdout, "kept %s written before init; the next sync publishes this machine's\n", plural(kept, "record"))
+	if res.Cloned {
+		fmt.Fprintf(stdout, "the journal is set up at %s, following %s\n", journalDir, res.Branch)
+	} else {
+		fmt.Fprintf(stdout, "the journal at %s was already set up, following %s\n", journalDir, res.Branch)
 	}
+	if syncErr != nil {
+		fmt.Fprintf(stdout, "the first sync failed, and the next one retries: %v\n", syncErr)
+		return nil
+	}
+	fmt.Fprintf(stdout, "published %s from this machine\n", plural(published, "record"))
 	return nil
 }
 
@@ -150,97 +118,35 @@ func saltMismatch(from, where string) error {
 		gitsync.ErrSaltMismatch, from, where, gitsync.FleetFile, from)
 }
 
-// recordsOnly lists the journal files in dir, which init may take over: nil
-// when dir does not exist or is empty. Anything else in dir is refused, so init
-// never deletes what it did not write.
-func recordsOnly(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+// waitForFleetFile waits, at most until deadline, for the journal's fleetd.json
+// to have been in place for refileSettle, so that the sync after it can file the
+// records this machine wrote under another identity. A clone that has none yet
+// gets it from that sync, and re-files at the next.
+func waitForFleetFile(dir string, deadline time.Time) {
+	info, err := os.Stat(filepath.Join(dir, gitsync.FleetFile))
 	if err != nil {
-		return nil, err
+		return
 	}
-	var names, foreign []string
-	for _, e := range entries {
-		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".jsonl") {
-			names = append(names, e.Name())
-			continue
-		}
-		foreign = append(foreign, e.Name())
+	if wait := time.Until(info.ModTime().Add(refileSettle)); wait > 0 && time.Now().Add(wait).Before(deadline) {
+		time.Sleep(wait)
 	}
-	if len(foreign) > 0 {
-		return nil, fmt.Errorf("%s holds %s, which is not a journal file; init sets up the journal "+
-			"there, so move it, or give init another --dir", dir, strings.Join(foreign, ", "))
-	}
-	return names, nil
-}
-
-// adopt appends to into every line of from that into does not already hold,
-// and returns how many that was. A final line without a newline, left by an
-// interrupted append, is kept as a line of its own.
-func adopt(from, into string) (int, error) {
-	local, err := os.ReadFile(from)
-	if err != nil {
-		return 0, err
-	}
-	published, err := os.ReadFile(into)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return 0, err
-	}
-	var merged bytes.Buffer
-	seen := map[string]bool{}
-	for _, line := range lines(published) {
-		seen[line] = true
-		merged.WriteString(line + "\n")
-	}
-	added := 0
-	for _, line := range lines(local) {
-		if !seen[line] {
-			seen[line] = true
-			merged.WriteString(line + "\n")
-			added++
-		}
-	}
-	if added == 0 {
-		return 0, nil
-	}
-	tmp := into + ".adopt"
-	if err := os.WriteFile(tmp, merged.Bytes(), 0o644); err != nil {
-		return 0, err
-	}
-	return added, renameRetry(tmp, into)
 }
 
 // lines splits journal content into its non-empty lines, without line endings.
 func lines(b []byte) []string {
 	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if line = strings.TrimSuffix(line, "\r"); line != "" {
-			out = append(out, line)
+	start := 0
+	for i := 0; i <= len(b); i++ {
+		if i == len(b) || b[i] == '\n' {
+			line := string(b[start:i])
+			if n := len(line); n > 0 && line[n-1] == '\r' {
+				line = line[:n-1]
+			}
+			if line != "" {
+				out = append(out, line)
+			}
+			start = i + 1
 		}
 	}
 	return out
-}
-
-// renameRetry renames, retrying for a few seconds while Windows refuses because
-// another process, such as a virus scanner or an indexer, has a file open.
-func renameRetry(from, to string) error {
-	var err error
-	for delay := 50 * time.Millisecond; delay < 5*time.Second; delay *= 2 {
-		if err = os.Rename(from, to); err == nil {
-			return nil
-		}
-		if _, statErr := os.Stat(from); statErr != nil {
-			return err
-		}
-		time.Sleep(delay)
-	}
-	return err
-}
-
-func randomSuffix() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

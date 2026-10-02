@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 )
 
 // FleetFile is the journal repository's own settings file. It holds the fleet's
 // salt, so every machine that clones the journal derives host ids the same way
 // without each one having to be given the salt: a hook started without
 // FLEET_SALT in its environment would otherwise file its records under a second
-// id for the same machine, which nothing ever publishes.
+// id for the same machine.
 const FleetFile = "fleetd.json"
 
 // Fleet is FleetFile's content.
@@ -33,34 +35,64 @@ var (
 	ErrNotJournal = errors.New("gitsync: the repository does not look like a fleet journal")
 	// ErrSaltMismatch means a salt was given that differs from the journal's.
 	ErrSaltMismatch = errors.New("gitsync: the salt given differs from the journal's fleetd.json")
-	// ErrBadFleetFile means FleetFile exists but holds no salt.
-	ErrBadFleetFile = errors.New("gitsync: fleetd.json holds no salt")
+	// ErrBadFleetFile means FleetFile exists but is not valid JSON, or holds no salt.
+	ErrBadFleetFile = errors.New("gitsync: fleetd.json is not usable")
+	// ErrNeedSalt means the journal holds records but no FleetFile, so the salt
+	// its machines use cannot be known, and inventing one would give each of them
+	// a second id.
+	ErrNeedSalt = errors.New("gitsync: the journal holds records but no fleetd.json")
+	// ErrOtherRemote means the journal directory is a clone of another repository.
+	ErrOtherRemote = errors.New("gitsync: the journal directory is a clone of another repository")
+	// ErrDirInUse means the journal directory holds something besides journal
+	// files, which init leaves alone.
+	ErrDirInUse = errors.New("gitsync: the journal directory holds files that are not journal records")
 )
+
+// hostFile is the name of a machine's journal file: journal.FileName of a host
+// id, which fleetd makes "host:" and 16 hex digits.
+var hostFile = regexp.MustCompile(`^host-[a-z0-9_-]{1,59}\.jsonl$`)
 
 // ReadFleet reads FleetFile from a journal directory; ok is false when it has none.
 func ReadFleet(dir string) (f Fleet, ok bool, err error) {
-	data, err := os.ReadFile(filepath.Join(dir, FleetFile))
+	path := filepath.Join(dir, FleetFile)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Fleet{}, false, nil
 	}
 	if err != nil {
 		return Fleet{}, false, err
 	}
-	if err := json.Unmarshal(data, &f); err != nil || strings.TrimSpace(f.Salt) == "" {
-		return Fleet{}, false, fmt.Errorf("%w: %s", ErrBadFleetFile, filepath.Join(dir, FleetFile))
+	if f, err = parseFleet(data, path); err != nil {
+		return Fleet{}, false, err
 	}
 	return f, true, nil
 }
 
-// InitOptions says which journal repository to clone, and where to.
+func parseFleet(data []byte, where string) (Fleet, error) {
+	var f Fleet
+	if err := json.Unmarshal(data, &f); err != nil {
+		return Fleet{}, fmt.Errorf("%w: %s is not valid JSON (%v)", ErrBadFleetFile, where, err)
+	}
+	if strings.TrimSpace(f.Salt) == "" {
+		return Fleet{}, fmt.Errorf("%w: %s holds no salt", ErrBadFleetFile, where)
+	}
+	return f, nil
+}
+
+// InitOptions says which journal repository to set up, and where.
 type InitOptions struct {
 	// URL is the journal repository.
 	URL string
-	// Dir is where the clone goes. It must not exist, or be an empty directory.
+	// Dir is the journal directory. It may already be a clone of URL; otherwise
+	// it may be absent, empty, or hold journal files written before init and a
+	// FleetFile, and nothing else.
 	Dir string
-	// Salt is a salt the caller was given. A journal without FleetFile gets it,
-	// or a random one when it is empty; a journal with FleetFile must match it.
+	// Salt is a salt the caller was given. A journal without FleetFile gets it;
+	// a journal with FleetFile keeps its own.
 	Salt string
+	// Strict refuses a journal whose salt differs from Salt; otherwise the
+	// journal's salt is used and SaltDiffers is set.
+	Strict bool
 	// Run runs git; nil means Git.
 	Run Runner
 }
@@ -69,98 +101,419 @@ type InitOptions struct {
 type InitResult struct {
 	// Started is set when the repository was empty and Init made its first commit.
 	Started bool `json:"started"`
-	// WroteFleetFile is set when Init committed fleetd.json.
+	// WroteFleetFile is set when Init committed FleetFile to the repository.
 	WroteFleetFile bool `json:"wrote_fleet_file"`
+	// Cloned is set when Dir was not a clone and now is.
+	Cloned bool `json:"cloned"`
 	// Branch is the branch the clone follows.
 	Branch string `json:"branch"`
-	// Head is the commit the clone is at, which is the remote's.
+	// Head is the remote commit Init found FleetFile in.
 	Head string `json:"head"`
+	// Restored lists tracked files the work tree lacked, which Init checked out.
+	Restored []string `json:"restored,omitempty"`
 	// Salt is the journal's salt. It is not a credential, but it is nobody's
 	// business either, so it is not printed.
 	Salt string `json:"-"`
+	// SaltDiffers is set when a Salt was given, Strict was not, and the
+	// journal's differs from it.
+	SaltDiffers bool `json:"-"`
 }
 
-// Init clones a journal repository into o.Dir and makes sure it has FleetFile.
-// A repository without one gets it in a commit of its own, pushed at once; an
-// empty repository gets it as its first commit. When another machine pushes
+// Init makes Dir a clone of the journal repository that holds FleetFile.
+//
+// It never renames, rewrites or deletes Dir or a record in it, because a hook may
+// be appending to one at any moment. A directory that is not a clone yet keeps
+// its files where they are: Init clones without a work tree into a temporary
+// directory beside it, makes sure the repository has FleetFile there, writes
+// FleetFile into Dir so that every record from then on uses the journal's salt,
+// and only then moves the clone's git directory into Dir and checks out the
+// tracked files Dir lacks, overwriting none. A directory that is already a clone
+// has FleetFile added to its repository the same way, with plumbing, and its
+// work tree is left to the next sync.
+//
+// A repository without FleetFile gets it in a commit of its own, pushed at once;
+// an empty repository gets it as its first commit. One that already holds
+// records needs the salt its machines use, and one with files a journal never
+// has is refused, both before anything is pushed. When another machine pushes
 // first, Init takes what that machine pushed and looks again, at most
-// MaxAttempts times. A repository with files a journal never has is refused
-// before anything is pushed to it.
+// MaxAttempts times. Running Init again finishes what an interrupted one began.
 func Init(ctx context.Context, o InitOptions) (InitResult, error) {
-	var res InitResult
-	g := git{ctx: ctx, dir: filepath.Dir(o.Dir), run: o.Run}
-	if g.run == nil {
-		g.run = Git
+	run := o.Run
+	if run == nil {
+		run = Git
 	}
-	if _, err := g.line(append(batchSSH(g), "clone", "--quiet", "--no-tags", "--", o.URL, o.Dir)...); err != nil {
+	url := o.URL
+	// A local path is resolved here: git would resolve a relative one against the
+	// directory it clones from, which is not the one the person typed it in.
+	if info, err := os.Stat(url); err == nil && info.IsDir() {
+		if abs, err := filepath.Abs(url); err == nil {
+			url = abs
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(o.Dir, ".git")); err == nil {
+		return initClone(ctx, o, url, run)
+	}
+	return initNew(ctx, o, url, run)
+}
+
+func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitResult, error) {
+	var res InitResult
+	if err := checkJournalDir(o.Dir); err != nil {
 		return res, err
 	}
-	g.dir = o.Dir
-	ssh := batchSSH(g)
-	branch, err := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
+	parent := filepath.Dir(o.Dir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return res, err
+	}
+	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
 	if err != nil {
-		return res, fmt.Errorf("gitsync: the clone of %s has no branch checked out: %w", o.URL, err)
+		return res, err
+	}
+	// Init's own clone. Once its git directory has moved into Dir it is empty.
+	defer os.RemoveAll(tmp)
+
+	g := git{ctx: ctx, dir: parent, run: run}
+	if _, err := g.line(append(batchSSH(g), "clone", "--quiet", "--no-checkout", "--no-tags", "--", url, tmp)...); err != nil {
+		return res, err
+	}
+	g.dir = tmp
+	if res.Branch, err = startBranch(g); err != nil {
+		return res, err
+	}
+	if err := bootstrap(g, o, &res); err != nil {
+		return res, err
+	}
+	// There is no work tree, so pointing the branch at the remote's tip is all
+	// following it takes.
+	for _, args := range [][]string{
+		{"update-ref", "refs/heads/" + res.Branch, res.Head},
+		{"symbolic-ref", "HEAD", "refs/heads/" + res.Branch},
+		{"branch", "--quiet", "--set-upstream-to=origin/" + res.Branch, res.Branch},
+	} {
+		if _, err := g.line(args...); err != nil {
+			return res, err
+		}
+	}
+	// A sync must not start in Dir while Init is still filling its index: the
+	// lock moves into Dir with the git directory, and a hook's sync skips it.
+	lockPath := filepath.Join(tmp, ".git", syncLockName)
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		return res, err
+	}
+	if err := placeFleetFile(g, o.Dir, res.Head); err != nil {
+		return res, err
+	}
+	if err := RenameRetry(filepath.Join(tmp, ".git"), filepath.Join(o.Dir, ".git")); err != nil {
+		if _, statErr := os.Lstat(filepath.Join(o.Dir, ".git")); statErr == nil {
+			// Another init set Dir up first; finish as on any clone.
+			return initClone(ctx, o, url, run)
+		}
+		return res, err
+	}
+	defer os.Remove(filepath.Join(o.Dir, ".git", syncLockName))
+	res.Cloned = true
+	g.dir = o.Dir
+	if _, err := g.line("read-tree", "HEAD"); err != nil {
+		return res, err
+	}
+	res.Restored, err = restoreMissing(g)
+	return res, err
+}
+
+func initClone(ctx context.Context, o InitOptions, url string, run Runner) (InitResult, error) {
+	var res InitResult
+	g := git{ctx: ctx, dir: o.Dir, run: run}
+	top, err := g.line("rev-parse", "--show-toplevel")
+	if err != nil {
+		return res, fmt.Errorf("%w: %s (%v)", ErrNotClone, o.Dir, err)
+	}
+	if !SameDir(top, o.Dir) {
+		return res, fmt.Errorf("%w: %s is inside the repository at %s", ErrNotClone, o.Dir, top)
+	}
+	if origin, _ := g.line("config", "--get", "remote.origin.url"); !sameURL(origin, url) {
+		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
+	}
+	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil {
+		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+	}
+	remote, branch, ok := strings.Cut(upstream, "/")
+	if !ok || remote != "origin" {
+		return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
 	}
 	res.Branch = branch
+	unlock, _, err := lock(g)
+	if err != nil {
+		return res, err
+	}
+	defer unlock()
+	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
+		return res, err
+	}
+	if err := bootstrap(g, o, &res); err != nil {
+		return res, err
+	}
+	res.Restored, err = restoreMissing(g)
+	return res, err
+}
 
+// startBranch names the branch the journal is on. A clone of an empty repository
+// starts the branch the remote names as its default, else main, but never this
+// machine's own default, which another machine starting the same journal at the
+// same moment may not share.
+func startBranch(g git) (string, error) {
+	branch, err := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("gitsync: the clone has no branch: %w", err)
+	}
+	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch); err == nil {
+		return branch, nil
+	}
+	branch = "main"
+	if out, err := g.line(append(batchSSH(g), "ls-remote", "--symref", "origin", "HEAD")...); err == nil {
+		for _, l := range strings.Split(out, "\n") {
+			rest, ok := strings.CutPrefix(l, "ref: refs/heads/")
+			if name, _, ok2 := strings.Cut(rest, "\t"); ok && ok2 && name != "" {
+				branch = name
+			}
+		}
+	}
+	if _, err := g.line("symbolic-ref", "HEAD", "refs/heads/"+branch); err != nil {
+		return "", err
+	}
+	return branch, nil
+}
+
+// bootstrap makes sure the remote branch has FleetFile, and sets res.Head and
+// res.Salt from it. It moves refs only, never a work tree.
+func bootstrap(g git, o InitOptions, res *InitResult) error {
+	ssh := batchSSH(g)
 	for attempt := 1; ; attempt++ {
-		head, _ := g.line("rev-parse", "--verify", "--quiet", "HEAD")
-		if head != "" {
-			if err := looksLikeJournal(g, head); err != nil {
-				return res, fmt.Errorf("%w (%s): %v", ErrNotJournal, o.URL, err)
+		tip, _ := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+res.Branch)
+		var top map[string]string
+		if tip != "" {
+			var err error
+			if top, err = topLevel(g, tip); err != nil {
+				return err
 			}
-			fleet, ok, err := ReadFleet(o.Dir)
-			if err != nil {
-				return res, err
+			if err := looksLikeJournal(top); err != nil {
+				return fmt.Errorf("%w (%s): %v", ErrNotJournal, o.URL, err)
 			}
-			if ok {
+			if _, ok := top[FleetFile]; ok {
+				data, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+				if err != nil {
+					return err
+				}
+				fleet, err := parseFleet([]byte(data), o.URL+"'s "+FleetFile)
+				if err != nil {
+					return err
+				}
 				if o.Salt != "" && o.Salt != fleet.Salt {
-					return res, ErrSaltMismatch
-				}
-				if _, err := g.line("rev-parse", "--verify", "--quiet", "@{upstream}"); err != nil {
-					if _, err := g.line("branch", "--quiet", "--set-upstream-to=origin/"+branch); err != nil {
-						return res, err
+					if o.Strict {
+						return ErrSaltMismatch
 					}
+					res.SaltDiffers = true
 				}
-				res.Head, res.Salt = head, fleet.Salt
-				return res, nil
+				res.Head, res.Salt = tip, fleet.Salt
+				return nil
 			}
 		}
 		if attempt > MaxAttempts {
-			return res, fmt.Errorf("gitsync: %s still has no %s after %d attempts", o.URL, FleetFile, MaxAttempts)
+			return fmt.Errorf("gitsync: %s still has no %s after %d attempts", o.URL, FleetFile, MaxAttempts)
 		}
 		salt := o.Salt
 		if salt == "" {
+			for name := range top {
+				if strings.HasSuffix(name, ".jsonl") {
+					return fmt.Errorf("%w: %s holds %s", ErrNeedSalt, o.URL, name)
+				}
+			}
+			var err error
 			if salt, err = randomSalt(); err != nil {
-				return res, err
+				return err
 			}
 		}
-		commit, err := fleetCommit(g, head, salt)
+		commit, err := fleetCommit(g, tip, salt)
 		if err != nil {
-			return res, err
+			return err
 		}
-		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "origin", commit+":refs/heads/"+branch)...)
+		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "origin", commit+":refs/heads/"+res.Branch)...)
 		switch {
 		case err == nil:
-			res.WroteFleetFile, res.Started = true, head == ""
+			res.WroteFleetFile, res.Started = true, tip == ""
+			if res.Started {
+				if err := oneBranch(g, res.Branch); err != nil {
+					return err
+				}
+			}
 		case !lostRace(out):
-			return res, err
+			return err
 		}
-		// Either way the remote now has a tip this clone must take: this machine's
-		// commit, or the one that beat it. The clone is Init's own and holds
-		// nothing else yet, so a hard reset loses nothing.
+		// Either way the remote has a tip to look at again: this machine's
+		// commit, or the one that beat it.
 		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
-			return res, err
-		}
-		if _, err := g.line("reset", "--quiet", "--hard", "refs/remotes/origin/"+branch); err != nil {
-			return res, err
+			return err
 		}
 	}
 }
 
-// fleetCommit builds a commit, without touching the working tree or the index,
-// that adds FleetFile to parent, or that holds only FleetFile when parent is
-// empty, meaning the repository has no commits yet.
+// oneBranch fails when a journal this machine just started has another branch:
+// two machines started it at once on two branches, each with its own salt.
+func oneBranch(g git, branch string) error {
+	out, err := g.line(append(batchSSH(g), "ls-remote", "--heads", "origin")...)
+	if err != nil {
+		return err
+	}
+	var others []string
+	for _, l := range strings.Split(out, "\n") {
+		if _, ref, ok := strings.Cut(l, "\t"); ok && ref != "refs/heads/"+branch {
+			others = append(others, strings.TrimPrefix(ref, "refs/heads/"))
+		}
+	}
+	if len(others) > 0 {
+		return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s; "+
+			"delete the one that is not the repository's default, then run fleetd init again", branch, strings.Join(others, ", "))
+	}
+	return nil
+}
+
+// placeFleetFile writes the journal's FleetFile into dir, so that a record
+// appended from then on uses the journal's salt. dir may hold one from an
+// interrupted init; one with another salt is refused.
+func placeFleetFile(g git, dir, tip string) error {
+	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, FleetFile)
+	have, err := os.ReadFile(path)
+	switch {
+	case err == nil && string(have) == want:
+		return nil
+	case err == nil:
+		f, perr := parseFleet(have, path)
+		w, _ := parseFleet([]byte(want), FleetFile)
+		if perr != nil || f.Salt != w.Salt {
+			return fmt.Errorf("%w: %s holds another salt than the journal's; remove it, then run fleetd init again", ErrSaltMismatch, path)
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// Written beside dir and renamed in, so a reader never sees half of it.
+	f, err := os.CreateTemp(filepath.Dir(dir), "."+FleetFile+".*")
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(want)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = RenameRetry(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
+}
+
+// restoreMissing checks out every tracked file the work tree lacks, and returns
+// them. A file the work tree has is never overwritten.
+func restoreMissing(g git) ([]string, error) {
+	out, err := g.raw(nil, "ls-files", "-z", "--deleted")
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	if _, err := g.raw(nulList(paths), "checkout-index", "-z", "--stdin"); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+// checkJournalDir refuses a directory init must not take over: anything in it
+// but journal files and FleetFile, which init would otherwise leave inside a
+// clone it publishes from.
+func checkJournalDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var foreign []string
+	for _, e := range entries {
+		if e.Type().IsRegular() && (strings.HasSuffix(e.Name(), ".jsonl") || e.Name() == FleetFile) {
+			continue
+		}
+		foreign = append(foreign, e.Name())
+	}
+	if len(foreign) > 0 {
+		return fmt.Errorf("%w: %s holds %s; init sets the journal up there, so move it, or give init another --dir",
+			ErrDirInUse, dir, strings.Join(foreign, ", "))
+	}
+	return nil
+}
+
+// topLevel lists a commit's top-level entries by name, with their object types.
+func topLevel(g git, commit string) (map[string]string, error) {
+	listing, err := g.raw(nil, "ls-tree", "-z", commit)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, entry := range strings.Split(listing, "\x00") {
+		meta, name, ok := strings.Cut(entry, "\t")
+		if !ok {
+			continue
+		}
+		if fields := strings.Fields(meta); len(fields) == 3 {
+			out[name] = fields[1]
+		}
+	}
+	return out, nil
+}
+
+// looksLikeJournal refuses a commit whose top level holds anything but host
+// journal files, FleetFile, and what GitHub offers to create with a new
+// repository; or anything that is not a file.
+func looksLikeJournal(top map[string]string) error {
+	var foreign []string
+	for name, kind := range top {
+		lower := strings.ToLower(name)
+		switch {
+		case kind != "blob":
+		case name == FleetFile, hostFile.MatchString(name),
+			strings.HasPrefix(lower, "readme"), strings.HasPrefix(lower, "license"),
+			lower == ".gitignore", lower == ".gitattributes":
+			continue
+		}
+		foreign = append(foreign, name)
+	}
+	if len(foreign) > 0 {
+		if len(foreign) > 5 {
+			foreign = append(foreign[:5], "…")
+		}
+		return fmt.Errorf("it holds %s", strings.Join(foreign, ", "))
+	}
+	return nil
+}
+
+// fleetCommit builds a commit, without touching a work tree or the index, that
+// adds FleetFile to parent, or that holds only FleetFile when parent is empty,
+// meaning the repository has no commits yet.
 func fleetCommit(g git, parent, salt string) (string, error) {
 	content, err := json.MarshalIndent(Fleet{About: fleetAbout, Salt: salt}, "", "  ")
 	if err != nil {
@@ -194,31 +547,17 @@ func fleetCommit(g git, parent, salt string) (string, error) {
 	return g.line(args...)
 }
 
-// looksLikeJournal refuses a commit whose top level holds anything but journal
-// files, FleetFile, and what GitHub offers to create with a new repository.
-func looksLikeJournal(g git, commit string) error {
-	listing, err := g.raw(nil, "ls-tree", "-z", "--name-only", commit)
-	if err != nil {
-		return err
+// sameURL reports whether two remote URLs name the same repository: the same
+// directory for a local path, otherwise the same text, ignoring a trailing slash
+// or .git and letter case.
+func sameURL(a, b string) bool {
+	if ia, err := os.Stat(a); err == nil && ia.IsDir() {
+		return SameDir(a, b)
 	}
-	var foreign []string
-	for _, name := range strings.Split(listing, "\x00") {
-		lower := strings.ToLower(name)
-		switch {
-		case name == "", name == FleetFile, strings.HasSuffix(lower, ".jsonl"),
-			strings.HasPrefix(lower, "readme"), strings.HasPrefix(lower, "license"),
-			lower == ".gitignore", lower == ".gitattributes":
-		default:
-			foreign = append(foreign, name)
-		}
+	norm := func(s string) string {
+		return strings.ToLower(strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(s), "/"), ".git"))
 	}
-	if len(foreign) > 0 {
-		if len(foreign) > 5 {
-			foreign = append(foreign[:5], "…")
-		}
-		return fmt.Errorf("it holds %s", strings.Join(foreign, ", "))
-	}
-	return nil
+	return norm(a) == norm(b)
 }
 
 func randomSalt() (string, error) {
@@ -227,4 +566,20 @@ func randomSalt() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// RenameRetry renames, retrying for a few seconds while Windows refuses because
+// another process, such as a virus scanner or an indexer, has the file open.
+func RenameRetry(from, to string) error {
+	var err error
+	for delay := 50 * time.Millisecond; delay < 5*time.Second; delay *= 2 {
+		if err = os.Rename(from, to); err == nil {
+			return nil
+		}
+		if _, statErr := os.Stat(from); statErr != nil {
+			return err
+		}
+		time.Sleep(delay)
+	}
+	return err
 }

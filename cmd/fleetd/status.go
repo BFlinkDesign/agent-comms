@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,7 +59,7 @@ func noteSync(dir string, res gitsync.Result, syncErr error, stderr io.Writer) {
 	if err == nil {
 		tmp := path + ".tmp"
 		if err = os.WriteFile(tmp, append(data, '\n'), 0o644); err == nil {
-			err = renameRetry(tmp, path)
+			err = gitsync.RenameRetry(tmp, path)
 		}
 	}
 	if err != nil {
@@ -77,53 +78,100 @@ func readSyncStatus(dir string) (syncStatus, bool) {
 
 // publication is what the clone's copy of the remote says about one host file.
 type publication struct {
-	// At is when the remote branch, as of this clone's last fetch, last changed
-	// the file, by the publishing machine's clock; "" if it never had it.
+	// Known is set when git could say; the other fields are empty otherwise.
+	Known bool
+	// At is the timestamp of the newest complete record in the remote's copy of
+	// the file, as of this clone's last fetch; "" when the remote has no file.
 	At string
 	// Unpublished counts the file's complete records here that the remote lacks.
 	Unpublished int
 }
 
-// publications reads, for each host file stem, when the remote last published it
-// and how many of its records on this machine it still lacks. ok is false when
-// the journal is not a clone with an upstream, so there is nothing to compare.
-// Records here that the remote lacks are this machine's unpublished work, or
-// the records of a second identity this machine was given, which only a sync
-// with that identity's salt would publish.
+// publications reads, for each host file stem, what the remote's copy of it holds
+// and how many of its records here it lacks. ok is false when the journal is not
+// the top of a clone with an upstream, so there is nothing to compare. It reads
+// the remote's tree once and each file's blob, never the history, so it costs the
+// same however long the journal has been running. A host git could not answer for
+// is left unknown rather than reported as unpublished.
 func publications(dir string, stems []string) (map[string]publication, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	top, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--show-toplevel")
+	if err != nil || !gitsync.SameDir(strings.TrimSpace(top), dir) {
+		return nil, false
+	}
 	up, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--verify", "--quiet", "@{upstream}")
 	if up = strings.TrimSpace(up); err != nil || up == "" {
 		return nil, false
 	}
 	out := map[string]publication{}
+	listing, err := gitsync.Git(ctx, dir, nil, "ls-tree", "-z", up)
+	if err != nil {
+		return out, true
+	}
+	blobs := map[string]string{}
+	for _, entry := range strings.Split(listing, "\x00") {
+		meta, name, ok := strings.Cut(entry, "\t")
+		if fields := strings.Fields(meta); ok && len(fields) == 3 && fields[1] == "blob" {
+			blobs[name] = fields[2]
+		}
+	}
 	for _, stem := range stems {
 		name := stem + ".jsonl"
-		var p publication
-		if at, err := gitsync.Git(ctx, dir, nil, "log", "-1", "--format=%cI", up, "--", name); err == nil {
-			p.At = strings.TrimSpace(at)
-		}
-		published := map[string]bool{}
-		if p.At != "" {
-			if blob, err := gitsync.Git(ctx, dir, nil, "cat-file", "blob", up+":"+name); err == nil {
-				for _, line := range lines([]byte(blob)) {
-					published[line] = true
-				}
+		var remote []byte
+		if oid, ok := blobs[name]; ok {
+			blob, err := gitsync.Git(ctx, dir, nil, "cat-file", "blob", oid)
+			if err != nil {
+				continue
 			}
+			remote = []byte(blob)
 		}
+		p := publication{Known: true, At: newestTS(remote)}
 		if local, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
 			// Only complete records: one still being written waits for the next sync.
-			local = local[:strings.LastIndexByte(string(local), '\n')+1]
-			for _, line := range lines(local) {
-				if !published[line] {
-					p.Unpublished++
-				}
-			}
+			local = bytes.ReplaceAll(local[:bytes.LastIndexByte(local, '\n')+1], []byte("\r\n"), []byte("\n"))
+			p.Unpublished = unpublished(local, remote)
 		}
 		out[stem] = p
 	}
 	return out, true
+}
+
+// unpublished counts the records in local that remote lacks. For this machine's
+// own file the remote's copy is a prefix of the local one, and the records after
+// it are counted, repeats included; otherwise each line of remote accounts for
+// one equal line of local.
+func unpublished(local, remote []byte) int {
+	if bytes.HasPrefix(local, remote) {
+		return len(lines(local[len(remote):]))
+	}
+	have := map[string]int{}
+	for _, l := range lines(remote) {
+		have[l]++
+	}
+	n := 0
+	for _, l := range lines(local) {
+		if have[l] > 0 {
+			have[l]--
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// newestTS is the ts of the last record in journal content that has one.
+func newestTS(content []byte) string {
+	ls := lines(content[:bytes.LastIndexByte(content, '\n')+1])
+	for i := len(ls) - 1; i >= 0; i-- {
+		var rec struct {
+			TS string `json:"ts"`
+		}
+		if json.Unmarshal([]byte(ls[i]), &rec) == nil && rec.TS != "" {
+			return rec.TS
+		}
+	}
+	return ""
 }
 
 // ago says how long ago an RFC3339 instant was, roughly, for a person.
