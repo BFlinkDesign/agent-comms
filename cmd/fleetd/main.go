@@ -191,10 +191,18 @@ func run(args []string, stdout, stderr io.Writer) error {
 // just does not separate this fleet from another using the same scheme, so the
 // caller is told rather than silently given a weaker identity.
 func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error) {
+	salt, _, err := resolveSaltFrom(flagValue, journalDir, stderr)
+	return salt, err
+}
+
+// resolveSaltFrom is resolveSalt, and also says whether the salt is the journal's:
+// read from its fleetd.json, or the one that file last held. A salt that is not
+// came from --salt or FLEET_SALT for want of a usable fleetd.json.
+func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt string, journals bool, err error) {
 	fleet, ok, err := gitsync.ReadFleet(journalDir)
 	if err != nil {
 		if !errors.Is(err, gitsync.ErrBadFleetFile) {
-			return "", err
+			return "", false, err
 		}
 		if cached := cachedSalt(journalDir); cached != "" {
 			fmt.Fprintf(stderr, "fleetd: warning: %v; the salt it last held is used until a sync brings in a fixed one\n", err)
@@ -206,7 +214,7 @@ func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error)
 	env := os.Getenv("FLEET_SALT")
 	switch {
 	case ok && flagValue != "" && flagValue != fleet.Salt:
-		return "", saltMismatch("--salt", journalDir)
+		return "", false, saltMismatch("--salt", journalDir)
 	case ok:
 		if flagValue == "" && env != "" && env != fleet.Salt {
 			fmt.Fprintf(stderr, "fleetd: warning: FLEET_SALT differs from the salt in %s's %s, which is used; unset FLEET_SALT\n",
@@ -218,14 +226,14 @@ func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error)
 			_ = gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev)
 		}
 		cacheSalt(journalDir, fleet.Salt)
-		return fleet.Salt, nil
+		return fleet.Salt, true, nil
 	case flagValue != "":
-		return flagValue, nil
+		return flagValue, false, nil
 	case env != "":
-		return env, nil
+		return env, false, nil
 	}
 	fmt.Fprintln(stderr, "fleetd: warning: no fleetd.json in the journal, no --salt and no FLEET_SALT; host digests are unseparated")
-	return "", nil
+	return "", false, nil
 }
 
 // saltCacheName is the file, in a clone's .git directory, that keeps the last
@@ -380,7 +388,7 @@ func appendRecord(req recordRequest, warn io.Writer) (recorded, error) {
 	if err != nil {
 		return recorded{}, err
 	}
-	fleetSalt, err := resolveSalt(req.salt, journalDir, warn)
+	fleetSalt, journals, err := resolveSaltFrom(req.salt, journalDir, warn)
 	if err != nil {
 		return recorded{}, err
 	}
@@ -449,10 +457,10 @@ func appendRecord(req recordRequest, warn io.Writer) (recorded, error) {
 	if err := store.Append(h.ID, c); err != nil {
 		return recorded{}, err
 	}
-	if fleetSalt != "" {
-		if _, ok, err := gitsync.ReadFleet(journalDir); err == nil && !ok {
-			noteSalt(journalDir, fleetSalt, warn)
-		}
+	// A salt that is not the journal's is noted, so that once the journal has a
+	// fleetd.json, re-filing finds this record whatever the environment then.
+	if fleetSalt != "" && !journals {
+		noteSalt(journalDir, fleetSalt, warn)
 	}
 	return recorded{id: c.ID, host: h, file: filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl")}, nil
 }
@@ -551,7 +559,7 @@ func printSyncStatus(stdout io.Writer, dir string) {
 	}
 	switch st, ok := readSyncStatus(dir); {
 	case !ok:
-		fmt.Fprintln(stdout, "this machine has not synced this journal yet; the other machines' records may be missing")
+		fmt.Fprintln(stdout, "no sync of this journal is noted on this machine yet; the other machines' records may be missing or out of date")
 	case st.LastAttempt != nil && st.LastAttempt.Error != "":
 		fmt.Fprintf(stdout, "this machine's last sync, %s, FAILED: %s\n", ago(st.LastAttempt.At), st.LastAttempt.Error)
 		if st.LastSuccess != nil {

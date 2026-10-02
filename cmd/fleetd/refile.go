@@ -67,53 +67,61 @@ func otherIdentities(dir, gitDir string, me hostOut) []hostOut {
 // record was written under for want of the journal's fleetd.json: --salt or
 // FLEET_SALT. Once the journal has fleetd.json, re-filing finds those records by
 // it, whatever the environment of the sync that files them.
+// A journal directory at the root of a filesystem has nothing beside it, and gets
+// no note: saltsNote is then empty.
 func saltsNote(dir string) string {
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
+	if filepath.Dir(dir) == dir {
+		return ""
+	}
 	return filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".salts")
 }
 
-// noteSalt adds salt to dir's salts note, once.
+// noteSalt adds salt to dir's salts note, once: a line holding it as a JSON
+// string, so that it reads back exactly, and so that hooks noting at once each
+// append a whole line.
 func noteSalt(dir, salt string, warn io.Writer) {
 	if slices.Contains(notedSalts(dir), salt) {
 		return
 	}
 	path := saltsNote(dir)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err == nil {
-		_, err = f.WriteString(salt + "\n")
-		if cerr := f.Close(); err == nil {
-			err = cerr
+	err := errors.New("a journal directory at the root of a filesystem has nothing beside it")
+	if path != "" {
+		var f *os.File
+		if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600); err == nil {
+			line, _ := json.Marshal(salt)
+			_, err = f.Write(append(line, '\n'))
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
 		}
 	}
 	if err != nil {
-		fmt.Fprintf(warn, "fleetd: warning: could not note this record's salt in %s (%v); once the journal has %s, "+
-			"only a sync with the same salt in FLEET_SALT files it under the fleet's\n", path, err, gitsync.FleetFile)
+		fmt.Fprintf(warn, "fleetd: warning: could not note this record's salt beside %s (%v); once the journal has %s, "+
+			"only a sync with the same salt in FLEET_SALT files it under the fleet's\n", dir, err, gitsync.FleetFile)
 	}
 }
 
 // notedSalts returns the salts dir's salts note holds.
 func notedSalts(dir string) []string {
-	data, err := os.ReadFile(saltsNote(dir))
+	path := saltsNote(dir)
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	return lines(data)
-}
-
-// refilePending reports whether dir holds a file refile would move.
-func refilePending(ctx context.Context, dir string, me hostOut) bool {
-	gitDir, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--absolute-git-dir")
-	if err != nil {
-		return false
-	}
-	for _, o := range otherIdentities(dir, strings.TrimSpace(gitDir), me) {
-		if movable(ctx, dir, journal.FileName(o.ID)+".jsonl") {
-			return true
+	var salts []string
+	for _, line := range strings.Split(string(data), "\n") {
+		var salt string
+		if json.Unmarshal([]byte(line), &salt) == nil {
+			salts = append(salts, salt)
 		}
 	}
-	return false
+	return salts
 }
 
 // copyAt returns name's content at rev. ok is false when rev has no such file;
@@ -365,7 +373,7 @@ func fileMoved(ctx context.Context, dir, keep string, me hostOut, moved map[stri
 		if !known {
 			continue
 		}
-		n, read, skipped, err := refileOne(store, filepath.Join(keep, copyName), from, me, have, published)
+		n, read, skipped, err := refileOne(ctx, store, filepath.Join(keep, copyName), from, me, have, published)
 		total += n
 		if err != nil {
 			return total, err
@@ -410,13 +418,20 @@ func publishedIDs(ctx context.Context, dir, name string) (ids map[string]bool, k
 // that is not in published and that have lacks once filed under me, and adds it
 // to have. A line that is not a record of identity from is skipped and counted.
 // read is how many bytes of path it read; a final line without a newline may
-// still be being written, and is read again once the file grows.
-func refileOne(store *journal.Store, path, from string, me hostOut, have, published map[string]bool) (added int, read int64, skipped int, err error) {
+// still be being written, and is read again once the file grows. Once ctx ends it
+// stops, reporting nothing read.
+func refileOne(ctx context.Context, store *journal.Store, path, from string, me hostOut, have, published map[string]bool) (added int, read int64, skipped int, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	for _, line := range lines(data[:bytes.LastIndexByte(data, '\n')+1]) {
+		// Each record costs an fsync, so a long backlog is bounded by the sync's
+		// time. What is left is read again next time; have keeps what this pass
+		// filed from being filed twice.
+		if err := ctx.Err(); err != nil {
+			return added, 0, skipped, err
+		}
 		var r struct{ ID string }
 		if json.Unmarshal([]byte(line), &r) == nil && published[r.ID] {
 			continue

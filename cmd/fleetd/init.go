@@ -69,22 +69,14 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 			from, url, gitsync.FleetFile, from)
 	}
 
-	// The journal is set up. Syncing now publishes this machine's records, brings
-	// the journal's fleetd.json into a clone that lacked it, and, once it has
-	// been in place long enough for every hook to use it, files under this
-	// machine's fleet identity the records it wrote under another.
+	// The journal is set up, with its fleetd.json in place. Syncing now publishes
+	// this machine's records and, once fleetd.json has been in place long enough
+	// for every hook to use it, files under this machine's fleet identity the
+	// records it wrote under another.
 	h := identity(res.Salt)
-	var published int
-	var syncErr error
-	for pass := 0; pass < 2 && syncErr == nil; pass++ {
-		if pass == 1 && !refilePending(ctx, journalDir, h) {
-			break
-		}
-		waitForFleetFile(journalDir, deadline)
-		var r gitsync.Result
-		r, _, syncErr = syncJournal(journalDir, h, time.Until(deadline), *reclaim, stderr)
-		published += r.Published
-	}
+	waitForFleetFile(journalDir, deadline)
+	r, _, syncErr := syncJournal(journalDir, h, time.Until(deadline), *reclaim, stderr)
+	published := r.Published
 
 	failed := finalSyncError(syncErr, *reclaim)
 	if *asJSON {
@@ -101,8 +93,10 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		return failed
 	}
 	switch {
-	case res.Started:
+	case res.Started && given == "":
 		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with a new salt for this fleet\n", url, gitsync.FleetFile)
+	case res.Started:
+		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with the salt this machine was given\n", url, gitsync.FleetFile)
 	case res.WroteFleetFile && given == "":
 		fmt.Fprintf(stdout, "added %s to %s, with a new salt for this fleet\n", gitsync.FleetFile, url)
 	case res.WroteFleetFile:
@@ -153,8 +147,7 @@ func saltMismatch(from, where string) error {
 
 // waitForFleetFile waits, at most until deadline, for the journal's fleetd.json
 // to have been in place for refileSettle, so that the sync after it can file the
-// records this machine wrote under another identity. A clone that has none yet
-// gets it from that sync, and re-files at the next.
+// records this machine wrote under another identity.
 func waitForFleetFile(dir string, deadline time.Time) {
 	info, err := os.Stat(filepath.Join(dir, gitsync.FleetFile))
 	if err != nil {

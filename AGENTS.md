@@ -280,8 +280,9 @@ was wrong:
   still had the file open appends to the moved copy, and the next sync files that
   record too. A re-filed record carries
   `refiled.from`, the id it was written under, and `where` does not take it for
-  the machine's latest activity; one that the mark would take past the 4096-byte
-  record limit is filed without it. When no stable source is readable it
+  the machine's latest activity. One that the mark would take past the 4096-byte
+  record limit is filed whole and unmarked, and `where` and `last_published` may
+  then take it for the latest. When no stable source is readable it
   degrades to the hostname and says so: `stable: false` means the attribution will
   change if the machine is renamed and may collide with another machine of that
   name. A weak identity is labelled weak rather than presented as a strong one.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	osexec "os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -663,15 +665,56 @@ func TestARecordNearTheSizeLimitIsStillFiled(t *testing.T) {
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
 		t.Fatal(err)
 	}
+	// A process that had the file open appends to the moved copy, so the next
+	// sync reads it again, the long record included.
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	moved, err := filepath.Glob(filepath.Join(dir, ".git", "fleetd-pre-init", plain+".*"))
+	if err != nil || len(moved) != 1 {
+		t.Fatalf("moved copies %v (%v), want one", moved, err)
+	}
+	f, err := os.OpenFile(moved[0], os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(recordLine(t, "appended to the moved copy")); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
 	recordWithout(t, dir, "--note", "fourth, written later")
 	fleetFileAged(t, dir)
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
 		t.Fatal(err)
 	}
-	for _, note := range []string{"first, before the long one", long, "third, after the long one", "fourth, written later"} {
+	for _, note := range []string{"first, before the long one", long, "third, after the long one", "appended to the moved copy", "fourth, written later"} {
 		if _, ok := remoteHostRecords(t, remote, "s", note); !ok {
 			t.Errorf("%.30q is on no remote file", note)
 		}
+	}
+	if n := remoteCount(t, remote, long); n != 1 {
+		t.Errorf("the long record is on the remote %d times, want once", n)
+	}
+}
+
+// A line too large to file even unmarked, from a process that does not keep to
+// the limit, is skipped: it stops nothing, and the records after it are filed.
+func TestARecordTooLargeEvenUnmarkedIsSkipped(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	huge := strings.Replace(recordLine(t, "x"), `"note":"x"`, `"note":"`+strings.Repeat("y", journal.MaxRecordBytes)+`"`, 1)
+	if err := os.WriteFile(filepath.Join(dir, plain), []byte(huge), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "after the huge one")
+	fleetFileAged(t, dir)
+	if _, stderr, err := exec(t, "sync", "--dir", dir); err != nil || !strings.Contains(stderr, "1 record") {
+		t.Fatalf("sync: %v; stderr %q, want a warning naming the record not filed", err, stderr)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "after the huge one"); !ok {
+		t.Fatal("the record after the huge one was never filed")
 	}
 }
 
@@ -681,8 +724,13 @@ func TestARecordWrittenUnderFleetSaltBeforeInitIsFiledWithoutIt(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	t.Setenv("FLEET_SALT", "a-salt-of-its-own")
-	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under FLEET_SALT"); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under FLEET_SALT"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := notedSalts(dir); !slices.Equal(got, []string{"a-salt-of-its-own"}) {
+		t.Fatalf("the salts note holds %q, want the salt once", got)
 	}
 	t.Setenv("FLEET_SALT", "")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -694,6 +742,82 @@ func TestARecordWrittenUnderFleetSaltBeforeInitIsFiledWithoutIt(t *testing.T) {
 	}
 	if _, ok := remoteHostRecords(t, remote, "s", "written under FLEET_SALT"); !ok {
 		t.Fatal("a record written under FLEET_SALT before init is on no remote file")
+	}
+}
+
+// Re-filing a long backlog stops when the sync's time runs out, files nothing
+// more, and reports nothing read, so the next pass reads the copy again.
+func TestRefilingStopsWhenItsTimeRunsOut(t *testing.T) {
+	store, err := journal.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backlog := filepath.Join(t.TempDir(), "moved")
+	data := recordLine(t, "one") + recordLine(t, "two")
+	if err := os.WriteFile(backlog, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	from, me := hostID(t, "--salt", "", "--dir", t.TempDir()), identity("s")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if added, read, _, err := refileOne(ctx, store, backlog, from, me, map[string]bool{}, map[string]bool{}); !errors.Is(err, context.Canceled) || added != 0 || read != 0 {
+		t.Fatalf("with its time run out: %d filed, %d bytes read, err %v; want none, and the cancellation", added, read, err)
+	}
+	if added, read, _, err := refileOne(context.Background(), store, backlog, from, me, map[string]bool{}, map[string]bool{}); err != nil || added != 2 || read != int64(len(data)) {
+		t.Fatalf("with time: %d filed, %d bytes read, err %v; want both records and the whole copy", added, read, err)
+	}
+}
+
+// A salt is noted exactly as given, a trailing carriage return included, so the
+// records written under it are found again.
+func TestASaltEndingInACarriageReturnIsNotedExactly(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	t.Setenv("FLEET_SALT", "abc\r")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under a salt ending in CR"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "")
+	if got := notedSalts(dir); !slices.Equal(got, []string{"abc\r"}) {
+		t.Fatalf("the salts note holds %q, want \"abc\\r\"", got)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "written under a salt ending in CR"); !ok {
+		t.Fatal("a record written under a salt ending in CR is on no remote file")
+	}
+}
+
+// A record written under FLEET_SALT while the journal's fleetd.json is unusable
+// was written under FLEET_SALT, not the journal's salt, and is noted as such.
+func TestARecordWrittenBesideAnUnusableFleetFileIsFiled(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "x")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written beside an unusable fleetd.json"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "written beside an unusable fleetd.json"); !ok {
+		t.Fatal("the record is on no remote file")
+	}
+}
+
+// A journal directory at the root of a filesystem has nothing beside it, and a
+// note inside it would be a file init refuses; it gets none.
+func TestAJournalAtAFilesystemRootGetsNoSaltsNote(t *testing.T) {
+	if got := saltsNote(string(filepath.Separator)); got != "" {
+		t.Fatalf("saltsNote(%q) = %q, want none", string(filepath.Separator), got)
 	}
 }
 
@@ -792,6 +916,7 @@ func TestLastPublishedIsTheNewestRecordNotTheLastRefiledOne(t *testing.T) {
 		return time.Time{}
 	}
 	weekAgo := time.Now().Add(-7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	recordWithout(t, dir, "--note", "two weeks ago", "--at", weekAgo.Add(-7*24*time.Hour).Format(time.RFC3339))
 	recordWithout(t, dir, "--note", "a week ago", "--at", weekAgo.Format(time.RFC3339))
 	fleetFileAged(t, dir)
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {

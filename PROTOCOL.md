@@ -341,7 +341,8 @@ under this machine's fleet id the records it wrote under another salt (none or
 `$FLEET_SALT` before it knew the fleet's, a replaced `fleetd.json`'s, or the
 journal's previous one) that the old id never published, appending them to this
 machine's file with `refiled.from` set to the old id (left out when it would take
-the record past 4096 bytes). It moves their file into
+the record past 4096 bytes; `where` and `last_published` may then take that record
+for the latest). It moves their file into
 `.git/fleetd-pre-init/`, putting back a file git tracks as published, and files a
 record appended to the moved copy later at the next sync. A `--salt` or
 `$FLEET_SALT` a record was written under for want of `fleetd.json` is noted in

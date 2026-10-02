@@ -472,7 +472,7 @@ func TestWhereInsideAnotherRepositoryClaimsNothingAboutPublishing(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, claim := range []string{"published", "NOT PUBLISHED", "has not synced"} {
+	for _, claim := range []string{"published", "NOT PUBLISHED", "no sync of this journal is noted"} {
 		if strings.Contains(stdout, claim) {
 			t.Errorf("where says %q about a journal that is not a clone:\n%s", claim, stdout)
 		}
@@ -903,10 +903,11 @@ func TestASecondMachineHasTheOthersRecordsAfterInit(t *testing.T) {
 	}
 }
 
-// On a clone made before init, as a v0.1.0 machine has, init's first sync brings
-// in fleetd.json and its second files the records written under no salt: init
-// publishes them itself, without waiting for another sync.
-func TestInitPublishesWhatItsSecondPassFiles(t *testing.T) {
+// On a clone made before the journal had fleetd.json, as a v0.1.0 machine has,
+// init puts the journal's fleetd.json in place and files the records written
+// under no salt itself, without waiting for another sync, leaving nothing to
+// commit.
+func TestInitOnAnOldCloneFilesItsRecordsItself(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
@@ -928,6 +929,9 @@ func TestInitPublishesWhatItsSecondPassFiles(t *testing.T) {
 	if _, ok := remoteHostRecords(t, remote, "s", "recorded before init"); !ok {
 		t.Fatal("after init, the record written before it is on no remote file")
 	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after init:\n%s", out)
+	}
 }
 
 // init --salt that contradicts the journal's salt is refused, and sets nothing up.
@@ -942,5 +946,68 @@ func TestInitRefusesASaltThatContradictsTheJournalsAndSetsNothingUp(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("init set the journal up anyway: %v", err)
+	}
+}
+
+// A clone whose fleetd.json holds another salt than the journal's, edited by
+// hand or left by an earlier setup, gets the journal's from init, as a new clone
+// does, and the records written under the other salt are published under the
+// fleet's.
+func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "the-fleets" {
+		t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v), want the journal's salt", fleet, ok, err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
+		t.Fatal("the record written under the other salt is not published under the fleet's")
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after the sync:\n%s", out)
+	}
+}
+
+// A clone with no sync noted, such as one fleetd v0.1.0 synced, is not said
+// never to have synced: where says no sync is noted.
+func TestWhereOnACloneWithNoSyncNotedSaysSo(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "work"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "where", "--dir", dir)
+	if err != nil || !strings.Contains(stdout, "no sync of this journal is noted") || strings.Contains(stdout, "has not synced") {
+		t.Fatalf("where: %v\n%s", err, stdout)
+	}
+}
+
+// init that starts an empty journal with the salt it was given says so, rather
+// than that the salt is new.
+func TestInitStartingAJournalWithAGivenSaltSaysSo(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	stdout, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
+	if err != nil || !strings.Contains(stdout, "with the salt this machine was given") || strings.Contains(stdout, "new salt") {
+		t.Fatalf("init: %v, %q; want it to say the salt was given", err, stdout)
 	}
 }

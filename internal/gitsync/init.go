@@ -283,8 +283,32 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if err := bootstrap(g, o, &res); err != nil {
 		return res, err
 	}
+	if err := adoptFleetFile(g, o.Dir, res.Head); err != nil {
+		return res, err
+	}
 	res.Restored, err = restoreMissing(g)
 	return res, err
+}
+
+// adoptFleetFile makes a clone's FleetFile the journal's, as placeFleetFile does
+// for a new one: a FleetFile with another salt, edited by hand or left by an
+// earlier setup, gives way. git writes the file, index and all. Its salt needs
+// no note here, unlike in a new clone: fleetd keeps the salt of every FleetFile
+// it reads in a clone, and notes it as past once the file holds another.
+func adoptFleetFile(g git, dir, tip string) error {
+	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+	if err != nil {
+		return err
+	}
+	have, err := os.ReadFile(filepath.Join(dir, FleetFile))
+	if err == nil && strings.ReplaceAll(string(have), "\r\n", "\n") == want {
+		return nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = g.line("checkout", tip, "--", FleetFile)
+	return err
 }
 
 // removeAbandonedClones removes the temporary clones beside dir that an init
