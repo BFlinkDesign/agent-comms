@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -138,8 +139,10 @@ type InitResult struct {
 // FleetFile into Dir so that every record from then on uses the journal's salt,
 // and only then moves the clone's git directory into Dir and checks out the
 // tracked files Dir lacks, overwriting none. A directory that is already a clone
-// has FleetFile added to its repository the same way, with plumbing, and its
-// work tree is left to the next sync.
+// has FleetFile added to its repository the same way, with plumbing; then the
+// journal's FleetFile replaces the one in its work tree, if they differ, and the
+// tracked files it lacks are checked out. The rest of its work tree is left to
+// the next sync.
 //
 // A repository without FleetFile gets it in a commit of its own, pushed at once;
 // an empty repository gets it as its first commit. One that already holds
@@ -283,31 +286,60 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if err := bootstrap(g, o, &res); err != nil {
 		return res, err
 	}
-	if err := adoptFleetFile(g, o.Dir, res.Head); err != nil {
+	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
 		return res, err
 	}
 	res.Restored, err = restoreMissing(g)
 	return res, err
 }
 
-// adoptFleetFile makes a clone's FleetFile the journal's, as placeFleetFile does
-// for a new one: a FleetFile with another salt, edited by hand or left by an
-// earlier setup, gives way. git writes the file, index and all. Its salt needs
-// no note here, unlike in a new clone: fleetd keeps the salt of every FleetFile
-// it reads in a clone, and notes it as past once the file holds another.
-func adoptFleetFile(g git, dir, tip string) error {
+// adoptFleetFile makes a clone's FleetFile the journal's, index and all, as
+// placeFleetFile does for a new one. A FleetFile with another salt, edited by
+// hand or left by an earlier setup, gives way, and its salt is noted in gitDir as
+// placeFleetFile notes it, so that init's own sync files the records this machine
+// wrote under it. The index gets the journal's entry, or a sync would keep the
+// file as this machine's change; git writes the file only when it sees it differ,
+// so that an equal one, CRLF endings and all, is never rewritten under a hook.
+func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
 	if err != nil {
 		return err
 	}
-	have, err := os.ReadFile(filepath.Join(dir, FleetFile))
-	if err == nil && strings.ReplaceAll(string(have), "\r\n", "\n") == want {
-		return nil
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	path := filepath.Join(dir, FleetFile)
+	have, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		f, perr := parseFleet(have, path)
+		w, _ := parseFleet([]byte(want), FleetFile)
+		if perr == nil && f.Salt != w.Salt {
+			if err := NotePastSalt(gitDir, f.Salt); err != nil {
+				return err
+			}
+		}
+	case !errors.Is(err, os.ErrNotExist):
 		return err
 	}
-	_, err = g.line("checkout", tip, "--", FleetFile)
+	// "<mode> blob <id>\t<path>" from the tree, "<mode> <id> 0\t<path>" from the index.
+	entry, err := g.line("ls-tree", tip, "--", FleetFile)
+	if err != nil {
+		return err
+	}
+	mode, rest, _ := strings.Cut(entry, " ")
+	id, _, _ := strings.Cut(strings.TrimPrefix(rest, "blob "), "\t")
+	staged, err := g.line("ls-files", "--stage", "--", FleetFile)
+	if err != nil {
+		return err
+	}
+	if staged != mode+" "+id+" 0\t"+FleetFile {
+		if _, err := g.line("update-index", "--add", "--cacheinfo", mode+","+id+","+FleetFile); err != nil {
+			return err
+		}
+	}
+	differs, err := g.raw(nil, "diff", "--name-only", "-z", "--", FleetFile)
+	if err != nil || differs == "" {
+		return err
+	}
+	_, err = g.line("checkout", "--", FleetFile)
 	return err
 }
 
@@ -532,32 +564,63 @@ const pastSaltsName = "fleetd-past-salts"
 
 // PastSalts returns the salts noted in gitDir, oldest first.
 func PastSalts(gitDir string) []string {
-	data, err := os.ReadFile(filepath.Join(gitDir, pastSaltsName))
-	if err != nil {
-		return nil
-	}
-	var salts []string
-	if json.Unmarshal(data, &salts) != nil {
-		return nil
-	}
-	return salts
+	return ReadSalts(filepath.Join(gitDir, pastSaltsName))
 }
 
 // NotePastSalt adds salt to the salts noted in gitDir.
 func NotePastSalt(gitDir, salt string) error {
-	salts := PastSalts(gitDir)
-	if slices.Contains(salts, salt) {
+	return AppendSalt(filepath.Join(gitDir, pastSaltsName), salt)
+}
+
+// AppendSalt adds salt to the salts file at path, once. Each salt is a line of
+// its own, holding it as a quoted Go string, so that it reads back exactly,
+// bytes that are not UTF-8 included. A line is appended in a single write, so
+// that processes noting salts at once lose none of them, as they would if each
+// rewrote the file. A symbolic link at path, which an account able to write
+// there could plant, is not written through.
+func AppendSalt(path, salt string) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write through the symbolic link %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if slices.Contains(parseSalts(data), salt) {
 		return nil
 	}
-	data, err := json.Marshal(append(salts, salt))
+	line := strconv.Quote(salt) + "\n"
+	// A write that failed partway, on a full disk say, left its line unfinished;
+	// this one starts a line of its own.
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		line = "\n" + line
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(gitDir, pastSaltsName)
-	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o600); err != nil {
-		return err
+	_, err = f.WriteString(line)
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	return RenameRetry(context.Background(), path+".tmp", path)
+	return err
+}
+
+// ReadSalts returns the salts in the salts file at path, oldest first. A line
+// that is not a whole quoted string is skipped.
+func ReadSalts(path string) []string {
+	data, _ := os.ReadFile(path)
+	return parseSalts(data)
+}
+
+func parseSalts(data []byte) []string {
+	var salts []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if salt, err := strconv.Unquote(line); err == nil {
+			salts = append(salts, salt)
+		}
+	}
+	return salts
 }
 
 // restoreMissing checks out every tracked file the work tree lacks, and returns

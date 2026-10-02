@@ -633,8 +633,20 @@ func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+			again, _, err := exec(t, "init", "--json", "--dir", dir, remote)
+			if err != nil {
 				t.Fatal(err)
+			}
+			var res struct {
+				Restored []string `json:"restored"`
+			}
+			if err := json.Unmarshal([]byte(again), &res); err != nil {
+				t.Fatalf("init --json: %v\n%s", err, again)
+			}
+			// With no sync in between, init itself checks out what the interrupted one
+			// did not, so the clone is whole even if init's own sync fails.
+			if !syncFirst && !slices.Contains(res.Restored, "host-0123456789abcdef.jsonl") {
+				t.Fatalf("init ran again restored %q, want another machine's file among them", res.Restored)
 			}
 			stdout, _, err := exec(t, "sync", "--dir", dir)
 			if err != nil || strings.Contains(stdout, "kept") {
@@ -966,11 +978,15 @@ func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
 	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+	stdout, _, err := exec(t, "init", "--dir", dir, remote)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "the-fleets" {
 		t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v), want the journal's salt", fleet, ok, err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
+		t.Fatalf("after init, the record written under the replaced salt is on no remote file; init said %q", stdout)
 	}
 	fleetFileAged(t, dir)
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
@@ -1009,5 +1025,134 @@ func TestInitStartingAJournalWithAGivenSaltSaysSo(t *testing.T) {
 	stdout, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
 	if err != nil || !strings.Contains(stdout, "with the salt this machine was given") || strings.Contains(stdout, "new salt") {
 		t.Fatalf("init: %v, %q; want it to say the salt was given", err, stdout)
+	}
+}
+
+// An old clone, made before the journal had fleetd.json, holding a copy of the
+// journal's fleetd.json put there by hand: init puts it in the index too, so no
+// sync keeps it as this machine's own change, and a later salt change reaches it.
+func TestInitAdoptsAnIdenticalFleetFileGitDoesNotTrack(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("journal\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "start")
+	gitIn(t, seed, "push", "--quiet", "-u", "origin", "main")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	first := filepath.Join(t.TempDir(), "first")
+	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	fleet, err := os.ReadFile(filepath.Join(first, gitsync.FleetFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), fleet, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "sync", "--dir", dir)
+	if err != nil || strings.Contains(stdout, "kept") {
+		t.Fatalf("sync after init: %v\n%s", err, stdout)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after the sync:\n%s", out)
+	}
+}
+
+// A clone checked out with CRLF line endings, as git for Windows does, already
+// holds the journal's fleetd.json: init leaves it as it is, rather than writing
+// it again and waiting for it to settle.
+func TestInitOnACRLFCloneLeavesItsFleetFileAlone(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "-c", "core.autocrlf=true", "clone", "--quiet", "--config", "core.autocrlf=true", remote, dir)
+	path := filepath.Join(dir, gitsync.FleetFile)
+	if data, err := os.ReadFile(path); err != nil || !strings.Contains(string(data), "\r\n") {
+		t.Fatalf("fleetd.json was not checked out with CRLF: %q (%v)", data, err)
+	}
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || !info.ModTime().Equal(old) {
+		t.Fatalf("init wrote fleetd.json again: modified %v (%v), want %v", info.ModTime(), err, old)
+	}
+}
+
+// A clone whose git converts no line endings holds the journal's fleetd.json with
+// CRLF endings, saved by a Windows editor: git sees it changed, so init checks
+// the journal's out over it. Left alone, it would keep every later change to the
+// journal's fleetd.json from reaching this machine.
+func TestInitChecksOutAFleetFileGitSeesAsChanged(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "-c", "core.autocrlf=false", "clone", "--quiet", "--config", "core.autocrlf=false", remote, dir)
+	path := filepath.Join(dir, gitsync.FleetFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(string(data), "\n", "\r\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(data) {
+		t.Fatalf("after init fleetd.json holds %q (%v), want git's copy %q", got, err, data)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after init:\n%s", out)
+	}
+}
+
+// init on a clone notes the salt of a fleetd.json it replaces before replacing
+// it. When the note cannot be written, init fails and leaves the file as it was,
+// so that running it again loses nothing.
+func TestInitOnACloneKeepsAFleetFileWhoseSaltItCannotNote(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The note cannot be written: a directory stands where it goes.
+	obstacle := filepath.Join(dir, ".git", "fleetd-past-salts")
+	if err := os.MkdirAll(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil {
+		t.Fatal("init replaced a fleetd.json whose salt it could not note")
+	}
+	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "another" {
+		t.Fatalf("after the failed init fleetd.json is %+v (%v, %v), want it as it was", fleet, ok, err)
+	}
+	if err := os.Remove(obstacle); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if past := gitsync.PastSalts(filepath.Join(dir, ".git")); !slices.Contains(past, "another") {
+		t.Fatalf("init run again did not note the replaced salt: %q", past)
 	}
 }

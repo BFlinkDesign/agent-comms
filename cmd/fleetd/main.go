@@ -221,9 +221,15 @@ func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt strin
 				journalDir, gitsync.FleetFile)
 		}
 		// A changed salt leaves this machine's records under the old one
-		// unpublished: noting it lets a sync file them under the new one.
+		// unpublished: noting it lets a sync file them under the new one. Until
+		// the note is written, the cache keeps the old salt, so the next run
+		// tries again.
 		if prev := cachedSalt(journalDir); prev != "" && prev != fleet.Salt {
-			_ = gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev)
+			if err := gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev); err != nil {
+				fmt.Fprintf(stderr, "fleetd: warning: could not note the salt %s's %s held before (%v); "+
+					"this machine's records under it are filed once a later run can\n", journalDir, gitsync.FleetFile, err)
+				return fleet.Salt, true, nil
+			}
 		}
 		cacheSalt(journalDir, fleet.Salt)
 		return fleet.Salt, true, nil

@@ -120,7 +120,7 @@ with anything but host journal files, `fleetd.json`, a README, a LICENSE,
 journal directory holding anything but journal files and `fleetd.json`. A
 directory that is already a clone of another repository is refused too. A
 `fleetd.json` already in the journal directory with another salt is replaced by the
-journal's, and the next sync files the records written under its salt under the
+journal's, and init's own sync files the records written under its salt under the
 journal's. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Running init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,

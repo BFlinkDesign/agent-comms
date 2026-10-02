@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -821,6 +822,120 @@ func TestAJournalAtAFilesystemRootGetsNoSaltsNote(t *testing.T) {
 	}
 }
 
+// A salt is noted exactly even when it is not valid UTF-8, which an environment
+// variable can be.
+func TestASaltThatIsNotUTF8IsNotedExactly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "journal")
+	var warn strings.Builder
+	noteSalt(dir, "ab\xffcd", &warn)
+	if got := notedSalts(dir); !slices.Equal(got, []string{"ab\xffcd"}) || warn.Len() != 0 {
+		t.Fatalf("the salts note holds %q (warning %q), want the salt exactly", got, warn.String())
+	}
+}
+
+// The salts note is never written through a symbolic link, which another
+// account able to write beside the journal could plant.
+func TestTheSaltsNoteIsNotWrittenThroughASymlink(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "journal")
+	target := filepath.Join(t.TempDir(), "someone-elses-file")
+	if err := os.WriteFile(target, []byte("theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, saltsNote(dir)); err != nil {
+		t.Skipf("cannot make a symbolic link here: %v", err)
+	}
+	var warn strings.Builder
+	noteSalt(dir, "x", &warn)
+	if data, _ := os.ReadFile(target); string(data) != "theirs\n" || !strings.Contains(warn.String(), "symbolic link") {
+		t.Fatalf("the link's target holds %q, warning %q; want it untouched and a warning", data, warn.String())
+	}
+}
+
+// A note of a past salt that cannot be written is tried again by the next run:
+// until it is written, the salt is remembered in the cache it would otherwise
+// leave, and the records written under it are filed once it is.
+func TestASaltNoteThatFailsIsTriedAgain(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "checkout", "--", gitsync.FleetFile)
+	// The note cannot be written: a directory stands where it goes.
+	obstacle := filepath.Join(dir, ".git", "fleetd-past-salts")
+	if err := os.MkdirAll(obstacle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fleetFileAged(t, dir)
+	if _, stderr, err := exec(t, "sync", "--dir", dir); err != nil || !strings.Contains(stderr, "could not note") {
+		t.Fatalf("sync with the note failing: %v; stderr %q, want a warning", err, stderr)
+	}
+	if err := os.Remove(obstacle); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
+		t.Fatal("once the note could be written, the record written under the other salt was still not filed")
+	}
+}
+
+// Re-filing waits until fleetd.json has been in place for a moment, so that a
+// hook that resolved its salt just before it appeared has finished appending.
+func TestRefilingWaitsForTheFleetFileToSettle(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "waits for fleetd.json to settle")
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	now := time.Now()
+	if err := os.Chtimes(filepath.Join(dir, gitsync.FleetFile), now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, plain)); err != nil {
+		t.Fatalf("a sync re-filed while fleetd.json was new: %v", err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "waits for fleetd.json to settle"); !ok {
+		t.Fatal("once fleetd.json had settled, the record was still not filed")
+	}
+}
+
+// Re-filing does nothing for an identity that is not the one the journal's
+// fleetd.json gives: it would file this machine's records under a stale id.
+func TestRefilingDoesNothingForAnIdentityThatIsNotTheJournals(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	recordWithout(t, dir, "--note", "not this identity's to file")
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	fleetFileAged(t, dir)
+	if n, err := refile(context.Background(), dir, filepath.Join(dir, ".git"), identity("not-the-journals"), io.Discard); n != 0 || err != nil {
+		t.Fatalf("refile for another identity filed %d records (%v), want none", n, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, plain)); err != nil {
+		t.Fatalf("refile for another identity moved the file: %v", err)
+	}
+}
+
 // A record an older fleetd wrote under FLEET_SALT has no note of its salt. A sync
 // that still has FLEET_SALT set files it.
 func TestARecordUnderAnUnnotedFleetSaltIsFiledWhileItIsSet(t *testing.T) {
@@ -967,6 +1082,9 @@ func TestInitReplacesALocalFleetFileAndPublishesItsRecords(t *testing.T) {
 			}
 			if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s2" {
 				t.Fatalf("fleetd.json is %+v (%v, %v), want the journal's", fleet, ok, err)
+			}
+			if _, ok := remoteHostRecords(t, remote, "s2", "under the local salt"); !ok {
+				t.Fatal("init's own sync did not publish the record written under the local fleetd.json's salt")
 			}
 			fleetFileAged(t, dir)
 			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {

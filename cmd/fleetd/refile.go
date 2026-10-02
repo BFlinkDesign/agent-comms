@@ -79,24 +79,13 @@ func saltsNote(dir string) string {
 	return filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".salts")
 }
 
-// noteSalt adds salt to dir's salts note, once: a line holding it as a JSON
-// string, so that it reads back exactly, and so that hooks noting at once each
-// append a whole line.
+// noteSalt adds salt to dir's salts note, as gitsync.AppendSalt does, and warns
+// when it cannot.
 func noteSalt(dir, salt string, warn io.Writer) {
-	if slices.Contains(notedSalts(dir), salt) {
-		return
-	}
 	path := saltsNote(dir)
 	err := errors.New("a journal directory at the root of a filesystem has nothing beside it")
 	if path != "" {
-		var f *os.File
-		if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600); err == nil {
-			line, _ := json.Marshal(salt)
-			_, err = f.Write(append(line, '\n'))
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
-		}
+		err = gitsync.AppendSalt(path, salt)
 	}
 	if err != nil {
 		fmt.Fprintf(warn, "fleetd: warning: could not note this record's salt beside %s (%v); once the journal has %s, "+
@@ -106,22 +95,10 @@ func noteSalt(dir, salt string, warn io.Writer) {
 
 // notedSalts returns the salts dir's salts note holds.
 func notedSalts(dir string) []string {
-	path := saltsNote(dir)
-	if path == "" {
-		return nil
+	if path := saltsNote(dir); path != "" {
+		return gitsync.ReadSalts(path)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var salts []string
-	for _, line := range strings.Split(string(data), "\n") {
-		var salt string
-		if json.Unmarshal([]byte(line), &salt) == nil {
-			salts = append(salts, salt)
-		}
-	}
-	return salts
+	return nil
 }
 
 // copyAt returns name's content at rev. ok is false when rev has no such file;

@@ -3,10 +3,12 @@ package gitsync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -377,5 +379,49 @@ func TestInitReportsAFirstPushThatFailsAtOnce(t *testing.T) {
 				t.Fatalf("err = %v after %d pushes, want %v after one", err, pushes, tc.want)
 			}
 		})
+	}
+}
+
+// Hooks that fire at once can each note a past salt, and none of the salts is
+// lost.
+func TestPastSaltsNotedAtOnceAreAllKept(t *testing.T) {
+	gitDir := t.TempDir()
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- NotePastSalt(gitDir, fmt.Sprintf("salt-%02d", i))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("noting a salt while others were noted: %v", err)
+		}
+	}
+	got := PastSalts(gitDir)
+	slices.Sort(got)
+	got = slices.Compact(got)
+	if len(got) != n {
+		t.Fatalf("%d of %d salts noted at once are kept: %q", len(got), n, got)
+	}
+}
+
+// A note whose last write stopped partway, on a full disk say, still takes the
+// next salt whole.
+func TestASaltNotedAfterAnUnfinishedLineIsKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "salts")
+	if err := os.WriteFile(path, []byte("\"first\"\n\"seco"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendSalt(path, "third"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadSalts(path); !slices.Equal(got, []string{"first", "third"}) {
+		t.Fatalf("the salts read back are %q, want first and third", got)
 	}
 }
