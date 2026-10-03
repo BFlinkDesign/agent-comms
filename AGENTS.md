@@ -138,8 +138,9 @@ origin has it; a record that cannot be read stops sync and init, saying so, and
 so does one that holds anything but a branch's name, give or take the byte order
 mark, carriage return and spaces an editor adds; recorded and gone from origin,
 it is left for a person, as a branch the remote deleted or renamed is (below). A
-gone branch the record does not name, such as a stray a person switched to, stops
-neither init nor sync: the record says where the journal is. A clone with no record, set
+gone branch the record does not name, such as a stray a person switched to, is not
+left for a person: sync says to run init, which puts the clone back on the recorded
+branch. A clone with no record, set
 up before init kept one, takes the branch it follows, of the same name on origin,
 if origin still has it, since a remote's default can change while its machines go
 on publishing where they did; else the remote's default, the branch its HEAD
@@ -215,8 +216,14 @@ a push that may make a branch the journal's notes, in the clone's git directory
 (`.git/fleetd-look`), that a look at origin's other branches is due, and only a
 look that finds no other journal clears it, so a look that fails, as when the
 network goes for a moment, or that finds one, is made again by every init until
-one finds none. A first init in a new directory whose push went through keeps
-its clone there, even when it fails after, so that init run again looks.
+one finds none. Till then no sync publishes: the clone may lack the journal's
+`fleetd.json`, and this machine's records would go out under another id; they
+wait, and the sync after init files them under the fleet's. A copy of the journal,
+a branch made from it, holds the commit that added `fleetd.json` to it, and is not
+a second journal. A first init in a new directory whose push went through, or
+whose look found another journal, keeps its clone there, even when it fails, so
+that init run again looks; one killed right after its push leaves the look due in
+the clone it left beside the journal directory, and the next init makes it.
 A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the

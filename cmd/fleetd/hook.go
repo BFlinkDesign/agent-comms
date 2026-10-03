@@ -650,7 +650,7 @@ func repoAndBranch(cwd string, wait time.Duration) (repo, branch string, err err
 		}
 		return "", "", fmt.Errorf("git could not read the repository at %s, so repo and branch are not recorded: %v", cwd, err)
 	}
-	top := strings.TrimSpace(out)
+	top := strings.TrimRight(out, "\r\n")
 	// A repository whose root is the home directory is named after the account,
 	// and these records are committed; the account name is published only with
 	// `fleetd record --include-user`.
@@ -669,7 +669,8 @@ func repoAndBranch(cwd string, wait time.Duration) (repo, branch string, err err
 		}
 		return repo, "", fmt.Errorf("git could not name the branch at %s: %v", cwd, err)
 	}
-	return repo, strings.TrimSpace(out), nil
+	// Only the line ending: a branch's name can end in a no-break space.
+	return repo, strings.TrimRight(out, "\r\n"), nil
 }
 
 // underGitCheckout reports whether dir, or a directory above it, holds .git. It

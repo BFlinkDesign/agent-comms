@@ -292,7 +292,10 @@ branch the journal is on, with nothing pushed or moved. Two machines that make t
 such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
 makes it until one finds no other journal (a first init in a new directory whose
-push went through keeps its clone there for that). A clone a person moved off the
+push went through, or whose look found one, keeps its clone there for that, and
+one killed right after its push leaves the look to the next init); a copy of the
+journal, a branch holding the commit that added `fleetd.json`, is not a second
+journal. Till the look is made, sync publishes nothing. A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch init recorded
@@ -300,8 +303,9 @@ when it last set the clone up (in `.git/fleetd-branch`, never committed; one
 holding anything but a branch's name, give or take an editor's byte order mark,
 carriage return and spaces, stops sync and init as one that cannot be read does),
 while origin has it, else, recorded and gone, none (init says what a person does,
-as for a gone branch); a gone branch the record does not name stops neither init
-nor sync; with no record, the branch it follows, of the same name on origin,
+as for a gone branch); a gone branch the record does not name is not left for a
+person (sync says to run init, which puts the clone back on the recorded one);
+with no record, the branch it follows, of the same name on origin,
 if origin still has it; else the remote's default, the branch its HEAD names; else
 its only branch. `--branch` names the journal's branch instead, where a person
 knows better; origin must have it, and init records it. Following several of
@@ -355,7 +359,8 @@ journal's branch, as when the remote deleted it meanwhile. Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository, on a branch with a commit that follows one of origin's; never
+journal repository whose init is done (no look due in `.git/fleetd-look`; else
+it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
 look, nor, once init has recorded the journal's branch, another of origin's. Any
 other clone (detached, an orphan branch, a branch that follows nothing, a branch

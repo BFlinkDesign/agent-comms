@@ -69,6 +69,10 @@ var (
 	// protection or a ruleset. No later push gets past it until a person changes
 	// the remote.
 	ErrRejected = errors.New("gitsync: the remote refused this machine's push")
+	// ErrLookDue means init has yet to finish setting the clone up: a push of its
+	// made a branch the journal's, and it has yet to look whether another machine
+	// made another branch the journal's at the same time.
+	ErrLookDue = errors.New("gitsync: init has yet to finish setting the journal up")
 )
 
 // gitConfig is the configuration every git command runs with. core.fsmonitor
@@ -299,6 +303,14 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	recorded, err := recordedBranch(gitDir)
 	if err != nil {
 		return res, err
+	}
+	// Nor while a look init made due is to come: till init has made it, the clone
+	// may lack the journal's fleetd.json, so this machine's records would go out
+	// under another id, or the journal may be on two branches. Records wait, and
+	// the sync after init files them under the fleet's id.
+	if _, err := os.Lstat(filepath.Join(gitDir, lookName)); err == nil {
+		return res, fmt.Errorf("%w: it has yet to look whether another machine made another branch the journal's at "+
+			"the same time; `fleetd init --dir \"%s\" <journal URL>` looks, and finishes", ErrLookDue, g.dir)
 	}
 	// Only a branch of origin's: fleetd's clone follows the journal there, and a
 	// branch of another remote, or of the clone, would take this machine's records
@@ -1060,7 +1072,8 @@ func clearStaleLocks(gitDir string) []string {
 
 // GitDir is the git directory of the clone whose top is dir, found as git finds
 // it, with no git process: dir/.git, or the directory a .git file there names
-// (gitdir: and a path, relative to dir unless absolute), as a clone made with
+// (gitdir: and a path, relative to dir's real path unless absolute, so that ..
+// through a link is the real parent, as git takes it), as a clone made with
 // --separate-git-dir has. ok is false when there is neither.
 func GitDir(dir string) (gitDir string, ok bool) {
 	path := filepath.Join(dir, ".git")
@@ -1080,7 +1093,11 @@ func GitDir(dir string) (gitDir string, ok bool) {
 		return "", false
 	}
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(dir, target)
+		base := dir
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			base = resolved
+		}
+		target = filepath.Join(base, target)
 	}
 	if info, err := os.Stat(target); err != nil || !info.IsDir() {
 		return "", false

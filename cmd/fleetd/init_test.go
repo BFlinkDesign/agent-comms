@@ -1944,3 +1944,81 @@ func TestWhereOnAJournalWhoseGitDirectoryIsElsewhereReadsFleetdsNotesThere(t *te
 		t.Fatalf("where: %v, want it to say the last sync failed:\n%s", err, stdout)
 	}
 }
+
+// A first init in a new directory whose fetch after its push fails keeps its
+// clone, with no fleetd.json yet, so that init run again makes the look the push
+// made due. A record written meanwhile is under no salt: sync waits for init
+// rather than publish it under that id for good, and the sync init runs then
+// files it under the fleet's, so the journal holds one file for this machine.
+func TestRecordsWrittenWhileALookIsDueArePublishedUnderTheFleetsId(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	remote := emptyJournalRemote(t)
+	work := filepath.Join(t.TempDir(), "work")
+	gitIn(t, filepath.Dir(work), "init", "--quiet", "--initial-branch=main", work)
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("about\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, work, "add", ".")
+	gitIn(t, work, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "readme")
+	gitIn(t, work, "push", "--quiet", remote, "main")
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// git, except that the first fetch after a push that went through fails.
+	bin := t.TempDir()
+	flag := filepath.Join(bin, "pushed")
+	script := "#!/bin/sh\ncase \" $* \" in\n*\" push \"*) " + real + " \"$@\"; rc=$?; [ $rc -eq 0 ] && : > " + flag + "; exit $rc;;\n" +
+		"*\" fetch \"*) if [ -e " + flag + " ]; then rm -f " + flag + "; echo 'fatal: unable to access the remote' >&2; exit 128; fi;;\nesac\n" +
+		"exec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil || !strings.Contains(err.Error(), "could not then look") {
+		t.Fatalf("init: %v, want it to say it could not look", err)
+	}
+	t.Setenv("PATH", path)
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "while the look was due"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrLookDue) {
+		t.Fatalf("sync while the look was due: %v, want ErrLookDue", err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	listing, err := osexec.Command("git", "--git-dir", remote, "ls-tree", "--name-only", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, name := range strings.Fields(string(listing)) {
+		if strings.HasSuffix(name, ".jsonl") {
+			files = append(files, name)
+		}
+	}
+	fleet, ok, err := gitsync.ReadFleet(dir)
+	if err != nil || !ok {
+		t.Fatalf("fleetd.json after init: %v, %v", ok, err)
+	}
+	if n, ok := remoteHostRecords(t, remote, fleet.Salt, "while the look was due"); len(files) != 1 || n != 1 || !ok {
+		t.Fatalf("the journal holds %v; want one file, the fleet id's, holding the record (%d records, found %v)", files, n, ok)
+	}
+}
+
+// The hook records a work repository and its branch as git names them: a name
+// can end in a no-break space, which is the name's own.
+func TestTheHookRecordsNamesThatEndInANoBreakSpace(t *testing.T) {
+	t.Parallel()
+	work := filepath.Join(t.TempDir(), "work\u00a0")
+	gitIn(t, filepath.Dir(work), "init", "--quiet", "--initial-branch=weg\u00a0", work)
+	repo, branch, err := lookupRepo(work, 10*time.Second)
+	if err != nil || repo != "work\u00a0" || branch != "weg\u00a0" {
+		t.Fatalf("lookupRepo = %q, %q, %v; want %q and %q", repo, branch, err, "work\u00a0", "weg\u00a0")
+	}
+}

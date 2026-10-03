@@ -61,6 +61,9 @@ var (
 	// ErrJournalElsewhere means the branch init would start the journal on holds
 	// none, while another of the repository's branches holds one.
 	ErrJournalElsewhere = errors.New("gitsync: the journal is on another branch")
+	// ErrTwoJournals means two machines made two branches the journal's at once,
+	// each with its own salt.
+	ErrTwoJournals = errors.New("gitsync: the journal was started on two branches at once")
 )
 
 // unnamedDefault is the branch init's clone of an empty repository is on when the
@@ -219,6 +222,9 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return res, err
 	}
+	// An init killed after its push left the look it made due only in its own
+	// clone, which this one replaces: this one makes it.
+	lookDue := abandonedLookDue(o.Dir)
 	removeAbandonedClones(o.Dir)
 	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
 	if err != nil {
@@ -248,12 +254,18 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := recordBranch(ctx, tmpGit, res.Branch); err != nil {
 		return res, err
 	}
+	if lookDue {
+		if err := os.WriteFile(filepath.Join(tmpGit, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
+			return res, err
+		}
+	}
 	if err := bootstrap(g, tmpGit, o, &res); err != nil {
-		// Once its push has made a branch the journal's, a look at origin's other
-		// branches is due, which only the clone notes: kept, as it is, in Dir, it
-		// has init run again finish setting it up, and look.
-		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil && res.WroteFleetFile &&
-			os.MkdirAll(o.Dir, 0o755) == nil {
+		// Once its push has made a branch the journal's, or a look found another
+		// journal, a look is due, which only the clone notes: kept, as it is, in
+		// Dir, it has init run again finish setting it up, and look, and every
+		// sync wait till then.
+		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil &&
+			(res.WroteFleetFile || errors.Is(err, ErrTwoJournals)) && os.MkdirAll(o.Dir, 0o755) == nil {
 			_ = RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git"))
 		}
 		return res, err
@@ -793,6 +805,13 @@ func removeAbandonedClones(dir string) {
 	}
 }
 
+// abandonedLookDue reports whether a clone an init left beside dir, as one
+// killed after its push does, notes a look as due.
+func abandonedLookDue(dir string) bool {
+	due, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".init-*", ".git", lookName))
+	return len(due) > 0
+}
+
 // startBranch names the branch the journal is on: the remote's default branch.
 // When that does not exist but the remote has exactly one branch, the journal is
 // on that one: a server that does not say which branch is its default (git
@@ -878,6 +897,11 @@ func recordBranch(ctx context.Context, gitDir, branch string) error {
 	f, err := os.CreateTemp(gitDir, "."+branchName+".*")
 	if err != nil {
 		return err
+	}
+	// The reader strips one byte order mark, as an editor may add; a name that
+	// starts with one keeps it.
+	if strings.HasPrefix(branch, "\ufeff") {
+		branch = "\ufeff" + branch
 	}
 	_, err = f.WriteString(branch + "\n")
 	if cerr := f.Close(); err == nil {
@@ -1085,7 +1109,24 @@ func look(g git, gitDir, branch string) error {
 		return err
 	}
 	if len(holding) > 0 {
-		return twoBranches(branch, holding)
+		// A copy of this journal, a branch made from it since, holds the commit
+		// that added FleetFile to it; a journal another machine started does not.
+		start, _ := g.line("log", "-1", "--format=%H", "--diff-filter=A", "refs/remotes/origin/"+branch, "--", FleetFile)
+		var others []string
+		for _, h := range holding {
+			if start != "" {
+				if _, err := g.line("merge-base", "--is-ancestor", start, "refs/remotes/origin/"+h); err == nil {
+					continue
+				}
+			}
+			others = append(others, h)
+		}
+		if err := g.ctx.Err(); err != nil {
+			return err
+		}
+		if len(others) > 0 {
+			return twoBranches(branch, others)
+		}
 	}
 	return os.RemoveAll(filepath.Join(gitDir, lookName))
 }
@@ -1099,11 +1140,11 @@ func couldNotLook(branch string, err error) error {
 // twoBranches says what a person does about a journal started on branch and on
 // others at once.
 func twoBranches(branch string, others []string) error {
-	return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s. Keep the repository's "+
+	return fmt.Errorf("%w, %s and %s. Keep the repository's "+
 		"default branch: on any machine whose journal follows the other one, delete the journal's .git directory (its "+
 		"records stay; left in place, its syncs stop once that branch is gone, until `fleetd init --dir \"<its "+
 		"journal directory>\" --branch <branch> <journal URL>` names the one kept); then delete the other branch, "+
-		"and run fleetd init again on those machines and on this one", branch, strings.Join(others, ", "))
+		"and run fleetd init again on those machines and on this one", ErrTwoJournals, branch, strings.Join(others, ", "))
 }
 
 // placeFleetFile writes the journal's FleetFile into dir, so that a record

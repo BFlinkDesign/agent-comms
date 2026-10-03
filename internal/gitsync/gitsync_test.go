@@ -220,6 +220,7 @@ func TestGitDirFindsTheDirectoryAGitFileNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	write(t, filepath.Join(plain, ".git", "HEAD"), "ref: refs/heads/main\n")
 	for _, c := range []struct {
 		name, file string
 		want       string
@@ -227,6 +228,7 @@ func TestGitDirFindsTheDirectoryAGitFileNames(t *testing.T) {
 		{"absolute", "gitdir: " + elsewhere + "\n", elsewhere},
 		{"relative, ending in CRLF", "gitdir: ../elsewhere.git\r\n", elsewhere},
 		{"naming nothing there", "gitdir: " + filepath.Join(root, "missing") + "\n", ""},
+		{"naming a file", "gitdir: " + filepath.Join(root, "plain", ".git", "HEAD") + "\n", ""},
 		{"not a .git file", "ref: refs/heads/main\n", ""},
 	} {
 		dir := filepath.Join(root, strings.ReplaceAll(c.name, " ", "-"))
@@ -243,6 +245,28 @@ func TestGitDirFindsTheDirectoryAGitFileNames(t *testing.T) {
 	}
 	if _, ok := GitDir(root); ok {
 		t.Error("GitDir found a git directory where there is none")
+	}
+}
+
+// GitDir takes a relative path from the journal directory's real path, as git
+// takes it: through a link to the journal directory, .. is its real parent.
+func TestGitDirTakesARelativePathFromTheRealDirectory(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	journal := filepath.Join(root, "real", "journal")
+	if err := os.MkdirAll(filepath.Join(root, "real", "journal.git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(journal, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(journal, ".git"), "gitdir: ../journal.git\n")
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(journal, alias); err != nil {
+		t.Skipf("no symbolic links here: %v", err)
+	}
+	if got, ok := GitDir(alias); !ok || !SameDir(got, filepath.Join(root, "real", "journal.git")) {
+		t.Errorf("through a link: GitDir = %q, %v; want the real journal.git", got, ok)
 	}
 }
 
