@@ -987,11 +987,13 @@ func TestAnInvalidFleetFileUsesTheSaltItLastHeldWhenThePastSaltsNoteFails(t *tes
 // about refreshing git's index. Moved again, it would be copied into the git
 // directory by every sync, without end.
 func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
-	t.Parallel()
 	remote := emptyJournalRemote(t)
-	if err := os.WriteFile(os.Getenv("GIT_CONFIG_GLOBAL"), []byte("[diff]\n\tautoRefreshIndex = false\n"), 0o600); err != nil {
+	// A configuration of its own: the one TestMain sets is every test's at once.
+	config := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(config, []byte("[diff]\n\tautoRefreshIndex = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GIT_CONFIG_GLOBAL", config)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
 		t.Fatal(err)

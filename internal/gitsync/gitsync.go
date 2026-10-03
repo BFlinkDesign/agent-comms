@@ -234,14 +234,16 @@ type git struct {
 	run Runner
 }
 
-// raw returns git's output untouched; line returns it with surrounding space trimmed.
+// raw returns git's output untouched; line returns it with the ASCII white space
+// around it trimmed, the newline git ends it with included. Other white space is
+// a name's own: a branch's name can end in a no-break space.
 func (g git) raw(stdin []byte, args ...string) (string, error) {
 	return g.run(g.ctx, g.dir, stdin, args...)
 }
 
 func (g git) line(args ...string) (string, error) {
 	out, err := g.raw(nil, args...)
-	return strings.TrimSpace(out), err
+	return strings.Trim(out, " \t\r\n"), err
 }
 
 // Sync publishes this host's complete records and brings in every other host's.
@@ -292,6 +294,12 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 
+	// The journal's branch, as init recorded it, decides what a clone off it is
+	// told, the upstream gone or not.
+	recorded, err := recordedBranch(gitDir)
+	if err != nil {
+		return res, err
+	}
 	// Only a branch of origin's: fleetd's clone follows the journal there, and a
 	// branch of another remote, or of the clone, would take this machine's records
 	// somewhere the fleet never looks. Full names, so that a branch here named
@@ -312,23 +320,16 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		if ctx.Err() != nil {
 			return res, err
 		}
-		return res, noUpstream(g)
+		return res, noUpstream(g, recorded)
 	}
 	branch, ok := strings.CutPrefix(upstream, "refs/remotes/origin/")
 	if !ok {
-		return res, noUpstream(g)
+		return res, noUpstream(g, recorded)
 	}
 	// Nor another of origin's branches than the one init set the clone up on, as
 	// after a person's git switch, or a repair cut short: init puts it back.
-	recorded, err := recordedBranch(gitDir)
-	if err != nil {
-		return res, err
-	}
 	if recorded != "" && recorded != branch {
-		return res, fmt.Errorf("%w: it follows origin/%s, while the journal is on %s, the branch init set it up on: "+
-			"`fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, or says what "+
-			"stops it; if the journal has moved, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` puts it "+
-			"on <branch>", ErrNoUpstream, branch, recorded, g.dir, g.dir)
+		return res, offRecord(g, branch, recorded)
 	}
 	remote := "origin"
 	upstream = remote + "/" + branch
@@ -337,7 +338,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		if ctx.Err() != nil {
 			return res, err
 		}
-		return res, noUpstream(g)
+		return res, noUpstream(g, recorded)
 	}
 	// A branch with no commit yet, as a plain clone of the repository made while
 	// it was empty has once it fetches, follows a branch that resolves.
@@ -346,7 +347,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		if ctx.Err() != nil {
 			return res, err
 		}
-		return res, noUpstream(g)
+		return res, noUpstream(g, recorded)
 	}
 
 	ssh := batchSSH(g)
@@ -754,7 +755,7 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 // branch's files lack. A current branch that follows one of origin's the clone no
 // longer has is told so instead: the remote may have deleted or renamed it, and
 // init would not know where the journal went.
-func noUpstream(g git) error {
+func noUpstream(g git, recorded string) error {
 	head, err := g.line("symbolic-ref", "--quiet", "HEAD")
 	if err != nil && g.ctx.Err() != nil {
 		return err
@@ -764,12 +765,26 @@ func noUpstream(g git) error {
 		if err != nil {
 			return err
 		}
+		// A gone branch the record does not name, a stray a person switched to,
+		// is not the journal's: init puts the clone back on the recorded one.
+		if theirs != "" && recorded != "" && recorded != theirs {
+			return offRecord(g, theirs, recorded)
+		}
 		if theirs != "" {
 			return goneError(g, head, theirs)
 		}
 	}
 	return fmt.Errorf("%w: `fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, "+
 		"or says what stops it", ErrNoUpstream, g.dir)
+}
+
+// offRecord says what to do about a clone that follows origin's branch, while
+// the journal is on recorded, the branch init set the clone up on.
+func offRecord(g git, branch, recorded string) error {
+	return fmt.Errorf("%w: it follows origin/%s, while the journal is on %s, the branch init set it up on: "+
+		"`fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, or says what "+
+		"stops it; if the journal has moved, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` puts it "+
+		"on <branch>", ErrNoUpstream, branch, recorded, g.dir, g.dir)
 }
 
 // goneUpstream names the branch of origin's that the branch head follows when
@@ -795,12 +810,76 @@ func goneUpstream(g git, head string) (string, error) {
 // command a person might paste. Only a person knows where the journal went after
 // a rename, or a deletion on purpose, so the way on is init told the branch.
 func goneError(g git, head, theirs string) error {
+	back, err := pushBack(g, theirs)
+	if err != nil {
+		return err
+	}
 	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
 		"it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` "+
 		"puts the clone on <branch>, the one the journal is on now; if it was deleted by mistake, push it back from "+
-		"the machine that synced last, with `git push origin HEAD:<branch>` in its journal directory and %s for "+
-		"<branch>, and every machine's next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"),
-		theirs, g.dir, theirs)
+		"the machine that synced last, as fleetd sync there says; %s; every machine's next sync then takes it up again",
+		ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs, g.dir, back)
+}
+
+// pushBack says how this clone would push theirs, a branch of origin's the remote
+// no longer has, back, were it the machine that synced last: from its own copy
+// of the branch, never from HEAD, which a person may have moved to a stale copy
+// or off the journal altogether.
+func pushBack(g git, theirs string) (string, error) {
+	local, held, err := copyOf(g, theirs)
+	switch {
+	case err != nil:
+		return "", err
+	case local != "":
+		return fmt.Sprintf("if that is this one, `git -C \"%s\" push origin refs/heads/<local>:refs/heads/<branch>`, "+
+			"with %s for <local> and %s for <branch>, pushes this clone's copy", g.dir, local, theirs), nil
+	case len(held) > 0:
+		return fmt.Sprintf("if that is this one, its branches that follow it, %s, have moved apart: `git -C \"%s\" "+
+			"push origin refs/heads/<local>:refs/heads/<branch>`, with the one holding the journal's latest records "+
+			"for <local> and %s for <branch>, pushes it", strings.Join(held, ", "), g.dir, theirs), nil
+	}
+	return "no branch here follows it, so this clone has no copy of it to push", nil
+}
+
+// copyOf names this clone's copy of theirs, a branch of origin's the clone no
+// longer has: of the branches here that follow it, held, the one whose last
+// commit holds every other's, as the one each sync moved on does; of several
+// at that commit, the one named like it. local is "" when none follows it, and
+// when they have moved apart, none holding all the others' commits.
+func copyOf(g git, theirs string) (local string, held []string, err error) {
+	out, err := g.line("for-each-ref", "--format=%(objectname) %(upstream) %(refname)", "refs/heads/")
+	if err != nil {
+		return "", nil, err
+	}
+	tips, commits := map[string]string{}, map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		commit, rest, _ := strings.Cut(line, " ")
+		upstream, ref, _ := strings.Cut(rest, " ")
+		if name, ok := strings.CutPrefix(ref, "refs/heads/"); ok && upstream == "refs/remotes/origin/"+theirs {
+			tips[name], commits[commit] = commit, true
+			held = append(held, name)
+		}
+	}
+	slices.Sort(held)
+	newest := ""
+	switch {
+	case len(commits) == 1:
+		newest = tips[held[0]]
+	case len(commits) > 1:
+		out, err := g.line(append([]string{"merge-base", "--independent"}, mapKeys(commits)...)...)
+		if err != nil {
+			return "", nil, err
+		}
+		if heads := strings.Fields(out); len(heads) == 1 {
+			newest = heads[0]
+		}
+	}
+	for _, name := range held {
+		if tips[name] == newest && (local == "" || name == theirs) {
+			local = name
+		}
+	}
+	return local, held, nil
 }
 
 // branchName is the file, in a clone's git directory, that records the journal's
@@ -816,19 +895,46 @@ func RecordedBranch(gitDir string) (string, error) {
 
 // recordedBranch is the journal's branch as init last set up the clone whose git
 // directory is gitDir, or "" when init never recorded one, as for a clone set up
-// before it did. A record that cannot be read, a directory or a FIFO put there,
-// say, is an error, never taken for none.
+// before it did, or the record is empty. A record that cannot be read, a
+// directory or a FIFO put there, say, is an error, never taken for none, and so
+// is one that holds anything but a branch name and the white space and byte
+// order mark an editor may add: UTF-16, say, or two lines.
 func recordedBranch(gitDir string) (string, error) {
 	path := filepath.Join(gitDir, branchName)
 	data, err := readRegular(path, 4096)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
-	if err != nil {
-		return "", fmt.Errorf("gitsync: %s, init's record of the journal's branch, cannot be read (%v); delete it, then "+
-			"run fleetd init again", path, err)
+	if err == nil {
+		name := strings.Trim(strings.TrimPrefix(string(data), "\ufeff"), " \t\r\n")
+		if name == "" || branchLike(name) {
+			return name, nil
+		}
+		err = errors.New("it holds no branch name")
 	}
-	return strings.TrimSpace(string(data)), nil
+	return "", fmt.Errorf("gitsync: %s, init's record of the journal's branch, cannot be read (%v); delete it, then "+
+		"run fleetd init again", path, err)
+}
+
+// branchLike reports whether git takes name for a branch's, as git
+// check-ref-format does refs/heads/name: no control character, space, ~, ^, :,
+// ?, *, [ or \, no .. or @{, no empty path component, none that starts with a dot
+// or ends with .lock, and no dot at the end.
+func branchLike(name string) bool {
+	if strings.HasSuffix(name, ".") || strings.Contains(name, "..") || strings.Contains(name, "@{") {
+		return false
+	}
+	for _, c := range []byte(name) {
+		if c < 0x20 || c == 0x7f || strings.IndexByte(" ~^:?*[\\", c) >= 0 {
+			return false
+		}
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part[0] == '.' || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
 }
 
 // refetchGone fetches when HEAD's branch follows one of origin's that this clone
@@ -950,6 +1056,36 @@ func clearStaleLocks(gitDir string) []string {
 		return nil
 	})
 	return cleared
+}
+
+// GitDir is the git directory of the clone whose top is dir, found as git finds
+// it, with no git process: dir/.git, or the directory a .git file there names
+// (gitdir: and a path, relative to dir unless absolute), as a clone made with
+// --separate-git-dir has. ok is false when there is neither.
+func GitDir(dir string) (gitDir string, ok bool) {
+	path := filepath.Join(dir, ".git")
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if info.IsDir() {
+		return path, true
+	}
+	data, err := readRegular(path, 4096)
+	if err != nil {
+		return "", false
+	}
+	target, ok := strings.CutPrefix(strings.TrimRight(string(data), "\r\n"), "gitdir: ")
+	if !ok || target == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(dir, target)
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() {
+		return "", false
+	}
+	return filepath.Clean(target), true
 }
 
 // SameDir reports whether two paths name the same directory, after resolving

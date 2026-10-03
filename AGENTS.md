@@ -134,13 +134,12 @@ follows nothing, a branch of the clone or another remote's, or with no commit
 yet, as a plain clone of the repository made while it was empty has, is put back
 on it by init. The journal's branch is the one init recorded when it last set
 the clone up, in a file of the clone's git directory (`.git/fleetd-branch`), while
-origin has it; a record that cannot be read stops sync and init, saying so;
-recorded and gone from origin, it is left for a person, as a branch the remote
-deleted or renamed is (below), except that a branch deleted by mistake is pushed
-back from the branch here that followed it, never from HEAD, which is then not
-the journal's; init names it. A gone branch the record does not name, such as a
-stray a person switched to, does not stop init: the record says where the
-journal is. A clone with no record, set
+origin has it; a record that cannot be read stops sync and init, saying so, and
+so does one that holds anything but a branch's name, give or take the byte order
+mark, carriage return and spaces an editor adds; recorded and gone from origin,
+it is left for a person, as a branch the remote deleted or renamed is (below). A
+gone branch the record does not name, such as a stray a person switched to, stops
+neither init nor sync: the record says where the journal is. A clone with no record, set
 up before init kept one, takes the branch it follows, of the same name on origin,
 if origin still has it, since a remote's default can change while its machines go
 on publishing where they did; else the remote's default, the branch its HEAD
@@ -154,11 +153,13 @@ origin's branches somewhere else first, has its refspec's branch lines give way 
 one for every branch of origin's, as a clone has; its other lines stay. Such a
 line in a file the clone's config includes, for the fetch or for the branch, which
 init does not rewrite, is named instead, and init stops before HEAD moves, as a
-repair cut short; with the line gone, init run again finishes the repair. Only
+repair cut short; with the line gone, init run again, with `--branch` or
+without, finishes the repair. Only
 refs and git's index change, never a file, so
 this machine's records stay as they are, which git's own ways back (`git
-switch`, `git checkout`) refuse to promise; HEAD moves last, so init run again
-finishes a repair cut short. A branch with commits of its own is not moved, and
+switch`, `git checkout`) refuse to promise; the branch the clone is going to is
+recorded before anything moves, and HEAD moves last, so init run again finishes
+a repair cut short or stopped part way, and every sync till then says to run it. A branch with commits of its own is not moved, and
 init's sync then reports them.
 The repair is refused, with nothing moved, in a repository that is not a journal,
 in the middle of a rebase, merge, cherry-pick, revert or bisect, with a commit
@@ -177,8 +178,9 @@ untracked, and `fleetd where` lists its records as not published until it is
 deleted by hand. Sync syncs only a branch that follows one of origin's, and tells
 any other clone to run `fleetd init --dir "<dir>" <journal URL>`; one that follows
 another of origin's branches than the one init recorded, as `git switch stray`
-makes, is told the same, naming both, and init puts it back, unless `fleetd init
---branch` says the journal moved there. A clone with no record syncs with the
+makes, is told the same, naming both, even once the remote has deleted that
+branch, and init puts it back, unless `fleetd init --branch` says the journal
+moved there. A clone with no record syncs with the
 branch it follows, as before. Sync's and init's fetches take every branch of origin's,
 whatever the clone's own refspec, and leave its tags alone. They prune, so a
 branch the remote deleted or renamed goes from the clone too, a `--single-branch`
@@ -188,10 +190,16 @@ Their pushes go onto the tip they fetched and nowhere else, so a branch renamed
 or deleted in between refuses them, as a race lost. Only a person knows where the
 journal went: after a rename, or a deletion on purpose, `fleetd init --branch
 <branch>` puts the clone on the branch it is on now; a branch deleted by mistake
-is pushed back from the machine that synced last (`git push origin
-HEAD:<branch>` in its journal directory, naming origin's branch, which the
-machine's own may not be named after), and every machine's next sync takes it up
-again, since a sync whose branch is gone fetches once more before it says so.
+is pushed back from the machine that synced last, from that clone's copy of it,
+never from HEAD, which a person may have moved to an older copy or off the
+journal: the branch there that followed it and holds every other such branch's
+commits, as the one its syncs moved on does, the one named like it among
+branches at the same commit. Its sync or init spells the push out (`git -C
+"<dir>" push origin refs/heads/<local>:refs/heads/<branch>`, naming its branch
+and origin's), names branches that moved apart, none holding all the others'
+commits, as such, and on a clone with no such branch says it has no copy to
+push. Every machine's next sync then takes the branch up again, since a sync
+whose branch is gone fetches once more before it says so.
 When the repository has no branch yet, a
 clone with no commit and no ref of any kind (a branch, a tag, a stash) is told to
 delete its `.git` directory, which holds nothing, after which init sets the
@@ -202,7 +210,13 @@ empty repository at once, the one whose push loses takes the other's commit and
 salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default, and so are two machines
-that make two branches holding no journal, a README each, the journal's at once.
+that make two branches holding no journal, a README each, the journal's at once:
+a push that may make a branch the journal's notes, in the clone's git directory
+(`.git/fleetd-look`), that a look at origin's other branches is due, and only a
+look that finds no other journal clears it, so a look that fails, as when the
+network goes for a moment, or that finds one, is made again by every init until
+one finds none. A first init in a new directory whose push went through keeps
+its clone there, even when it fails after, so that init run again looks.
 A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the
@@ -339,7 +353,10 @@ Two defaults are deliberate and worth knowing before you use it:
   file on the journal's branch, as init recorded it, rather than its history. A machine whose syncs keep failing shows up there
   rather than looking idle. A journal directory that is not the top of a clone
   gets no such lines, and a machine git cannot answer for is left out of them, not
-  reported as unpublished.
+  reported as unpublished. A clone whose `.git` is a file naming its git directory
+  elsewhere, as `--separate-git-dir` makes, keeps these notes, init's record of
+  the journal's branch and the salt fleetd last read, in that directory, where
+  git and every sync find them.
 
 Three things about it are load-bearing, and each exists because the naive version
 was wrong:

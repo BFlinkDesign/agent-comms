@@ -45,8 +45,8 @@ type syncOutcome struct {
 // not a clone has nowhere to note it; a failure to note it is only a warning,
 // because the sync itself already did, or did not, do its work.
 func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, stderr io.Writer) {
-	gitDir := filepath.Join(dir, ".git")
-	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
+	gitDir, ok := gitsync.GitDir(dir)
+	if !ok {
 		return
 	}
 	path := filepath.Join(gitDir, syncStatusFile)
@@ -74,7 +74,11 @@ func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, 
 
 func readSyncStatus(dir string) (syncStatus, bool) {
 	var st syncStatus
-	data, err := os.ReadFile(filepath.Join(dir, ".git", syncStatusFile))
+	gitDir, ok := gitsync.GitDir(dir)
+	if !ok {
+		return st, false
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, syncStatusFile))
 	if err != nil || json.Unmarshal(data, &st) != nil {
 		return syncStatus{}, false
 	}
@@ -102,14 +106,16 @@ func publications(dir string, stems []string) (map[string]publication, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	top, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--show-toplevel")
-	if err != nil || !gitsync.SameDir(strings.TrimSpace(top), dir) {
+	if err != nil || !gitsync.SameDir(strings.TrimRight(top, "\r\n"), dir) {
 		return nil, false
 	}
 	// The journal is on the branch init recorded, whatever branch the clone was
 	// switched to since; a clone set up before init recorded one follows it.
 	want := "@{upstream}"
-	if recorded, err := gitsync.RecordedBranch(filepath.Join(dir, ".git")); err == nil && recorded != "" {
-		want = "refs/remotes/origin/" + recorded
+	if gitDir, ok := gitsync.GitDir(dir); ok {
+		if recorded, err := gitsync.RecordedBranch(gitDir); err == nil && recorded != "" {
+			want = "refs/remotes/origin/" + recorded
+		}
 	}
 	up, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--verify", "--quiet", want)
 	if up = strings.TrimSpace(up); err != nil || up == "" {

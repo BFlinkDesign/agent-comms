@@ -1764,6 +1764,34 @@ func TestInitPutsRightAFetchThatTakesOriginsBranchesElsewhere(t *testing.T) {
 			t.Fatalf("init: %v, want ErrNoUpstream naming the included line, for the fetch or the branch", err)
 		}
 	})
+	t.Run("the branch named, its remote in a file the clone's config includes", func(t *testing.T) {
+		t.Parallel()
+		remote, m := newFleet(t, 1)
+		a := m[0]
+		mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+		run(t, a, "--git-dir", remote, "branch", "trunk", "main")
+		run(t, a, "remote", "add", "backup", remote)
+		run(t, a, "fetch", "--quiet", "backup")
+		// The branch's section comes before the include, so the included line
+		// decides, whatever init writes into the section.
+		run(t, a, "config", "branch.trunk.description", "made before the include")
+		inc := filepath.Join(t.TempDir(), "branch.cfg")
+		write(t, inc, "[branch \"trunk\"]\n\tremote = backup\n")
+		run(t, a, "config", "--add", "include.path", filepath.ToSlash(inc))
+		_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Branch: "trunk"})
+		if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "then run fleetd init again, which finishes putting the clone back") {
+			t.Fatalf("init --branch trunk: %v, want ErrNoUpstream naming the included line", err)
+		}
+		write(t, inc, "")
+		if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "trunk" || !res.Reattached {
+			t.Fatalf("init = %+v, want the clone put on trunk, the branch named before", res)
+		}
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+		mustSync(t, options(a, "host-a"))
+		if got := run(t, a, "--git-dir", remote, "show", "trunk:host-a.jsonl"); got != `{"id":"hive:a1"}` {
+			t.Fatalf("trunk holds %q for host-a", got)
+		}
+	})
 	t.Run("a branch named @", func(t *testing.T) {
 		t.Parallel()
 		remote := newEmptyRemote(t)
@@ -1797,57 +1825,116 @@ func TestInitPutsRightAFetchThatTakesOriginsBranchesElsewhere(t *testing.T) {
 // the advice followed works.
 func TestARecordOfTheJournalsBranchThatCannotBeReadStopsSyncAndInit(t *testing.T) {
 	t.Parallel()
-	remote, m := fleet(t, 1)
-	a := m[0]
-	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
-	record := filepath.Join(a, ".git", branchName)
-	if got := strings.TrimSpace(readFile(t, record)); got != "main" {
-		t.Fatalf("init recorded %q, want main", got)
+	requireGit(t)
+	for _, c := range []struct {
+		name string
+		put  func(t *testing.T, record string)
+	}{
+		{"a directory", func(t *testing.T, record string) {
+			if err := os.Mkdir(record, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"UTF-16, as Windows PowerShell's > writes it", func(t *testing.T, record string) {
+			write(t, record, "\xff\xfem\x00a\x00i\x00n\x00\r\x00\n\x00")
+		}},
+		{"two lines", func(t *testing.T, record string) { write(t, record, "main\nmain\n") }},
+		{"a name git refuses for a branch", func(t *testing.T, record string) { write(t, record, "ma..in\n") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 1)
+			a := m[0]
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			record := filepath.Join(a, ".git", branchName)
+			if got := strings.TrimSpace(readFile(t, record)); got != "main" {
+				t.Fatalf("init recorded %q, want main", got)
+			}
+			if err := os.Remove(record); err != nil {
+				t.Fatal(err)
+			}
+			c.put(t, record)
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			for _, step := range []string{"sync", "init"} {
+				var err error
+				if step == "sync" {
+					_, err = Sync(context.Background(), options(a, "host-a"))
+				} else {
+					_, err = Init(context.Background(), InitOptions{URL: remote, Dir: a})
+				}
+				// The path is the one git gives for the git directory, which on
+				// Windows can be the long form of a short temporary path.
+				if err == nil || !strings.Contains(err.Error(), branchName+", init's record of the journal's branch, cannot be read") ||
+					!strings.Contains(err.Error(), "delete it, then run fleetd init again") {
+					t.Fatalf("%s: %v, want it to say the record cannot be read", step, err)
+				}
+			}
+			if err := os.Remove(record); err != nil {
+				t.Fatal(err)
+			}
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" {
+				t.Fatalf("init = %+v, want the clone on main", res)
+			}
+			mustSync(t, options(a, "host-a"))
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+				t.Fatalf("main holds %q for host-a", got)
+			}
+		})
 	}
-	if err := os.Remove(record); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(record, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
-	for _, step := range []string{"sync", "init"} {
-		var err error
-		if step == "sync" {
-			_, err = Sync(context.Background(), options(a, "host-a"))
-		} else {
-			_, err = Init(context.Background(), InitOptions{URL: remote, Dir: a})
-		}
-		// The path is the one git gives for the git directory, which on Windows
-		// can be the long form of a short temporary path.
-		if err == nil || !strings.Contains(err.Error(), branchName+", init's record of the journal's branch, cannot be read") ||
-			!strings.Contains(err.Error(), "delete it, then run fleetd init again") {
-			t.Fatalf("%s: %v, want it to say the record cannot be read", step, err)
-		}
-	}
-	if err := os.Remove(record); err != nil {
-		t.Fatal(err)
-	}
-	if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" {
-		t.Fatalf("init = %+v, want the clone on main", res)
-	}
-	mustSync(t, options(a, "host-a"))
-	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
-		t.Fatalf("main holds %q for host-a", got)
+}
+
+// A record an editor saved, with a byte order mark, a carriage return or spaces
+// around the name, still names the journal's branch; white space beyond ASCII,
+// which a branch's name can hold, is the name's own.
+func TestARecordAnEditorSavedStillNamesTheJournalsBranch(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, c := range []struct{ name, branch, saved string }{
+		{"a byte order mark and a carriage return", "main", "\ufeffmain\r\n"},
+		{"spaces and a blank line", "main", "  main \n\n"},
+		{"a name ending in a no-break space", "weg\u00a0", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote := newEmptyRemote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s", Branch: c.branch})
+			record := filepath.Join(a, ".git", branchName)
+			if got := readFile(t, record); got != c.branch+"\n" {
+				t.Fatalf("init recorded %q, want %q", got, c.branch+"\n")
+			}
+			if c.saved != "" {
+				write(t, record, c.saved)
+			}
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			mustSync(t, options(a, "host-a"))
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != c.branch || res.Reattached {
+				t.Fatalf("init = %+v, want the clone left on %q", res, c.branch)
+			}
+			if got := run(t, a, "--git-dir", remote, "show", c.branch+":host-a.jsonl"); got != `{"id":"hive:a1"}` {
+				t.Fatalf("%q holds %q for host-a", c.branch, got)
+			}
+		})
 	}
 }
 
 // The recorded branch, deleted from origin by mistake, is pushed back as init
 // says on a clone off it, switched to another branch or detached: never this
 // clone's HEAD, which is not the journal's, but the branch here that followed
-// the recorded one; with it back, init puts the clone on it again, keeping the
+// the recorded one and holds every other such branch's commits, the one named
+// like it among those at the same commit; branches that moved apart are named
+// as such. With it back, init puts the clone on it again, keeping the
 // journal's salt, and the other machine's next sync takes it up again.
 func TestARecordedBranchGoneIsPushedBackFromTheBranchThatHeldIt(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
+	a1, a2 := "{\"id\":\"hive:a1\"}\n", "{\"id\":\"hive:a2\"}\n"
 	for _, c := range []struct {
-		name string
-		off  func(t *testing.T, remote, a string)
+		name  string
+		off   func(t *testing.T, remote, a string)
+		local string // the branch init names for <local>, "" when they moved apart
+		push  string // the branch then pushed back
+		hostA string // host-a.jsonl as main then holds
 	}{
 		{"switched to a branch holding a README", func(t *testing.T, remote, a string) {
 			docs := filepath.Join(t.TempDir(), "docs")
@@ -1859,10 +1946,29 @@ func TestARecordedBranchGoneIsPushedBackFromTheBranchThatHeldIt(t *testing.T) {
 			run(t, docs, "push", "--quiet", remote, "docs")
 			run(t, a, "fetch", "--quiet", "origin")
 			run(t, a, "switch", "--quiet", "docs")
-		}},
+		}, "main", "main", a1},
 		{"detached", func(t *testing.T, remote, a string) {
 			run(t, a, "checkout", "--quiet", "--detach")
-		}},
+		}, "main", "main", a1},
+		{"detached, beside a copy at the same commit", func(t *testing.T, remote, a string) {
+			run(t, a, "branch", "--quiet", "--track", "copy", "origin/main")
+			run(t, a, "checkout", "--quiet", "--detach")
+		}, "main", "main", a1},
+		{"detached from a branch synced on since, beside main", func(t *testing.T, remote, a string) {
+			run(t, a, "switch", "--quiet", "-c", "mywork", "--track", "origin/main")
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+			mustSync(t, options(a, "host-a"))
+			run(t, a, "checkout", "--quiet", "--detach")
+		}, "mywork", "mywork", a1 + a2},
+		{"detached, beside a copy moved apart", func(t *testing.T, remote, a string) {
+			run(t, a, "branch", "--quiet", "--track", "apart", "origin/main")
+			for _, b := range []string{"main", "apart"} {
+				tree := run(t, a, "rev-parse", "refs/heads/"+b+"^{tree}")
+				commit := run(t, a, "commit-tree", tree, "-p", "refs/heads/"+b, "-m", "on "+b)
+				run(t, a, "update-ref", "refs/heads/"+b, commit)
+			}
+			run(t, a, "checkout", "--quiet", "--detach")
+		}, "", "main", a1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -1880,23 +1986,91 @@ func TestARecordedBranchGoneIsPushedBackFromTheBranchThatHeldIt(t *testing.T) {
 			if !errors.Is(err, ErrNoUpstream) || strings.Contains(err.Error(), "push origin HEAD") {
 				t.Fatalf("init: %v, want ErrNoUpstream, never saying to push this clone's HEAD", err)
 			}
-			want := "`git -C \"" + a + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with main for <local> and main for <branch>"
+			want := "`git -C \"" + a + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with " + c.local + " for <local> and main for <branch>"
+			if c.local == "" {
+				want = "its branches that follow it, apart, main, have moved apart"
+			}
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("init: %v, want it to say %s", err, want)
 			}
-			run(t, a, "push", "--quiet", "origin", "refs/heads/main:refs/heads/main")
+			run(t, a, "push", "--quiet", "origin", "refs/heads/"+c.push+":refs/heads/main")
 			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" || res.Salt != "s" || res.WroteFleetFile {
 				t.Fatalf("init = %+v, want the clone back on main, with salt s", res)
+			}
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != c.hostA {
+				t.Fatalf("main holds %q for host-a, want %q", got, c.hostA)
 			}
 			appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b2"}`)
 			mustSync(t, options(b, "host-b"))
 			if got := remoteFile(t, remote, "host-b.jsonl"); got != "{\"id\":\"hive:b1\"}\n{\"id\":\"hive:b2\"}\n" {
 				t.Fatalf("main holds %q for host-b", got)
 			}
-			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
-				t.Fatalf("main holds %q for host-a", got)
-			}
 		})
+	}
+}
+
+// A clone with no branch following the recorded branch, gone from origin, says
+// it has no copy to push, never sending a person in a circle from its sync to
+// its init; the machine that has one says how, and with the branch back from
+// there, init puts this clone on it again.
+func TestARecordedBranchGoneIsPushedBackFromAMachineThatHasACopy(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	mustInit(t, InitOptions{URL: remote, Dir: b, Salt: "s"})
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	mustSync(t, options(b, "host-b"))
+	run(t, a, "checkout", "--quiet", "--detach")
+	run(t, a, "branch", "--quiet", "-D", "main")
+	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a})
+	if want := "push it back from the machine that synced last, as fleetd sync there says; no branch here follows it, " +
+		"so this clone has no copy of it to push"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("init: %v, want ErrNoUpstream saying %s", err, want)
+	}
+	_, err = Sync(context.Background(), options(b, "host-b"))
+	if want := "`git -C \"" + b + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with main for <local> and main for <branch>"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("b's sync: %v, want ErrNoUpstream saying %s", err, want)
+	}
+	run(t, b, "push", "--quiet", "origin", "refs/heads/main:refs/heads/main")
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" || !res.Reattached || res.Salt != "s" {
+		t.Fatalf("init = %+v, want the clone back on main, with salt s", res)
+	}
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+}
+
+// A clone switched to a stray branch, which the remote then deleted, is told by
+// sync, as by init, that the journal is on the branch init recorded, and init
+// puts it back there: never to push the stray back, which would bring back a
+// branch the fleet does not publish to.
+func TestASyncOnAGoneStrayBranchSaysTheJournalIsOnTheRecordedOne(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	run(t, a, "push", "--quiet", "origin", "main:refs/heads/stray")
+	run(t, a, "fetch", "--quiet", "origin")
+	run(t, a, "switch", "--quiet", "-c", "stray", "--track", "origin/stray")
+	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/stray")
+	run(t, a, "fetch", "--quiet", "--prune", "origin")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	if want := "it follows origin/stray, while the journal is on main"; !errors.Is(err, ErrNoUpstream) ||
+		!strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "push it back") {
+		t.Fatalf("sync: %v, want ErrNoUpstream saying %s, and nothing of pushing the stray back", err, want)
+	}
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" || !res.Reattached {
+		t.Fatalf("init = %+v, want the clone back on main", res)
+	}
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
 	}
 }
 
@@ -1931,5 +2105,140 @@ func TestTwoMachinesAddingTheJournalToTwoBranchesAtOnceAreToldSo(t *testing.T) {
 	}
 	if errA == nil || !strings.Contains(errA.Error(), "the journal was started on two branches at once, main and docs") {
 		t.Fatalf("init: %v, want it told the journal was started on two branches at once", errA)
+	}
+}
+
+// readmeOnTwoBranches is a repository whose main and docs each hold a README and
+// no journal.
+func readmeOnTwoBranches(t *testing.T) string {
+	t.Helper()
+	remote := newEmptyRemote(t)
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "init", "--quiet", "--initial-branch=main", w)
+	identify(t, w)
+	write(t, filepath.Join(w, "README.md"), "about\n")
+	run(t, w, "add", ".")
+	run(t, w, "commit", "--quiet", "-m", "readme")
+	run(t, w, "push", "--quiet", remote, "main", "main:docs")
+	return remote
+}
+
+// failFetchAfterPush is a Runner whose first fetch after a push that went
+// through fails, as a network gone for a moment would have it; first runs before
+// the first push.
+func failFetchAfterPush(first func(ctx context.Context)) Runner {
+	ran, pushed := false, false
+	return func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "push") {
+			if !ran && first != nil {
+				ran = true
+				first(ctx)
+			}
+			out, err := Git(ctx, dir, stdin, args...)
+			pushed = err == nil
+			return out, err
+		}
+		if pushed && slices.Contains(args, "fetch") {
+			pushed = false
+			return "", errors.New("git fetch: exit status 128: fatal: unable to access the remote")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+}
+
+// A machine whose look at origin's other branches, after its push made a branch
+// that held no journal the journal's, fails, as when the network goes for a
+// moment, says so, and looks again when init runs again, in a new directory or
+// on a clone: another machine that made another branch the journal's at the
+// same time is found then, every time, not missed for good.
+func TestALookAfterThePushThatFailsIsMadeWhenInitRunsAgain(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, clone := range []bool{false, true} {
+		name := "a new directory"
+		if clone {
+			name = "a clone"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			remote := readmeOnTwoBranches(t)
+			a, b := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+			if clone {
+				run(t, filepath.Dir(a), "clone", "--quiet", remote, a)
+			}
+			var errB error
+			_, errA := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a",
+				Run: failFetchAfterPush(func(ctx context.Context) {
+					_, errB = Init(ctx, InitOptions{URL: remote, Dir: b, Salt: "b", Branch: "docs"})
+				})})
+			if errB != nil {
+				t.Fatalf("the other machine's init: %v", errB)
+			}
+			if errA == nil || !strings.Contains(errA.Error(), "could not then look whether another machine made another "+
+				"branch the journal's at the same time") || !strings.Contains(errA.Error(), "fleetd init run again looks again") {
+				t.Fatalf("init: %v, want it to say it could not look, and that init run again does", errA)
+			}
+			for range 2 {
+				_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"})
+				if err == nil || !strings.Contains(err.Error(), "the journal was started on two branches at once, main and docs") {
+					t.Fatalf("init run again: %v, want it told the journal was started on two branches at once", err)
+				}
+			}
+		})
+	}
+}
+
+// A journal started on an empty repository, or on a branch holding a README,
+// whose look at origin's other branches found none, leaves no look due: a copy
+// of the journal a person keeps on another branch later does not make init say
+// the journal was started on two branches at once.
+func TestNoLookIsLeftDueOnceOneFindsNoOtherJournal(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, c := range []struct {
+		name   string
+		remote func(t *testing.T) string
+	}{
+		{"an empty repository", newEmptyRemote},
+		{"a branch holding a README", readmeOnTwoBranches},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote := c.remote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			run(t, a, "--git-dir", remote, "branch", "--force", "kept", "main")
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" || res.Salt != "s" {
+				t.Fatalf("init run again = %+v, want the journal on main, with salt s", res)
+			}
+		})
+	}
+}
+
+// A look that fails with no other journal anywhere is made when init runs
+// again, with no --branch: the clone kept says which branch the journal went
+// on, not the remote's default. That init finishes setting the journal up, and
+// no init after it looks again.
+func TestALookThatFailedAndFindsNothingWhenMadeAgainIsNotMadeAgain(t *testing.T) {
+	t.Parallel()
+	remote := readmeOnTwoBranches(t)
+	a := filepath.Join(t.TempDir(), "a")
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Branch: "docs", Run: failFetchAfterPush(nil)})
+	if err == nil || !strings.Contains(err.Error(), "fleetd init run again looks again") {
+		t.Fatalf("init: %v, want it to say init run again looks", err)
+	}
+	if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); err != nil {
+		t.Fatalf("the clone init made does not note the look due: %v", err)
+	}
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"}); res.Branch != "docs" || res.Salt != "a" {
+		t.Fatalf("init run again = %+v, want the journal on docs, with salt a", res)
+	}
+	if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the look is still noted as due: %v", err)
+	}
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	if got := run(t, a, "--git-dir", remote, "show", "docs:host-a.jsonl"); got != `{"id":"hive:a1"}` {
+		t.Fatalf("docs holds %q for host-a", got)
 	}
 }

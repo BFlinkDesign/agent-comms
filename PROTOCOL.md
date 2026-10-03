@@ -288,14 +288,20 @@ on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
 on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
 no host journal file) while another branch holds one: it is refused, naming the
-branch the journal is on, with nothing pushed or moved. A clone a person moved off the
+branch the journal is on, with nothing pushed or moved. Two machines that make two
+such branches the journal's at once are told so: the push notes, in
+`.git/fleetd-look`, that a look at origin's other branches is due, and every init
+makes it until one finds no other journal (a first init in a new directory whose
+push went through keeps its clone there for that). A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch init recorded
-when it last set the clone up (in `.git/fleetd-branch`, never committed), while
-origin has it, else, recorded and gone, none (init says what a person does, as for
-a gone branch, but pushing back from the branch here that followed it, never from
-HEAD); a gone branch the record does not name stops nothing; with no record, the branch it follows, of the same name on origin,
+when it last set the clone up (in `.git/fleetd-branch`, never committed; one
+holding anything but a branch's name, give or take an editor's byte order mark,
+carriage return and spaces, stops sync and init as one that cannot be read does),
+while origin has it, else, recorded and gone, none (init says what a person does,
+as for a gone branch); a gone branch the record does not name stops neither init
+nor sync; with no record, the branch it follows, of the same name on origin,
 if origin still has it; else the remote's default, the branch its HEAD names; else
 its only branch. `--branch` names the journal's branch instead, where a person
 knows better; origin must have it, and init records it. Following several of
@@ -306,7 +312,9 @@ branches elsewhere first) has its refspec's branch lines replaced by one for eve
 branch of origin's, its other lines kept; such a line in an included file, for the
 fetch or for the branch, is named instead, init stopping before HEAD moves. Only
 refs and the index
-change, never a file, and HEAD last; the journal's branch here starts at origin's
+change, never a file; the branch the clone goes to is recorded first, so init run
+again, with or without `--branch`, finishes a repair stopped part way, and HEAD
+moves last; the journal's branch here starts at origin's
 tip and moves only forward to it, so one with commits of its own stays, and
 init's sync reports them. The repair is refused, with nothing moved, in a
 repository that is not a journal, in the middle of a rebase, merge, cherry-pick,
@@ -362,12 +370,16 @@ renamed goes from the clone too: a sync on a branch that followed it fetches onc
 more, in case it was pushed back, then stops, pushing nothing, which would bring
 the branch back, and says what a person does: after a rename, or a deletion on
 purpose, `fleetd init --branch <branch>` naming the branch the journal is on now;
-push one deleted by mistake back from the machine that synced last (`git push
-origin HEAD:<branch>`, naming origin's branch). Its push goes
+push one deleted by mistake back from the machine that synced last, from its copy
+of the branch, never HEAD (`git -C "<dir>" push origin
+refs/heads/<local>:refs/heads/<branch>`, its sync or init naming, of the branches
+there that followed it, the one holding every other's commits; it says when they
+moved apart, or when it has none). Its push goes
 onto the tip it fetched and nowhere else (`--force-with-lease` naming that tip),
 so a branch renamed or deleted in between refuses it, as a race lost. It notes
 each outcome in the clone's `.git/fleetd-sync.json`, which `fleetd where`
-reports. It publishes only this host's `<host-id>.jsonl`, up to its last
+reports; a clone whose `.git` is a file naming its git directory (as
+`--separate-git-dir` makes) keeps it, the record and the salt cache there. It publishes only this host's `<host-id>.jsonl`, up to its last
 complete line, in a commit built directly on the remote tip. It never rebases
 and never rewrites that file. A push rejected because another machine pushed
 first is retried, up to three attempts; a push the remote declines (a hook,

@@ -244,7 +244,18 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	} else if res.Branch, err = startBranch(g, o.URL, o.Dir); err != nil {
 		return res, err
 	}
-	if err := bootstrap(g, o, &res); err != nil {
+	tmpGit := filepath.Join(tmp, ".git")
+	if err := recordBranch(ctx, tmpGit, res.Branch); err != nil {
+		return res, err
+	}
+	if err := bootstrap(g, tmpGit, o, &res); err != nil {
+		// Once its push has made a branch the journal's, a look at origin's other
+		// branches is due, which only the clone notes: kept, as it is, in Dir, it
+		// has init run again finish setting it up, and look.
+		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil && res.WroteFleetFile &&
+			os.MkdirAll(o.Dir, 0o755) == nil {
+			_ = RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git"))
+		}
 		return res, err
 	}
 	// There is no work tree, so pointing the branch at the remote's tip is all
@@ -258,19 +269,16 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 			return res, err
 		}
 	}
-	if err := recordBranch(ctx, filepath.Join(tmp, ".git"), res.Branch); err != nil {
-		return res, err
-	}
 	// A sync must not start in Dir while Init is still filling its index: the
 	// lock moves into Dir with the git directory, and a hook's sync skips it.
-	lockPath := filepath.Join(tmp, ".git", syncLockName)
+	lockPath := filepath.Join(tmpGit, syncLockName)
 	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
 		return res, err
 	}
-	if err := placeFleetFile(g, o.Dir, filepath.Join(tmp, ".git"), res.Head); err != nil {
+	if err := placeFleetFile(g, o.Dir, tmpGit, res.Head); err != nil {
 		return res, err
 	}
-	if err := RenameRetry(ctx, filepath.Join(tmp, ".git"), filepath.Join(o.Dir, ".git")); err != nil {
+	if err := RenameRetry(ctx, tmpGit, filepath.Join(o.Dir, ".git")); err != nil {
 		if _, statErr := os.Lstat(filepath.Join(o.Dir, ".git")); statErr == nil {
 			// Another init set Dir up first; finish as on any clone.
 			return initClone(ctx, o, url, run)
@@ -330,7 +338,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 			return res, err
 		}
 	}
-	if err := bootstrap(g, o, &res); err != nil {
+	if err := bootstrap(g, gitDir, o, &res); err != nil {
 		return res, err
 	}
 	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
@@ -361,9 +369,9 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 // follows one of origin's the clone no longer has is left for a person: the
 // remote may have deleted or renamed it, and init would not know where the
 // journal went, unless the person names its branch, in o.Branch. The branch the
-// clone is put on is recorded, before HEAD moves, as the journal's: a clone on a
-// branch following another of origin's than the one named, else recorded, is put
-// back on that one too.
+// clone is put on is recorded as the journal's once nothing stops the move,
+// before any ref moves: a clone on a branch following another of origin's than
+// the one named, else recorded, is put back on that one too.
 func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattached bool, err error) {
 	named := o.Branch
 	recorded, err := recordedBranch(gitDir)
@@ -454,6 +462,12 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 	if err := leftAsItIs(g, gitDir, head, branch); err != nil {
 		return "", false, err
 	}
+	// Recorded before anything moves, so that init run again, with --branch or
+	// without, finishes a move cut short or refused part way, and sync till then
+	// says to.
+	if err := recordBranch(g.ctx, gitDir, branch); err != nil {
+		return "", false, err
+	}
 	ref := "refs/heads/" + branch
 	target, old := tip, ""
 	if have, err := g.line("rev-parse", "--verify", "--quiet", ref); err == nil {
@@ -511,9 +525,6 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 				"config --show-origin --list` shows each line and its file), then run fleetd init again, which finishes "+
 				"putting the clone back; till then HEAD stays where it was", ErrNoUpstream, branch, up, branch, g.dir, g.dir)
 		}
-	}
-	if err := recordBranch(g.ctx, gitDir, branch); err != nil {
-		return "", false, err
 	}
 	if _, err := g.line("symbolic-ref", "HEAD", ref); err != nil {
 		return "", false, err
@@ -882,34 +893,17 @@ func recordBranch(ctx context.Context, gitDir, branch string) error {
 }
 
 // recordedGone says what to do about the journal's recorded branch, gone from
-// origin, in a clone that is not on a branch following it. This clone's HEAD is
-// not the journal's, so it is never what goes back; a branch here that followed
-// the recorded one holds this clone's copy.
+// origin, in a clone that is not on a branch following it.
 func recordedGone(g git, url, recorded string) error {
-	ups, err := upstreams(g)
+	back, err := pushBack(g, recorded)
 	if err != nil {
 		return err
-	}
-	var held []string
-	for name, up := range ups {
-		if up == "refs/remotes/origin/"+recorded {
-			held = append(held, name)
-		}
-	}
-	slices.Sort(held)
-	if slices.Contains(held, recorded) {
-		held = []string{recorded}
-	}
-	back := "push it back from the machine that synced last, from its journal directory, as that machine's own sync says"
-	if len(held) == 1 {
-		back = fmt.Sprintf("push it back from the machine that synced last; if that is this one, `git -C \"%s\" push origin "+
-			"refs/heads/<local>:refs/heads/<branch>`, with %s for <local> and %s for <branch>, pushes this clone's copy",
-			g.dir, held[0], recorded)
 	}
 	return fmt.Errorf("%w: %s is the journal's branch, the one init set this clone up on, and %s no longer has it, as "+
 		"when the remote deleted or renamed it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" "+
 		"--branch <branch> <journal URL>` puts the clone on <branch>, the one the journal is on now; if it was deleted "+
-		"by mistake, %s; then run fleetd init here again", ErrNoUpstream, recorded, url, g.dir, back)
+		"by mistake, push it back from the machine that synced last, as fleetd sync there says; %s; then run fleetd "+
+		"init here again", ErrNoUpstream, recorded, url, g.dir, back)
 }
 
 // journalElsewhere refuses to start the journal on branch, whose top level is
@@ -969,8 +963,13 @@ func holdsJournal(top map[string]string) bool {
 }
 
 // bootstrap makes sure the remote branch has FleetFile, and sets res.Head and
-// res.Salt from it. It moves refs only, never a work tree.
-func bootstrap(g git, o InitOptions, res *InitResult) error {
+// res.Salt from it. It moves refs only, never a work tree. A push that makes a
+// branch holding no journal the journal's, or starts one, makes a look at
+// origin's other branches due, noted in gitDir, the clone's git directory: made
+// on the branches the fetch after the push brings, and by every init until one
+// finds no other journal, it is made even when that fetch fails, or an init
+// stops before it.
+func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 	ssh := batchSSH(g)
 	for attempt := 1; ; attempt++ {
 		tip, _ := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+res.Branch)
@@ -1010,6 +1009,9 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 					res.SaltDiffers = true
 				}
 				res.Head, res.Salt = tip, fleet.Salt
+				if _, err := os.Lstat(filepath.Join(gitDir, lookName)); err == nil {
+					return look(g, gitDir, res.Branch)
+				}
 				return nil
 			}
 		}
@@ -1037,6 +1039,12 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 		if err != nil {
 			return err
 		}
+		// Starting the journal, the branch has no top level, and holds none.
+		if !holdsJournal(top) {
+			if err := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
+				return err
+			}
+		}
 		// Onto the tip looked at, or, starting the journal, onto no branch at all:
 		// a branch renamed or deleted meanwhile refuses it, as a race lost.
 		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "--force-with-lease=refs/heads/"+res.Branch+":"+tip,
@@ -1044,18 +1052,6 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 		switch {
 		case err == nil:
 			res.WroteFleetFile, res.Started = true, tip == ""
-			if res.Started {
-				if err := oneBranch(g, res.Branch); err != nil {
-					return err
-				}
-			} else if !holdsJournal(top) {
-				// This push made a branch that held no journal one; another that
-				// holds one now was made one meanwhile, since the look before the
-				// push found none.
-				if err := oneJournal(g, res.Branch); err != nil {
-					return err
-				}
-			}
 		case refused(out):
 			return fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w", ErrRejected, res.Branch, err)
 		case !lostRace(out):
@@ -1064,43 +1060,40 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 		// Either way the remote has a tip to look at again: this machine's
 		// commit, or the one that beat it.
 		if err := fetchOrigin(g); err != nil {
+			if _, statErr := os.Lstat(filepath.Join(gitDir, lookName)); statErr == nil && res.WroteFleetFile {
+				return couldNotLook(res.Branch, err)
+			}
 			return err
 		}
 	}
 }
 
-// oneJournal fails when, once this machine has made branch, an existing one
-// that held no journal, the journal's, another of origin's branches holds a
-// journal too: two machines started the journal at once on two branches, each
-// with its own salt, which the look before the push cannot rule out.
-func oneJournal(g git, branch string) error {
-	if err := fetchOrigin(g); err != nil {
-		return err
-	}
-	holding, err := journalsBut(g, branch)
-	if err != nil || len(holding) == 0 {
-		return err
-	}
-	return twoBranches(branch, holding)
-}
+// lookName is the file, in a clone's git directory, that notes a look at
+// origin's other branches is due: a push of this clone's may have made branch,
+// which held no journal, the journal's. It is never committed.
+const lookName = "fleetd-look"
 
-// oneBranch fails when a journal this machine just started has another branch:
-// two machines started it at once on two branches, each with its own salt.
-func oneBranch(g git, branch string) error {
-	out, err := g.line(append(batchSSH(g), "ls-remote", "--heads", "origin")...)
+// look fails when another of origin's branches than branch holds a journal
+// too, as this clone last fetched them, once a push of this clone's has made
+// branch the journal's, starting it, or on a branch that held none: two machines
+// did so at once, on two branches, each with its own salt, which the look before
+// the push cannot rule out. It notes the look done only when it finds no other
+// journal, so that until then every init looks.
+func look(g git, gitDir, branch string) error {
+	holding, err := journalsBut(g, branch)
 	if err != nil {
 		return err
 	}
-	var others []string
-	for _, l := range strings.Split(out, "\n") {
-		if _, ref, ok := strings.Cut(l, "\t"); ok && ref != "refs/heads/"+branch {
-			others = append(others, strings.TrimPrefix(ref, "refs/heads/"))
-		}
+	if len(holding) > 0 {
+		return twoBranches(branch, holding)
 	}
-	if len(others) > 0 {
-		return twoBranches(branch, others)
-	}
-	return nil
+	return os.RemoveAll(filepath.Join(gitDir, lookName))
+}
+
+func couldNotLook(branch string, err error) error {
+	return fmt.Errorf("gitsync: %s is the journal's branch now, but init could not then look whether another "+
+		"machine made another branch the journal's at the same time (%w); fleetd init run again looks again",
+		branch, err)
 }
 
 // twoBranches says what a person does about a journal started on branch and on

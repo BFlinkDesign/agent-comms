@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -50,6 +51,12 @@ func TestMain(m *testing.M) {
 		}
 	}
 	code := m.Run()
+	// Tests running in parallel share that configuration: one that wrote it
+	// would change what git does in every other.
+	if data, err := os.ReadFile(empty); err != nil || len(data) != 0 {
+		fmt.Fprintf(os.Stderr, "a test changed the global git configuration every test shares: %q (%v)\n", data, err)
+		code = 1
+	}
 	_ = os.RemoveAll(home)
 	os.Exit(code)
 }

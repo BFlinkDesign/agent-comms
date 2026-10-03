@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
 
 // exec drives the command the way a shell does, and returns what a user would
@@ -533,6 +535,29 @@ func TestTheCachedSaltIsKeptExactly(t *testing.T) {
 		if got := cachedSalt(dir); got != salt {
 			t.Errorf("cached %q, read back %q", salt, got)
 		}
+	}
+}
+
+// A journal whose .git is a file naming its git directory elsewhere keeps the
+// salt cache, and the note of a salt the journal no longer uses, in that
+// directory, where sync reads the note.
+func TestTheSaltNotesOfAJournalWhoseGitDirectoryIsElsewhereAreKeptThere(t *testing.T) {
+	t.Parallel()
+	dir, gitDir := t.TempDir(), filepath.Join(t.TempDir(), "journal.git")
+	if err := os.Mkdir(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	keepSalt(dir, "A", &stderr)
+	keepSalt(dir, "B", &stderr)
+	if got := cachedSalt(dir); got != "B" || stderr.Len() != 0 {
+		t.Fatalf("cached %q, stderr %q; want B and nothing", got, stderr.String())
+	}
+	if got := gitsync.PastSalts(gitDir); !slices.Equal(got, []string{"A"}) {
+		t.Fatalf("the git directory notes %q as past salts, want A", got)
 	}
 }
 

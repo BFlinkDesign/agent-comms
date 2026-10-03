@@ -38,6 +38,12 @@ func TestMain(m *testing.M) {
 	os.Setenv("GIT_CONFIG_GLOBAL", cfg)
 	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	code := m.Run()
+	// Tests running in parallel share that configuration: one that wrote it
+	// would change what git does in every other.
+	if data, err := os.ReadFile(cfg); err != nil || len(data) != 0 {
+		fmt.Fprintf(os.Stderr, "a test changed the global git configuration every test shares: %q (%v)\n", data, err)
+		code = 1
+	}
 	os.RemoveAll(dir)
 	os.Exit(code)
 }
@@ -175,6 +181,68 @@ func TestEachMachinePublishesItsOwnFileAndReceivesTheOthers(t *testing.T) {
 	}
 	if status := run(t, a, "status", "--porcelain"); status != "" {
 		t.Errorf("after syncing, the clone should be clean, status is %q", status)
+	}
+}
+
+// A branch whose name ends in white space beyond ASCII, a no-break space, say,
+// is the branch a sync publishes to: read without it, the name is another
+// branch's, one origin does not have.
+func TestASyncPublishesToABranchWhoseNameEndsInANoBreakSpace(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	branch := "weg\u00a0"
+	run(t, a, "push", "--quiet", "origin", "main:refs/heads/"+branch)
+	run(t, a, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/"+branch)
+	run(t, a, "push", "--quiet", "origin", ":refs/heads/main")
+	run(t, a, "fetch", "--quiet", "--prune", "origin")
+	run(t, a, "branch", "--quiet", "-m", "main", branch)
+	run(t, a, "branch", "--quiet", "--set-upstream-to=origin/"+branch, branch)
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	// Each name ends in a bar, which run's trimming leaves alone.
+	if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)|", "refs/heads/"); heads != "refs/heads/"+branch+"|" {
+		t.Fatalf("the remote has %q, want only %q", heads, "refs/heads/"+branch)
+	}
+	if got := run(t, a, "--git-dir", remote, "show", branch+":host-a.jsonl"); got != `{"id":"hive:a1"}` {
+		t.Fatalf("%q holds %q for host-a", branch, got)
+	}
+}
+
+// GitDir finds a clone's git directory as git does: .git, or the directory a .git
+// file names, absolute or relative to the clone's top.
+func TestGitDirFindsTheDirectoryAGitFileNames(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	plain, elsewhere := filepath.Join(root, "plain"), filepath.Join(root, "elsewhere.git")
+	for _, d := range []string{filepath.Join(plain, ".git"), elsewhere} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		name, file string
+		want       string
+	}{
+		{"absolute", "gitdir: " + elsewhere + "\n", elsewhere},
+		{"relative, ending in CRLF", "gitdir: ../elsewhere.git\r\n", elsewhere},
+		{"naming nothing there", "gitdir: " + filepath.Join(root, "missing") + "\n", ""},
+		{"not a .git file", "ref: refs/heads/main\n", ""},
+	} {
+		dir := filepath.Join(root, strings.ReplaceAll(c.name, " ", "-"))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(dir, ".git"), c.file)
+		if got, ok := GitDir(dir); got != c.want || ok != (c.want != "") {
+			t.Errorf("%s: GitDir = %q, %v; want %q", c.name, got, ok, c.want)
+		}
+	}
+	if got, ok := GitDir(plain); got != filepath.Join(plain, ".git") || !ok {
+		t.Errorf("a .git directory: GitDir = %q, %v", got, ok)
+	}
+	if _, ok := GitDir(root); ok {
+		t.Error("GitDir found a git directory where there is none")
 	}
 }
 
@@ -755,7 +823,7 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 }
 
 // A branch deleted by mistake, and pushed back from the machine that synced
-// last as the message says, is taken up again by every other machine's next
+// last as its own sync says, is taken up again by every other machine's next
 // sync, though each had pruned its copy of the branch. The push names origin's
 // branch, which the machine's own may not be named after.
 func TestABranchPushedBackAfterAMistakenDeletionIsTakenUpAgain(t *testing.T) {
@@ -769,10 +837,46 @@ func TestABranchPushedBackAfterAMistakenDeletionIsTakenUpAgain(t *testing.T) {
 	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
 	_, err := Sync(context.Background(), options(a, "host-a"))
-	if advice := "`git push origin HEAD:<branch>` in its journal directory and main for <branch>"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), advice) {
+	if advice := "`git -C \"" + a + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with main for <local> and " +
+		"main for <branch>"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), advice) {
 		t.Fatalf("sync: %v, want ErrNoUpstream saying %s", err, advice)
 	}
-	run(t, b, "push", "--quiet", "origin", "HEAD:main")
+	_, err = Sync(context.Background(), options(b, "host-b"))
+	if advice := "with work for <local> and main for <branch>"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), advice) {
+		t.Fatalf("b's sync: %v, want ErrNoUpstream saying %s", err, advice)
+	}
+	run(t, b, "push", "--quiet", "origin", "refs/heads/work:refs/heads/main")
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+}
+
+// A sync on a branch whose copy of a branch the remote deleted is older than
+// another branch's here, one a person switched to and synced on, then left,
+// names the newer copy to push back: pushing HEAD's would take back the records
+// published since, and stop every machine that has them.
+func TestASyncNamesTheNewestCopyOfAGoneBranchToPushBack(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	run(t, a, "switch", "--quiet", "-c", "mywork", "--track", "origin/main")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+	mustSync(t, options(a, "host-a"))
+	newest := run(t, a, "rev-parse", "refs/heads/mywork")
+	run(t, a, "symbolic-ref", "HEAD", "refs/heads/main")
+	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	if advice := "with mywork for <local> and main for <branch>"; !errors.Is(err, ErrNoUpstream) ||
+		!strings.Contains(err.Error(), advice) || strings.Contains(err.Error(), "push origin HEAD") {
+		t.Fatalf("sync: %v, want ErrNoUpstream saying %s, never to push HEAD", err, advice)
+	}
+	run(t, a, "push", "--quiet", "origin", "refs/heads/mywork:refs/heads/main")
+	if got := run(t, a, "--git-dir", remote, "rev-parse", "refs/heads/main"); got != newest {
+		t.Fatalf("main is back at %s, want %s, the newest copy", got, newest)
+	}
 	mustSync(t, options(a, "host-a"))
 	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
 		t.Fatalf("main holds %q for host-a", got)

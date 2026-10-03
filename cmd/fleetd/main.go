@@ -238,7 +238,11 @@ func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt strin
 // Until one is written, the cache keeps the old salt, so the next run tries again.
 func keepSalt(journalDir, salt string, stderr io.Writer) {
 	if prev := cachedSalt(journalDir); prev != "" && prev != salt {
-		if err := gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev); err != nil {
+		err := errors.New("the journal directory is not a clone")
+		if gitDir, ok := gitsync.GitDir(journalDir); ok {
+			err = gitsync.NotePastSalt(gitDir, prev)
+		}
+		if err != nil {
 			if note := saltsNote(journalDir); note == "" || gitsync.AppendSalt(note, prev) != nil {
 				fmt.Fprintf(stderr, "fleetd: warning: could not note the salt %s's %s held before (%v); "+
 					"this machine's records under it are filed once a later run can\n", journalDir, gitsync.FleetFile, err)
@@ -254,7 +258,11 @@ func keepSalt(journalDir, salt string, stderr io.Writer) {
 const saltCacheName = "fleetd-salt"
 
 func cachedSalt(journalDir string) string {
-	data, err := os.ReadFile(filepath.Join(journalDir, ".git", saltCacheName))
+	gitDir, ok := gitsync.GitDir(journalDir)
+	if !ok {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(gitDir, saltCacheName))
 	if err != nil {
 		return ""
 	}
@@ -266,8 +274,8 @@ func cachedSalt(journalDir string) string {
 // cacheSalt keeps salt for cachedSalt, in a clone only, and only when it changed.
 // It is best effort: without it, an invalid fleetd.json is merely ignored.
 func cacheSalt(journalDir, salt string) {
-	gitDir := filepath.Join(journalDir, ".git")
-	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() || cachedSalt(journalDir) == salt {
+	gitDir, ok := gitsync.GitDir(journalDir)
+	if !ok || cachedSalt(journalDir) == salt {
 		return
 	}
 	path := filepath.Join(gitDir, saltCacheName)
@@ -567,7 +575,7 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 // printSyncStatus says how fresh the answer is: a clone holds the other machines'
 // records as of this machine's last successful sync.
 func printSyncStatus(stdout io.Writer, dir string) {
-	if info, err := os.Stat(filepath.Join(dir, ".git")); err != nil || !info.IsDir() {
+	if _, ok := gitsync.GitDir(dir); !ok {
 		return
 	}
 	switch st, ok := readSyncStatus(dir); {

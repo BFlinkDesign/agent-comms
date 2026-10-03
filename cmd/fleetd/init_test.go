@@ -1891,3 +1891,56 @@ func TestWhereReadsTheRecordedBranchOnAClonePutOffIt(t *testing.T) {
 		t.Fatalf("where --json: unpublished %d, last_published %q; want 0 and a time", entries[0].Unpublished, entries[0].LastPublished)
 	}
 }
+
+// A journal whose .git is a file naming its git directory elsewhere, as one set
+// up with --separate-git-dir has, keeps fleetd's notes in that directory, where
+// sync and init keep theirs: where reads the branch init recorded there, and the
+// outcome of the last sync.
+func TestWhereOnAJournalWhoseGitDirectoryIsElsewhereReadsFleetdsNotesThere(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "init", "--quiet", "--separate-git-dir="+filepath.Join(t.TempDir(), "journal.git"))
+	if info, err := os.Lstat(filepath.Join(dir, ".git")); err != nil || info.IsDir() {
+		t.Fatalf("the journal's .git is not a file: %v", err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published on main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	docs := filepath.Join(t.TempDir(), "docs")
+	gitIn(t, filepath.Dir(docs), "init", "--quiet", "--initial-branch=docs", docs)
+	if err := os.WriteFile(filepath.Join(docs, "README.md"), []byte("about\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, docs, "add", ".")
+	gitIn(t, docs, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "docs")
+	gitIn(t, docs, "push", "--quiet", remote, "docs")
+	gitIn(t, dir, "fetch", "--quiet", "origin")
+	gitIn(t, dir, "switch", "--quiet", "-c", "elsewhere")
+	gitIn(t, dir, "branch", "--quiet", "--set-upstream-to=origin/docs")
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil || len(entries) != 1 {
+		t.Fatalf("where --json: %v\n%s", err, stdout)
+	}
+	if entries[0].Unpublished != 0 || entries[0].LastPublished == "" {
+		t.Fatalf("where --json: unpublished %d, last_published %q; want 0 and a time", entries[0].Unpublished, entries[0].LastPublished)
+	}
+	// Off the journal's branch, the sync fails, and where says so.
+	if _, _, err := exec(t, "sync", "--dir", dir); err == nil {
+		t.Fatal("a sync off the journal's branch succeeded")
+	}
+	stdout, _, err = exec(t, "where", "--dir", dir)
+	if err != nil || !strings.Contains(stdout, "FAILED") || !strings.Contains(stdout, "as of its last successful sync") {
+		t.Fatalf("where: %v, want it to say the last sync failed:\n%s", err, stdout)
+	}
+}
