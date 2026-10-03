@@ -32,6 +32,7 @@ func returnsWithin(t *testing.T, d time.Duration, what string, f func()) {
 // where the salts note goes. Opening one waits for a writer that never comes;
 // a sync must not wait with it, past its --timeout and holding its lock.
 func TestAFIFOAtTheSaltsNoteDoesNotHoldUpASync(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -81,6 +82,7 @@ func TestAFIFOAtTheHookLogDoesNotHoldUpWhereOrAHook(t *testing.T) {
 // as one: a link to a FIFO must not hold up a record, which reads fleetd.json
 // for its salt.
 func TestAFleetFileLinkedToAFIFODoesNotHoldUpARecord(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -114,6 +116,7 @@ func TestAFleetFileLinkedToAFIFODoesNotHoldUpARecord(t *testing.T) {
 // init on a clone whose fleetd.json is a link to a FIFO replaces it, rather than
 // reading through it for a salt to note and waiting for a writer.
 func TestInitOnACloneWhoseFleetFileLinksToAFIFOReturns(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)

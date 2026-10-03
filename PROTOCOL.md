@@ -292,9 +292,10 @@ branch the journal is on, with nothing pushed or moved. A clone a person moved o
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch init recorded
-when it last set the clone up (`fleetd.branch` in the clone's git config), while
+when it last set the clone up (in `.git/fleetd-branch`, never committed), while
 origin has it, else, recorded and gone, none (init says what a person does, as for
-a gone branch); with no record, the branch it follows, of the same name on origin,
+a gone branch, but pushing back from the branch here that followed it, never from
+HEAD); a gone branch the record does not name stops nothing; with no record, the branch it follows, of the same name on origin,
 if origin still has it; else the remote's default, the branch its HEAD names; else
 its only branch. `--branch` names the journal's branch instead, where a person
 knows better; origin must have it, and init records it. Following several of
@@ -302,8 +303,9 @@ origin's branches, none of them the default, a clone is left as it is, and init
 says to name the journal's with `--branch`. A clone whose fetch does not take
 origin's branch to `origin/<branch>` (`--single-branch`, or a line mapping origin's
 branches elsewhere first) has its refspec's branch lines replaced by one for every
-branch of origin's, its other lines kept; such a line in an included file is named
-instead, with nothing moved. Only refs and the index
+branch of origin's, its other lines kept; such a line in an included file, for the
+fetch or for the branch, is named instead, init stopping before HEAD moves. Only
+refs and the index
 change, never a file, and HEAD last; the journal's branch here starts at origin's
 tip and moves only forward to it, so one with commits of its own stays, and
 init's sync reports them. The repair is refused, with nothing moved, in a
@@ -391,8 +393,8 @@ directory). `fleetd where` reports an
 error rather than "no records" when that directory does not exist, so a mistyped
 path is distinguishable from a machine that genuinely recorded nothing. For each
 host, `where --json` adds `last_published` (the ts of the newest record the
-remote has from that host, leaving out records re-filed after it, as of this
-clone's last sync) and `unpublished` (the
+remote has from that host on the journal's branch as init recorded it, leaving out
+records re-filed after it, as of this clone's last sync) and `unpublished` (the
 host's complete records here that the remote lacks), when the journal directory is
 the top of a clone and git could say.
 

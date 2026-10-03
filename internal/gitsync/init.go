@@ -253,11 +253,13 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 		{"update-ref", "refs/heads/" + res.Branch, res.Head},
 		{"symbolic-ref", "HEAD", "refs/heads/" + res.Branch},
 		{"branch", "--quiet", "--set-upstream-to=origin/" + res.Branch, res.Branch},
-		{"config", "--local", "--replace-all", branchKey, res.Branch},
 	} {
 		if _, err := g.line(args...); err != nil {
 			return res, err
 		}
+	}
+	if err := recordBranch(ctx, filepath.Join(tmp, ".git"), res.Branch); err != nil {
+		return res, err
 	}
 	// A sync must not start in Dir while Init is still filling its index: the
 	// lock moves into Dir with the git directory, and a hook's sync skips it.
@@ -337,7 +339,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if res.Restored, err = restoreMissing(g); err != nil {
 		return res, err
 	}
-	return res, recordBranch(g, res.Branch)
+	return res, recordBranch(ctx, gitDir, res.Branch)
 }
 
 // onBranch returns the branch of origin's that the clone follows. A clone a person
@@ -364,11 +366,13 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 // back on that one too.
 func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattached bool, err error) {
 	named := o.Branch
+	recorded, err := recordedBranch(gitDir)
+	if err != nil {
+		return "", false, err
+	}
 	want := named
 	if want == "" {
-		if want, err = recordedBranch(g); err != nil {
-			return "", false, err
-		}
+		want = recorded
 	}
 	if upstream, err := g.line("rev-parse", "--symbolic-full-name", "@{u}"); err == nil {
 		if theirs, ok := strings.CutPrefix(upstream, "refs/remotes/origin/"); ok && (want == "" || theirs == want) {
@@ -391,7 +395,7 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 		branch = named
 		if !has {
 			// origin has no branch at all, which journalBranch says what to do about.
-			if _, err := journalBranch(g, url, named); err != nil {
+			if _, err := journalBranch(g, url, named, recorded); err != nil {
 				return "", false, err
 			}
 		}
@@ -401,11 +405,13 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 			if err != nil {
 				return "", false, err
 			}
-			if theirs != "" {
+			// A gone branch the record does not name, as a stray a person switched
+			// to, is not the journal's: the record says where the journal is.
+			if theirs != "" && (recorded == "" || recorded == theirs) {
 				return "", false, goneError(g, head, theirs)
 			}
 		}
-		if branch, err = journalBranch(g, url, ""); err != nil {
+		if branch, err = journalBranch(g, url, "", recorded); err != nil {
 			return "", false, err
 		}
 	}
@@ -478,25 +484,35 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 	// origin's branch for the upstream only once the clone's refspec covers it, so
 	// the refspec's branch lines give way to one for every branch of origin's, as
 	// a clone has. Its other lines, notes or a branch left out on purpose, stay.
-	if up, err := g.line("rev-parse", "--symbolic-full-name", branch+"@{upstream}"); err != nil || up != "refs/remotes/origin/"+branch {
+	// The upstream is read as for-each-ref gives it, by the branch's full name,
+	// never as <branch>@{upstream}, which git takes for HEAD's for a branch named @.
+	upstream := func() (string, error) {
+		ups, err := upstreams(g)
+		return ups[branch], err
+	}
+	up, err := upstream()
+	if err != nil {
+		return "", false, err
+	}
+	if up != "refs/remotes/origin/"+branch {
 		if _, err := g.line("config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*",
 			`^\+?refs/heads/`); err != nil {
 			return "", false, err
 		}
-		// A line init cannot replace, in a file the clone's config includes, may
-		// still take origin's branches elsewhere first; every sync would then say
-		// to run init, which would say all was well.
-		if up, err := g.line("rev-parse", "--symbolic-full-name", branch+"@{upstream}"); err != nil || up != "refs/remotes/origin/"+branch {
-			if err := g.ctx.Err(); err != nil {
-				return "", false, err
-			}
-			return "", false, fmt.Errorf("%w: git takes origin's %s to %q, not to refs/remotes/origin/%s, by a "+
-				"remote.origin.fetch line in a file %s's config includes; remove that line (`git -C \"%s\" config "+
-				"--show-origin --get-all remote.origin.fetch` lists them), then run fleetd init again", ErrNoUpstream,
-				branch, up, branch, g.dir, g.dir)
+		// A line init does not rewrite, in a file the clone's config includes,
+		// for the fetch or for the branch itself, may still decide it; every sync
+		// would then say to run init, which would say all was well.
+		if up, err = upstream(); err != nil {
+			return "", false, err
+		}
+		if up != "refs/remotes/origin/"+branch {
+			return "", false, fmt.Errorf("%w: git takes origin's %s to %q, not to refs/remotes/origin/%s, as a line "+
+				"in a file %s's config includes says, for remote.origin.fetch or for the branch; remove it (`git -C \"%s\" "+
+				"config --show-origin --list` shows each line and its file), then run fleetd init again, which finishes "+
+				"putting the clone back; till then HEAD stays where it was", ErrNoUpstream, branch, up, branch, g.dir, g.dir)
 		}
 	}
-	if err := recordBranch(g, branch); err != nil {
+	if err := recordBranch(g.ctx, gitDir, branch); err != nil {
 		return "", false, err
 	}
 	if _, err := g.line("symbolic-ref", "HEAD", ref); err != nil {
@@ -563,8 +579,8 @@ func leftAsItIs(g git, gitDir, head, branch string) error {
 // repository was empty, holds nothing in its git directory, and without it init
 // sets the directory up as a new one, starting the journal; a clone with commits
 // of its own keeps them in its git directory, moved aside. named is the branch a
-// person named, for that advice.
-func journalBranch(g git, url, named string) (string, error) {
+// person named, for that advice, and recorded the one init recorded.
+func journalBranch(g git, url, named, recorded string) (string, error) {
 	out, err := g.line(append(batchSSH(g), "ls-remote", "--symref", "origin", "HEAD", "refs/heads/*")...)
 	if err != nil {
 		return "", err
@@ -583,17 +599,11 @@ func journalBranch(g git, url, named string) (string, error) {
 			}
 		}
 	}
-	recorded, err := recordedBranch(g)
-	if err != nil {
-		return "", err
-	}
 	if recorded != "" && named == "" {
 		if heads[recorded] {
 			return recorded, nil
 		}
-		return "", fmt.Errorf("%w: %s is the journal's branch, the one init set this clone up on, and %s no longer "+
-			"has it, as when the remote deleted or renamed it. %s, then run fleetd init here again", ErrNoUpstream,
-			recorded, url, goneAdvice(g.dir, recorded))
+		return "", recordedGone(g, url, recorded)
 	}
 	ups, err := upstreams(g)
 	if err != nil {
@@ -850,15 +860,56 @@ func originHas(g git, name, url string) (bool, error) {
 	return false, fmt.Errorf("%w: %s has no branch %s; it has %s", ErrNoBranch, url, name, strings.Join(branches, ", "))
 }
 
-// recordBranch records branch as the journal's in the clone's own config, unless
-// it is recorded already.
-func recordBranch(g git, branch string) error {
-	recorded, err := recordedBranch(g)
-	if err != nil || recorded == branch {
+// recordBranch records branch as the journal's in the clone whose git directory
+// is gitDir, by renaming in a file written beside the record, so that no reader
+// sees half of one.
+func recordBranch(ctx context.Context, gitDir, branch string) error {
+	f, err := os.CreateTemp(gitDir, "."+branchName+".*")
+	if err != nil {
 		return err
 	}
-	_, err = g.line("config", "--local", "--replace-all", branchKey, branch)
+	_, err = f.WriteString(branch + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = RenameRetry(ctx, f.Name(), filepath.Join(gitDir, branchName))
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
 	return err
+}
+
+// recordedGone says what to do about the journal's recorded branch, gone from
+// origin, in a clone that is not on a branch following it. This clone's HEAD is
+// not the journal's, so it is never what goes back; a branch here that followed
+// the recorded one holds this clone's copy.
+func recordedGone(g git, url, recorded string) error {
+	ups, err := upstreams(g)
+	if err != nil {
+		return err
+	}
+	var held []string
+	for name, up := range ups {
+		if up == "refs/remotes/origin/"+recorded {
+			held = append(held, name)
+		}
+	}
+	slices.Sort(held)
+	if slices.Contains(held, recorded) {
+		held = []string{recorded}
+	}
+	back := "push it back from the machine that synced last, from its journal directory, as that machine's own sync says"
+	if len(held) == 1 {
+		back = fmt.Sprintf("push it back from the machine that synced last; if that is this one, `git -C \"%s\" push origin "+
+			"refs/heads/<local>:refs/heads/<branch>`, with %s for <local> and %s for <branch>, pushes this clone's copy",
+			g.dir, held[0], recorded)
+	}
+	return fmt.Errorf("%w: %s is the journal's branch, the one init set this clone up on, and %s no longer has it, as "+
+		"when the remote deleted or renamed it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" "+
+		"--branch <branch> <journal URL>` puts the clone on <branch>, the one the journal is on now; if it was deleted "+
+		"by mistake, %s; then run fleetd init here again", ErrNoUpstream, recorded, url, g.dir, back)
 }
 
 // journalElsewhere refuses to start the journal on branch, whose top level is
@@ -870,25 +921,9 @@ func journalElsewhere(g git, url, dir, branch string, top map[string]string) err
 	if holdsJournal(top) {
 		return nil
 	}
-	out, err := g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
-	if err != nil {
+	holding, err := journalsBut(g, branch)
+	if err != nil || len(holding) == 0 {
 		return err
-	}
-	var holding []string
-	for _, name := range strings.Split(out, "\n") {
-		if name == "" || name == "HEAD" || name == branch {
-			continue
-		}
-		other, err := topLevel(g, "refs/remotes/origin/"+name)
-		if err != nil {
-			return err
-		}
-		if holdsJournal(other) {
-			holding = append(holding, name)
-		}
-	}
-	if len(holding) == 0 {
-		return nil
 	}
 	on := holding[0]
 	if len(holding) > 1 {
@@ -897,6 +932,29 @@ func journalElsewhere(g git, url, dir, branch string, top map[string]string) err
 	return fmt.Errorf("%w: %s holds no journal on %s, but holds one on %s, where the fleet publishes; a journal started "+
 		"on %s would split it. `fleetd init --dir \"%s\" --branch <branch> <journal URL>` follows the one on <branch>",
 		ErrJournalElsewhere, url, branch, on, branch, dir)
+}
+
+// journalsBut names the branches of origin's, as this clone last fetched them,
+// that hold a journal, but for branch.
+func journalsBut(g git, branch string) ([]string, error) {
+	out, err := g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
+	if err != nil {
+		return nil, err
+	}
+	var holding []string
+	for _, name := range strings.Split(out, "\n") {
+		if name == "" || name == "HEAD" || name == branch {
+			continue
+		}
+		top, err := topLevel(g, "refs/remotes/origin/"+name)
+		if err != nil {
+			return nil, err
+		}
+		if holdsJournal(top) {
+			holding = append(holding, name)
+		}
+	}
+	return holding, nil
 }
 
 // holdsJournal reports whether a commit's top level holds a journal: FleetFile,
@@ -990,6 +1048,13 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 				if err := oneBranch(g, res.Branch); err != nil {
 					return err
 				}
+			} else if !holdsJournal(top) {
+				// This push made a branch that held no journal one; another that
+				// holds one now was made one meanwhile, since the look before the
+				// push found none.
+				if err := oneJournal(g, res.Branch); err != nil {
+					return err
+				}
 			}
 		case refused(out):
 			return fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w", ErrRejected, res.Branch, err)
@@ -1002,6 +1067,21 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 			return err
 		}
 	}
+}
+
+// oneJournal fails when, once this machine has made branch, an existing one
+// that held no journal, the journal's, another of origin's branches holds a
+// journal too: two machines started the journal at once on two branches, each
+// with its own salt, which the look before the push cannot rule out.
+func oneJournal(g git, branch string) error {
+	if err := fetchOrigin(g); err != nil {
+		return err
+	}
+	holding, err := journalsBut(g, branch)
+	if err != nil || len(holding) == 0 {
+		return err
+	}
+	return twoBranches(branch, holding)
 }
 
 // oneBranch fails when a journal this machine just started has another branch:
@@ -1018,13 +1098,19 @@ func oneBranch(g git, branch string) error {
 		}
 	}
 	if len(others) > 0 {
-		return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s. Keep the repository's "+
-			"default branch: on any machine whose journal follows the other one, delete the journal's .git directory (its "+
-			"records stay; left in place, its syncs stop once that branch is gone, until `fleetd init --dir \"<its "+
-			"journal directory>\" --branch <branch> <journal URL>` names the one kept); then delete the other branch, "+
-			"and run fleetd init again on those machines and on this one", branch, strings.Join(others, ", "))
+		return twoBranches(branch, others)
 	}
 	return nil
+}
+
+// twoBranches says what a person does about a journal started on branch and on
+// others at once.
+func twoBranches(branch string, others []string) error {
+	return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s. Keep the repository's "+
+		"default branch: on any machine whose journal follows the other one, delete the journal's .git directory (its "+
+		"records stay; left in place, its syncs stop once that branch is gone, until `fleetd init --dir \"<its "+
+		"journal directory>\" --branch <branch> <journal URL>` names the one kept); then delete the other branch, "+
+		"and run fleetd init again on those machines and on this one", branch, strings.Join(others, ", "))
 }
 
 // placeFleetFile writes the journal's FleetFile into dir, so that a record

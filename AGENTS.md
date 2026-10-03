@@ -133,9 +133,14 @@ moved off the journal's branch, detached, on an orphan branch, on a branch that
 follows nothing, a branch of the clone or another remote's, or with no commit
 yet, as a plain clone of the repository made while it was empty has, is put back
 on it by init. The journal's branch is the one init recorded when it last set
-the clone up, in the clone's own git config (`fleetd.branch`), while origin has
-it; recorded and gone from origin, it is left for a person, as a branch the remote
-deleted or renamed is (below), with the same advice. A clone with no record, set
+the clone up, in a file of the clone's git directory (`.git/fleetd-branch`), while
+origin has it; a record that cannot be read stops sync and init, saying so;
+recorded and gone from origin, it is left for a person, as a branch the remote
+deleted or renamed is (below), except that a branch deleted by mistake is pushed
+back from the branch here that followed it, never from HEAD, which is then not
+the journal's; init names it. A gone branch the record does not name, such as a
+stray a person switched to, does not stop init: the record says where the
+journal is. A clone with no record, set
 up before init kept one, takes the branch it follows, of the same name on origin,
 if origin still has it, since a remote's default can change while its machines go
 on publishing where they did; else the remote's default, the branch its HEAD
@@ -147,8 +152,10 @@ it. A clone whose fetch does not take origin's branch to `origin/<branch>`, as o
 made with `--single-branch` and put back on another branch, or one mapping
 origin's branches somewhere else first, has its refspec's branch lines give way to
 one for every branch of origin's, as a clone has; its other lines stay. Such a
-line in a file the clone's config includes, which init does not rewrite, is named
-instead, and nothing moves. Only refs and git's index change, never a file, so
+line in a file the clone's config includes, for the fetch or for the branch, which
+init does not rewrite, is named instead, and init stops before HEAD moves, as a
+repair cut short; with the line gone, init run again finishes the repair. Only
+refs and git's index change, never a file, so
 this machine's records stay as they are, which git's own ways back (`git
 switch`, `git checkout`) refuse to promise; HEAD moves last, so init run again
 finishes a repair cut short. A branch with commits of its own is not moved, and
@@ -194,7 +201,9 @@ move its `.git` directory, and every file there but journal files and
 empty repository at once, the one whose push loses takes the other's commit and
 salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
-the second is told to keep the repository's default. A machine whose journal
+the second is told to keep the repository's default, and so are two machines
+that make two branches holding no journal, a README each, the journal's at once.
+A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the
 directory's syncs stop once the branch is gone, until `fleetd init --branch
@@ -327,7 +336,7 @@ Two defaults are deliberate and worth knowing before you use it:
   to show. For each machine it gives the time of the newest record the remote has
   from it, records re-filed after it aside (`last_published` in `--json`), and how many of its records this machine
   holds that the remote lacks (`unpublished`), read from the remote's copy of each
-  file rather than its history. A machine whose syncs keep failing shows up there
+  file on the journal's branch, as init recorded it, rather than its history. A machine whose syncs keep failing shows up there
   rather than looking idle. A journal directory that is not the top of a clone
   gets no such lines, and a machine git cannot answer for is left out of them, not
   reported as unpublished.

@@ -105,7 +105,13 @@ func publications(dir string, stems []string) (map[string]publication, bool) {
 	if err != nil || !gitsync.SameDir(strings.TrimSpace(top), dir) {
 		return nil, false
 	}
-	up, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--verify", "--quiet", "@{upstream}")
+	// The journal is on the branch init recorded, whatever branch the clone was
+	// switched to since; a clone set up before init recorded one follows it.
+	want := "@{upstream}"
+	if recorded, err := gitsync.RecordedBranch(filepath.Join(dir, ".git")); err == nil && recorded != "" {
+		want = "refs/remotes/origin/" + recorded
+	}
+	up, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--verify", "--quiet", want)
 	if up = strings.TrimSpace(up); err != nil || up == "" {
 		return nil, false
 	}

@@ -26,7 +26,32 @@ func TestMain(m *testing.M) {
 	// out the settle time each time was most of their run. The test of the wait
 	// itself puts back the value fleetd runs with.
 	productionSettle, refileSettle = refileSettle, 100*time.Millisecond
-	os.Exit(m.Run())
+	// Every test runs git with an empty global config and no system one, as on a
+	// fresh machine, and none reaches this machine's home directory, or a salt or
+	// journal directory its environment sets. Set once here, for the whole run,
+	// so that a test needing nothing else can run in parallel; a test that sets
+	// more of the environment runs on its own.
+	home, err := os.MkdirTemp("", "fleetd-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	empty := filepath.Join(home, "gitconfig")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		panic(err)
+	}
+	for k, v := range map[string]string{"GIT_CONFIG_GLOBAL": empty, "GIT_CONFIG_NOSYSTEM": "1", "HOME": home, "USERPROFILE": home} {
+		if err := os.Setenv(k, v); err != nil {
+			panic(err)
+		}
+	}
+	for _, k := range []string{"FLEET_SALT", "COMMS_CHANNELS", "GROK_HOOK_EVENT", "CURSOR_VERSION"} {
+		if err := os.Unsetenv(k); err != nil {
+			panic(err)
+		}
+	}
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
 }
 
 // productionSettle is refileSettle as fleetd runs with it.

@@ -78,6 +78,7 @@ func recordLine(t *testing.T, note string) string {
 // Two syncs that start together, as a hook's and init's do, must not both file
 // the same earlier records.
 func TestTwoSyncsAtOnceFileEarlierRecordsOnce(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -112,6 +113,7 @@ func TestTwoSyncsAtOnceFileEarlierRecordsOnce(t *testing.T) {
 // A process that had the file open when a sync moved it appends to the moved
 // copy. The next sync still files that record.
 func TestARecordAppendedToAMovedCopyIsFiledByTheNextSync(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -157,6 +159,7 @@ func TestARecordAppendedToAMovedCopyIsFiledByTheNextSync(t *testing.T) {
 // A record this machine wrote under another identity whose file git already
 // tracks, and that was never synced, must still reach the remote.
 func TestAnUnsyncedRecordOfATrackedOtherIdentityIsPublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
@@ -262,6 +265,7 @@ func TestInitAgainAfterTheJournalDirectoryWasLostStillPublishes(t *testing.T) {
 // HEAD behind the remote. --reclaim puts back what the remote has, not what that
 // old HEAD had, and publishes the newer record after it.
 func TestInitReclaimRepairsAJournalRestoredFromAnOlderCopy(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -348,6 +352,7 @@ func TestInitAgainDoesNotAdoptAnotherMachinesRecords(t *testing.T) {
 // A sync killed between moving another identity's tracked file aside and putting
 // its published copy back leaves the file missing. The next sync puts it back.
 func TestATrackedFileAKilledSyncLeftMissingIsPutBack(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -380,6 +385,7 @@ func TestATrackedFileAKilledSyncLeftMissingIsPutBack(t *testing.T) {
 // The directory was restored from an older copy, so its HEAD is behind the
 // remote, and only the remote's copy holds every published record.
 func TestThisMachinesMissingFileIsPutBackAsTheRemoteHasIt(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -651,6 +657,7 @@ func TestASecondMoveInTheSameClockTickKeepsTheFirstCopy(t *testing.T) {
 // with refiled.from. It is filed all the same, unmarked, and it stops nothing:
 // the records around it, and later ones, are filed too.
 func TestARecordNearTheSizeLimitIsStillFiled(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -699,6 +706,7 @@ func TestARecordNearTheSizeLimitIsStillFiled(t *testing.T) {
 // A line too large to file even unmarked, from a process that does not keep to
 // the limit, is skipped: it stops nothing, and the records after it are filed.
 func TestARecordTooLargeEvenUnmarkedIsSkipped(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -749,6 +757,7 @@ func TestARecordWrittenUnderFleetSaltBeforeInitIsFiledWithoutIt(t *testing.T) {
 // Re-filing a long backlog stops when the sync's time runs out, files nothing
 // more, and reports nothing read, so the next pass reads the copy again.
 func TestRefilingStopsWhenItsTimeRunsOut(t *testing.T) {
+	t.Parallel()
 	store, err := journal.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -817,6 +826,7 @@ func TestARecordWrittenBesideAnUnusableFleetFileIsFiled(t *testing.T) {
 // A journal directory at the root of a filesystem has nothing beside it, and a
 // note inside it would be a file init refuses; it gets none.
 func TestAJournalAtAFilesystemRootGetsNoSaltsNote(t *testing.T) {
+	t.Parallel()
 	if got := saltsNote(string(filepath.Separator)); got != "" {
 		t.Fatalf("saltsNote(%q) = %q, want none", string(filepath.Separator), got)
 	}
@@ -825,6 +835,7 @@ func TestAJournalAtAFilesystemRootGetsNoSaltsNote(t *testing.T) {
 // A salt is noted exactly even when it is not valid UTF-8, which an environment
 // variable can be.
 func TestASaltThatIsNotUTF8IsNotedExactly(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "journal")
 	var warn strings.Builder
 	noteSalt(dir, "ab\xffcd", &warn)
@@ -836,6 +847,7 @@ func TestASaltThatIsNotUTF8IsNotedExactly(t *testing.T) {
 // The salts note is never written through a symbolic link, which another
 // account able to write beside the journal could plant.
 func TestTheSaltsNoteIsNotWrittenThroughASymlink(t *testing.T) {
+	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "journal")
 	target := filepath.Join(t.TempDir(), "someone-elses-file")
 	if err := os.WriteFile(target, []byte("theirs\n"), 0o644); err != nil {
@@ -856,6 +868,7 @@ func TestTheSaltsNoteIsNotWrittenThroughASymlink(t *testing.T) {
 // salt is remembered in the cache it would otherwise leave, and the records
 // written under it are filed once it is.
 func TestASaltNoteThatFailsIsTriedAgain(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
 		t.Fatal(err)
@@ -897,6 +910,7 @@ func TestASaltNoteThatFailsIsTriedAgain(t *testing.T) {
 // beside the journal instead, which re-filing reads as well: the records written
 // under it are filed at once, with nothing to warn about.
 func TestAPastSaltWhoseNoteFailsIsNotedBesideTheJournal(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
@@ -940,6 +954,7 @@ func TestAPastSaltWhoseNoteFailsIsNotedBesideTheJournal(t *testing.T) {
 // An invalid fleetd.json is not trusted: the salt it last held is used. That
 // holds while the past-salts note in the clone's git directory cannot be written.
 func TestAnInvalidFleetFileUsesTheSaltItLastHeldWhenThePastSaltsNoteFails(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
@@ -972,6 +987,7 @@ func TestAnInvalidFleetFileUsesTheSaltItLastHeldWhenThePastSaltsNoteFails(t *tes
 // about refreshing git's index. Moved again, it would be copied into the git
 // directory by every sync, without end.
 func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if err := os.WriteFile(os.Getenv("GIT_CONFIG_GLOBAL"), []byte("[diff]\n\tautoRefreshIndex = false\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1033,6 +1049,7 @@ func TestRefilingWaitsForTheFleetFileToSettle(t *testing.T) {
 // Re-filing does nothing for an identity that is not the one the journal's
 // fleetd.json gives: it would file this machine's records under a stale id.
 func TestRefilingDoesNothingForAnIdentityThatIsNotTheJournals(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1076,6 +1093,7 @@ func TestARecordUnderAnUnnotedFleetSaltIsFiledWhileItIsSet(t *testing.T) {
 // Re-filing runs under the sync's lock: a sync that cannot take it, because
 // another sync of the journal is running, moves and files nothing.
 func TestASyncThatCannotTakeTheLockRefilesNothing(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1170,6 +1188,7 @@ func TestLastPublishedIsTheNewestRecordNotTheLastRefiledOne(t *testing.T) {
 // setup. The journal's salt wins, and the records written under the other one
 // are published under the journal's.
 func TestInitReplacesALocalFleetFileAndPublishesItsRecords(t *testing.T) {
+	t.Parallel()
 	for _, given := range []string{"", "s2"} {
 		t.Run("salt "+given, func(t *testing.T) {
 			remote := emptyJournalRemote(t)
@@ -1213,6 +1232,7 @@ func TestInitReplacesALocalFleetFileAndPublishesItsRecords(t *testing.T) {
 // The journal's salt can change while a hook still holds the old one. Its
 // record is published under the new salt.
 func TestARecordUnderTheSaltTheJournalReplacedIsPublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s1", remote); err != nil {
@@ -1262,6 +1282,7 @@ func TestARecordUnderTheSaltTheJournalReplacedIsPublished(t *testing.T) {
 // A record filed late from another identity is older than its place in the
 // file: where does not report it as this machine's latest activity.
 func TestWhereLeavesARefiledRecordOutOfTheLatestActivity(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1293,6 +1314,7 @@ func TestWhereLeavesARefiledRecordOutOfTheLatestActivity(t *testing.T) {
 // wrong say, must not hold up every sync: re-filing considers the salts noted
 // first, a few dozen at most, and the sync publishes within its time.
 func TestASaltsNoteFullOfSaltsDoesNotHoldUpSyncs(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {

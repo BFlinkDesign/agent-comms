@@ -989,6 +989,7 @@ func TestWhereMentionsARecentHookProblem(t *testing.T) {
 // reads as a directory named "C:" on the current drive (cc-safety-net#174 shows
 // such a payload from Cursor 3.22.12 on Windows 11).
 func TestLocalPathUndoesCursorsWindowsDriveForm(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct{ in, goos, want string }{
 		{"/C:/Users/someone/git-repos/research", "windows", "C:/Users/someone/git-repos/research"},
 		{"/d:/work", "windows", "d:/work"},
@@ -1097,6 +1098,7 @@ func TestWhereShowsAHookProblemWhenThereAreNoRecords(t *testing.T) {
 // A record written while a sync ran, after it read the file, is not published
 // by it, however that sync ended. notify must still see it as unsynced.
 func TestARecordWrittenDuringASyncCountsAsUnsynced(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)

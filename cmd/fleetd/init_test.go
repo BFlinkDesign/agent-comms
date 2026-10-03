@@ -17,20 +17,13 @@ import (
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
 
-// emptyJournalRemote is a bare repository with no commits, as GitHub creates one,
-// and a clean git configuration, so the tests see what a fresh PC sees.
+// emptyJournalRemote is a bare repository with no commits, as GitHub creates one.
+// TestMain gives every test the clean git configuration a fresh PC has.
 func emptyJournalRemote(t *testing.T) string {
 	t.Helper()
 	if _, err := osexec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-	t.Setenv("FLEET_SALT", "")
 	root := t.TempDir()
 	remote := filepath.Join(root, "journal.git")
 	gitIn(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
@@ -122,6 +115,7 @@ func TestAStaleFleetSaltStillRecordsUnderTheJournalsSalt(t *testing.T) {
 }
 
 func TestInitSetsUpTheJournalAndEveryMachineGetsTheSameSalt(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	a, b := filepath.Join(t.TempDir(), "a", "journal"), filepath.Join(t.TempDir(), "b", "journal")
 	stdout, _, err := exec(t, "init", "--dir", a, remote)
@@ -157,6 +151,7 @@ func TestInitSetsUpTheJournalAndEveryMachineGetsTheSameSalt(t *testing.T) {
 // journal directory. init keeps them, in the clone, and the next sync publishes
 // them; nothing else is left behind.
 func TestInitKeepsRecordsWrittenBeforeIt(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "journal")
@@ -186,6 +181,7 @@ func TestInitKeepsRecordsWrittenBeforeIt(t *testing.T) {
 }
 
 func TestInitLeavesADirectoryWithOtherFilesAlone(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "journal")
@@ -209,6 +205,7 @@ func TestInitLeavesADirectoryWithOtherFilesAlone(t *testing.T) {
 // A machine whose syncs fail must not look idle: where says the last sync
 // failed, and which records have not been published.
 func TestWhereSaysWhenThisMachinesSyncFailedAndWhatIsUnpublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
@@ -360,6 +357,7 @@ func TestInitWithoutASaltRefusesAJournalThatHoldsRecords(t *testing.T) {
 // salt. Nothing would ever publish those: a sync files them under the fleet's id
 // and keeps the original file in the clone's git directory.
 func TestRecordsWrittenBeforeInitUnderAnotherSaltArePublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "before the salt was known"); err != nil {
@@ -387,6 +385,7 @@ func TestRecordsWrittenBeforeInitUnderAnotherSaltArePublished(t *testing.T) {
 }
 
 func TestInitSetsUpAnExistingEmptyDirectory(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if err := os.Mkdir(dir, 0o755); err != nil {
@@ -403,6 +402,7 @@ func TestInitSetsUpAnExistingEmptyDirectory(t *testing.T) {
 // An invalid fleetd.json reaching a machine by sync must not stop it recording,
 // nor stop the sync that brings in the fix.
 func TestAnInvalidFleetFileDoesNotStopRecordingOrSyncing(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	a, b := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
 	for _, dir := range []string{a, b} {
@@ -439,6 +439,7 @@ func TestAnInvalidFleetFileDoesNotStopRecordingOrSyncing(t *testing.T) {
 
 // A sync that cannot even start has failed, and where says so.
 func TestWhereSaysASyncThatCouldNotStartFailed(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -457,6 +458,7 @@ func TestWhereSaysASyncThatCouldNotStartFailed(t *testing.T) {
 // home directory, is not a clone of the journal, and where claims nothing about
 // what the journal has published.
 func TestWhereInsideAnotherRepositoryClaimsNothingAboutPublishing(t *testing.T) {
+	t.Parallel()
 	dotfiles := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", dotfiles, seed)
@@ -480,6 +482,7 @@ func TestWhereInsideAnotherRepositoryClaimsNothingAboutPublishing(t *testing.T) 
 }
 
 func TestInitRefusesACloneOfAnotherRepository(t *testing.T) {
+	t.Parallel()
 	one, two := emptyJournalRemote(t), emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", one); err != nil {
@@ -493,6 +496,7 @@ func TestInitRefusesACloneOfAnotherRepository(t *testing.T) {
 // Two records written with the same --at are the same bytes. With one of them
 // published, the other is still unpublished.
 func TestWhereCountsIdenticalRecordsAsUnpublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -556,6 +560,7 @@ func remoteBranchList(t *testing.T, remote string) string {
 // its only branch, is not empty: init follows that branch. It must not start a
 // second branch with a salt of its own, nor tell the person to delete one.
 func TestInitFollowsTheOnlyBranchOfARepositoryWhoseDefaultIsMissing(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t) // HEAD names main, which never gets a commit
 	recordsOn(t, remote, "master")
 	before := remoteBranchList(t, remote)
@@ -579,6 +584,7 @@ func TestInitFollowsTheOnlyBranchOfARepositoryWhoseDefaultIsMissing(t *testing.T
 // With several branches and no default among them, the journal could be on any:
 // init refuses, before anything is pushed, and names them.
 func TestInitRefusesSeveralBranchesWithoutADefault(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	recordsOn(t, remote, "master", "trunk")
 	before := remoteBranchList(t, remote)
@@ -672,6 +678,7 @@ func TestRerunningAnInterruptedInitFinishesIt(t *testing.T) {
 // An init killed before it finished leaves its temporary clone beside the
 // journal. The next init removes it, but not one an init still running may own.
 func TestInitRemovesAnAbandonedCloneButNotOneInUse(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	abandoned, current, notes := dir+".init-1111", dir+".init-2222", dir+".init-notes"
@@ -760,6 +767,7 @@ func TestInitReclaimWhoseSyncFailedSaysToRunItAgain(t *testing.T) {
 // push the remote refuses, makes init fail, with --json too, instead of
 // promising a retry.
 func TestInitFailsWhenNoLaterSyncCanPublish(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		want error
@@ -803,6 +811,7 @@ func TestInitFailsWhenNoLaterSyncCanPublish(t *testing.T) {
 // there, as when the remote deleted the branch meanwhile, finds it so again next
 // time: init fails, rather than promise a retry.
 func TestInitFailsWhenItsSyncFindsTheCloneOffTheJournalsBranch(t *testing.T) {
+	t.Parallel()
 	syncErr := fmt.Errorf("syncing: %w", gitsync.ErrNoUpstream)
 	if err := finalSyncError(syncErr, false); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "nothing can be published") {
 		t.Fatalf("finalSyncError = %v, want it to say nothing can be published", err)
@@ -890,6 +899,7 @@ func TestInitWhoseSyncRanOutOfTimeSaysTheNextOneRetries(t *testing.T) {
 
 // init that makes the fleet's salt up says so, rather than that it was given one.
 func TestInitSaysWhenItMadeTheSaltUp(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
@@ -908,6 +918,7 @@ func TestInitSaysWhenItMadeTheSaltUp(t *testing.T) {
 // A machine that joins a journal another machine records into has that machine's
 // records in its clone as soon as init returns, and nothing to commit.
 func TestASecondMachineHasTheOthersRecordsAfterInit(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	first := filepath.Join(t.TempDir(), "first")
 	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
@@ -937,6 +948,7 @@ func TestASecondMachineHasTheOthersRecordsAfterInit(t *testing.T) {
 // under no salt itself, without waiting for another sync, leaving nothing to
 // commit.
 func TestInitOnAnOldCloneFilesItsRecordsItself(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
@@ -965,6 +977,7 @@ func TestInitOnAnOldCloneFilesItsRecordsItself(t *testing.T) {
 
 // init --salt that contradicts the journal's salt is refused, and sets nothing up.
 func TestInitRefusesASaltThatContradictsTheJournalsAndSetsNothingUp(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
 		t.Fatal(err)
@@ -985,6 +998,7 @@ func TestInitRefusesASaltThatContradictsTheJournalsAndSetsNothingUp(t *testing.T
 // which would also name it, is best effort, and a virus scanner holding its
 // temporary file on Windows can keep it from being written.
 func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
+	t.Parallel()
 	for _, cached := range []bool{true, false} {
 		t.Run(map[bool]string{true: "the salt cached", false: "no salt cache"}[cached], func(t *testing.T) {
 			remote := emptyJournalRemote(t)
@@ -1034,6 +1048,7 @@ func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
 // A clone with no sync noted, such as one fleetd v0.1.0 synced, is not said
 // never to have synced: where says no sync is noted.
 func TestWhereOnACloneWithNoSyncNotedSaysSo(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1052,6 +1067,7 @@ func TestWhereOnACloneWithNoSyncNotedSaysSo(t *testing.T) {
 // init that starts an empty journal with the salt it was given says so, rather
 // than that the salt is new.
 func TestInitStartingAJournalWithAGivenSaltSaysSo(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	stdout, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
 	if err != nil || !strings.Contains(stdout, "with the salt this machine was given") || strings.Contains(stdout, "new salt") {
@@ -1063,6 +1079,7 @@ func TestInitStartingAJournalWithAGivenSaltSaysSo(t *testing.T) {
 // journal's fleetd.json put there by hand: init puts it in the index too, so no
 // sync keeps it as this machine's own change, and a later salt change reaches it.
 func TestInitAdoptsAnIdenticalFleetFileGitDoesNotTrack(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	seed := filepath.Join(t.TempDir(), "seed")
 	gitIn(t, filepath.Dir(seed), "clone", "--quiet", remote, seed)
@@ -1101,6 +1118,7 @@ func TestInitAdoptsAnIdenticalFleetFileGitDoesNotTrack(t *testing.T) {
 // holds the journal's fleetd.json: init leaves it as it is, rather than writing
 // it again and waiting for it to settle.
 func TestInitOnACRLFCloneLeavesItsFleetFileAlone(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1128,6 +1146,7 @@ func TestInitOnACRLFCloneLeavesItsFleetFileAlone(t *testing.T) {
 // the journal's out over it. Left alone, it would keep every later change to the
 // journal's fleetd.json from reaching this machine.
 func TestInitChecksOutAFleetFileGitSeesAsChanged(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1157,6 +1176,7 @@ func TestInitChecksOutAFleetFileGitSeesAsChanged(t *testing.T) {
 // it. When the note cannot be written, init fails and leaves the file as it was,
 // so that running it again loses nothing.
 func TestInitOnACloneKeepsAFleetFileWhoseSaltItCannotNote(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
 		t.Fatal(err)
@@ -1249,6 +1269,7 @@ func TestAnInitWhoseIndexUpdateFailsLeavesTheJournalsSaltInPlace(t *testing.T) {
 // main here holds a commit the remote lacks, so it stays where it is, and init's
 // sync says so, with the way to drop the commit that keeps this machine's records.
 func TestInitPutsACloneOnAnOrphanBranchBackWithoutMovingItsBranches(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1282,6 +1303,7 @@ func TestInitPutsACloneOnAnOrphanBranchBackWithoutMovingItsBranches(t *testing.T
 // origin, has nothing to follow. init refuses it, and its advice works: with the
 // .git directory gone, init sets the directory up as a new one, keeping its files.
 func TestInitOnACloneWithNoCommitSaysHowToSetItUp(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		name string
 		make func(t *testing.T, remote, dir string)
@@ -1328,6 +1350,7 @@ func TestInitOnACloneWithNoCommitSaysHowToSetItUp(t *testing.T) {
 // fleetd.json only as a regular file. So no record was written under the salt of
 // the file a link points at, and that salt is not noted.
 func TestInitReplacesAFleetFileThatIsASymbolicLink(t *testing.T) {
+	t.Parallel()
 	for _, own := range []bool{true, false} {
 		t.Run(map[bool]string{true: "to the journal's own content", false: "to another salt"}[own], func(t *testing.T) {
 			remote := emptyJournalRemote(t)
@@ -1374,6 +1397,7 @@ func TestInitReplacesAFleetFileThatIsASymbolicLink(t *testing.T) {
 // something other than a file. Records and syncs go on with the salt it last
 // held, and a sync brings in the fixed file.
 func TestAFleetFileThatBecameADirectoryDoesNotStopRecordingOrSyncing(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1429,6 +1453,7 @@ func TestAFleetFileThatBecameADirectoryDoesNotStopRecordingOrSyncing(t *testing.
 // init on a clone whose fleetd.json is a directory says so, and what to do,
 // rather than failing on a rename it cannot make.
 func TestInitOnACloneWhoseFleetFileIsADirectorySaysSo(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1457,6 +1482,7 @@ func TestInitOnACloneWhoseFleetFileIsADirectorySaysSo(t *testing.T) {
 // run init, rather than to push a branch it is not on; and init puts it back on
 // the journal's branch.
 func TestInitPutsADetachedCloneBackOnItsBranch(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1482,6 +1508,7 @@ func TestInitPutsADetachedCloneBackOnItsBranch(t *testing.T) {
 // directory and run init again, works then too: the journal's file takes the
 // directory's place in the index as well as in the work tree.
 func TestInitsAdviceForAFleetFileDirectoryASyncBroughtInWorks(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1538,6 +1565,7 @@ func TestInitsAdviceForAFleetFileDirectoryASyncBroughtInWorks(t *testing.T) {
 // journal's salt, not to none or to a salt the journal has since replaced:
 // records written meanwhile go under the fleet's id, not under a second one.
 func TestInitKeepsTheJournalsSaltForWhenFleetFileIsUnusable(t *testing.T) {
+	t.Parallel()
 	unusable := func(t *testing.T, dir string) {
 		t.Helper()
 		path := filepath.Join(dir, gitsync.FleetFile)
@@ -1595,6 +1623,7 @@ func TestInitKeepsTheJournalsSaltForWhenFleetFileIsUnusable(t *testing.T) {
 // read would record under a second id, or warn on every record. Nor is a larger
 // one read whole.
 func TestInitRefusesAJournalWhoseFleetFileIsTooLarge(t *testing.T) {
+	t.Parallel()
 	for name, big := range map[string]string{
 		"over 64 KiB":                       `{"salt": "s"}` + strings.Repeat(" ", 70<<10) + "\n",
 		"over 64 KiB once checked out CRLF": `{"salt": "s"}` + strings.Repeat("\n", 40<<10),
@@ -1630,6 +1659,7 @@ func TestInitRefusesAJournalWhoseFleetFileIsTooLarge(t *testing.T) {
 // would not read is replaced by the journal's. Since no command read it, no record
 // was written under its salt, and the salt is not noted.
 func TestInitOnANewDirectoryReplacesAFleetFileTooLargeToRead(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1658,6 +1688,7 @@ func TestInitOnANewDirectoryReplacesAFleetFileTooLargeToRead(t *testing.T) {
 // directory: init does not tell anyone to delete that. It puts the clone on the
 // journal's branch, and the notes stay.
 func TestInitOnAnUnbornCloneWithOriginsBranchesKeepsItsGitDirectory(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1687,6 +1718,7 @@ func TestInitOnAnUnbornCloneWithOriginsBranchesKeepsItsGitDirectory(t *testing.T
 // file as the journal's only if fleetd reads the journal's salt from it, so a clone
 // whose checkout no command could read gets git's copy written in its place.
 func TestInitReadsBackAFleetFileGitConvertedOnCheckout(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1721,6 +1753,7 @@ func TestInitReadsBackAFleetFileGitConvertedOnCheckout(t *testing.T) {
 // commit that follows origin's. Rather than failing on the commit it does not
 // have, init puts the clone on the journal's branch.
 func TestInitOnAPlainCloneOfTheEmptyJournalThatHasSinceFetched(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
@@ -1743,6 +1776,7 @@ func TestInitOnAPlainCloneOfTheEmptyJournalThatHasSinceFetched(t *testing.T) {
 // back without touching the file, and says to reclaim; init --reclaim publishes
 // every record this machine wrote.
 func TestAnOlderCommitCheckedOutByHandEndsWithEveryRecordPublished(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
@@ -1779,6 +1813,7 @@ func TestAnOlderCommitCheckedOutByHandEndsWithEveryRecordPublished(t *testing.T)
 // --branch names the journal's branch where init cannot tell which it is: a
 // machine set up with it follows that branch, not the remote's default.
 func TestInitFollowsTheBranchItIsTold(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	first := filepath.Join(t.TempDir(), "first")
 	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
@@ -1795,6 +1830,7 @@ func TestInitFollowsTheBranchItIsTold(t *testing.T) {
 // refused, and the message says that branch may not be the fleet's, rather than
 // to take its salt.
 func TestInitWithABranchWhoseSaltDiffersSaysTheBranchMayNotBeTheFleets(t *testing.T) {
+	t.Parallel()
 	remote := emptyJournalRemote(t)
 	first := filepath.Join(t.TempDir(), "first")
 	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
@@ -1813,5 +1849,45 @@ func TestInitWithABranchWhoseSaltDiffersSaysTheBranchMayNotBeTheFleets(t *testin
 	if !errors.Is(err, gitsync.ErrSaltMismatch) || !strings.Contains(err.Error(), "If docs holds the fleet's journal") ||
 		!strings.Contains(err.Error(), "name the branch that does with --branch") {
 		t.Fatalf("init --branch docs --salt s: %v, want ErrSaltMismatch saying docs may not be the fleet's", err)
+	}
+}
+
+// where reads origin's copy of the branch init recorded, not of the one a person
+// switched the clone to since, so records published on the journal's branch do
+// not read as unpublished.
+func TestWhereReadsTheRecordedBranchOnAClonePutOffIt(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published on main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	docs := filepath.Join(t.TempDir(), "docs")
+	gitIn(t, filepath.Dir(docs), "init", "--quiet", "--initial-branch=docs", docs)
+	if err := os.WriteFile(filepath.Join(docs, "README.md"), []byte("about\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, docs, "add", ".")
+	gitIn(t, docs, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "docs")
+	gitIn(t, docs, "push", "--quiet", remote, "docs")
+	gitIn(t, dir, "fetch", "--quiet", "origin")
+	gitIn(t, dir, "switch", "--quiet", "-c", "elsewhere")
+	gitIn(t, dir, "branch", "--quiet", "--set-upstream-to=origin/docs")
+	stdout, _, err := exec(t, "where", "--dir", dir, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []whereEntry
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil || len(entries) != 1 {
+		t.Fatalf("where --json: %v\n%s", err, stdout)
+	}
+	if entries[0].Unpublished != 0 || entries[0].LastPublished == "" {
+		t.Fatalf("where --json: unpublished %d, last_published %q; want 0 and a time", entries[0].Unpublished, entries[0].LastPublished)
 	}
 }

@@ -22,6 +22,7 @@ func exec(t *testing.T, args ...string) (stdout, stderr string, err error) {
 }
 
 func TestNoArgsPrintsUsageAndFails(t *testing.T) {
+	t.Parallel()
 	_, stderr, err := exec(t)
 	if err == nil {
 		t.Error("invoking with no command succeeded; it should explain itself and fail")
@@ -32,6 +33,7 @@ func TestNoArgsPrintsUsageAndFails(t *testing.T) {
 }
 
 func TestUnknownCommandNamesItAndShowsUsage(t *testing.T) {
+	t.Parallel()
 	_, stderr, err := exec(t, "wat")
 	if err == nil || !strings.Contains(err.Error(), `"wat"`) {
 		t.Errorf("err = %v, want it to quote the unknown command", err)
@@ -42,6 +44,7 @@ func TestUnknownCommandNamesItAndShowsUsage(t *testing.T) {
 }
 
 func TestHostJSONCarriesTheHonestAttributionFields(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "host", "--json", "--salt", "t")
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +95,7 @@ func TestSaltFromEnvironmentIsUsedAndSeparatesIdentity(t *testing.T) {
 }
 
 func TestRecordRequiresAType(t *testing.T) {
+	t.Parallel()
 	_, _, err := exec(t, "record", "--dir", t.TempDir(), "--salt", "t", "--note", "x")
 	if err == nil || !strings.Contains(err.Error(), "--type") {
 		t.Errorf("err = %v, want a complaint that --type is required", err)
@@ -99,6 +103,7 @@ func TestRecordRequiresAType(t *testing.T) {
 }
 
 func TestRecordRejectsABadTimestamp(t *testing.T) {
+	t.Parallel()
 	_, _, err := exec(t, "record", "--dir", t.TempDir(), "--salt", "t",
 		"--type", "note", "--at", "last tuesday")
 	if err == nil || !strings.Contains(err.Error(), "RFC3339") {
@@ -107,6 +112,7 @@ func TestRecordRejectsABadTimestamp(t *testing.T) {
 }
 
 func TestWhereOnAnEmptyStoreSaysSoAndSucceeds(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	stdout, _, err := exec(t, "where", "--dir", dir)
 	if err != nil {
@@ -118,6 +124,7 @@ func TestWhereOnAnEmptyStoreSaysSoAndSucceeds(t *testing.T) {
 }
 
 func TestRecordThenWhereAnswersTheQuestion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "handoff",
 		"--repo", "ai-workspace", "--branch", "main", "--agent", "claude/cloud",
@@ -154,6 +161,7 @@ func TestRecordThenWhereAnswersTheQuestion(t *testing.T) {
 }
 
 func TestWhereSeparatesMachinesAndOrdersNewestFirst(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Two salts give two distinct host identities, which is how a second machine
 	// appears without needing a second machine.
@@ -186,6 +194,7 @@ func TestWhereSeparatesMachinesAndOrdersNewestFirst(t *testing.T) {
 }
 
 func TestRecordedLineCarriesHostAttribution(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	stdout, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
 		"--at", "2026-09-14T13:00:00Z", "--note", "n", "--json")
@@ -219,6 +228,7 @@ func TestRecordedLineCarriesHostAttribution(t *testing.T) {
 }
 
 func TestMachinesAreOrderedByInstantNotByStringCompare(t *testing.T) {
+	t.Parallel()
 	// The wrong answer this pins: lexical comparison of RFC3339 is only correct
 	// when every timestamp is UTC "Z". Machine A at 10:00+05:00 is 05:00Z, which
 	// is EARLIER than machine B at 06:00Z, but sorts later as a string. That
@@ -253,6 +263,7 @@ func TestMachinesAreOrderedByInstantNotByStringCompare(t *testing.T) {
 }
 
 func TestTwoRecordsInTheSameSecondAreDistinct(t *testing.T) {
+	t.Parallel()
 	// At whole-second resolution two successive records produced byte-identical
 	// cells with the same content-derived id. Since a reader is documented to
 	// collapse colliding ids, one of two genuinely distinct events would simply
@@ -279,6 +290,7 @@ func TestTwoRecordsInTheSameSecondAreDistinct(t *testing.T) {
 }
 
 func TestOSAccountIsNotPublishedUnlessAskedFor(t *testing.T) {
+	t.Parallel()
 	// internal/hostid deliberately publishes only a digest of the machine
 	// identifier. Emitting the OS account in the same record would undo that: on
 	// a domain-joined Windows host user.Current().Username is DOMAIN\account, so
@@ -305,6 +317,7 @@ func TestOSAccountIsNotPublishedUnlessAskedFor(t *testing.T) {
 }
 
 func TestLimitAppliesToJSONAsWellAsTheTerminal(t *testing.T) {
+	t.Parallel()
 	// --limit used to be read only by the human branch, so a program asking for
 	// the last N entries silently received one and could not tell.
 	dir := t.TempDir()
@@ -337,6 +350,7 @@ func TestLimitAppliesToJSONAsWellAsTheTerminal(t *testing.T) {
 }
 
 func TestOutOfOrderTimestampsAreFlaggedNotHidden(t *testing.T) {
+	t.Parallel()
 	// Append order is what gets reported, because it is what actually happened
 	// and does not depend on a clock. When a host's own timestamps disagree with
 	// that order, presenting the file-order-last entry as "last" is still correct
@@ -377,6 +391,7 @@ func TestOutOfOrderTimestampsAreFlaggedNotHidden(t *testing.T) {
 }
 
 func TestMonotonicTimestampsAreNotFlagged(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i, ts := range []string{"2026-09-22T05:00:00Z", "2026-09-22T06:00:00Z"} {
 		if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
@@ -398,12 +413,14 @@ func TestMonotonicTimestampsAreNotFlagged(t *testing.T) {
 }
 
 func TestLimitBelowOneIsRejected(t *testing.T) {
+	t.Parallel()
 	if _, _, err := exec(t, "where", "--dir", t.TempDir(), "--limit", "0"); err == nil {
 		t.Error("--limit 0 was accepted")
 	}
 }
 
 func TestMistypedDirIsAnErrorNotAnEmptyAnswer(t *testing.T) {
+	t.Parallel()
 	missing := filepath.Join(t.TempDir(), "channles", "journal")
 	stdout, _, err := exec(t, "where", "--dir", missing)
 	if err == nil {
@@ -438,6 +455,7 @@ func readJournal(t *testing.T, dir string) string {
 }
 
 func TestPluralReadsLikeEnglish(t *testing.T) {
+	t.Parallel()
 	for n, want := range map[int]string{0: "0 records", 1: "1 record", 2: "2 records"} {
 		if got := plural(n, "record"); got != want {
 			t.Errorf("plural(%d) = %q, want %q", n, got, want)
@@ -446,6 +464,7 @@ func TestPluralReadsLikeEnglish(t *testing.T) {
 }
 
 func TestVersionNamesTheBuildAndPlatform(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "version")
 	if err != nil {
 		t.Fatalf("version failed: %v", err)
@@ -490,6 +509,7 @@ func TestTheJournalDefaultsToTheHomeDirectoryNotTheCurrentOne(t *testing.T) {
 // --json is for programs; an empty journal is an empty list to them, not a
 // sentence.
 func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "where", "--json", "--dir", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -503,6 +523,7 @@ func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
 // A salt is used exactly as given: one kept with a space trimmed off would give
 // the same machine a second id when fleetd.json is invalid.
 func TestTheCachedSaltIsKeptExactly(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -518,6 +539,7 @@ func TestTheCachedSaltIsKeptExactly(t *testing.T) {
 // PROTOCOL.md, the canonical command list, lists fleetd's commands as the usage
 // text does, line for line, so neither can gain or lose a flag alone.
 func TestProtocolListsTheCommandsTheUsageDoes(t *testing.T) {
+	t.Parallel()
 	data, err := os.ReadFile(filepath.Join("..", "..", "PROTOCOL.md"))
 	if err != nil {
 		t.Fatal(err)

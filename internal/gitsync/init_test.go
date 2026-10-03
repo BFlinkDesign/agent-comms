@@ -319,9 +319,9 @@ func TestASecondMachineFollowsTheOnlyBranchWhenTheServerNamesNone(t *testing.T) 
 func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
-	for _, at := range []string{"--show-toplevel", "remote.origin.url", "@{u}", "fleetd.branch",
+	for _, at := range []string{"--show-toplevel", "remote.origin.url", "@{u}",
 		"detached symbolic-ref", "detached ls-remote", "detached update-ref", "detached read-tree",
-		"unrecorded --replace-all+fleetd.branch", "behind merge-base", "hand for-each-ref"} {
+		"behind merge-base", "hand for-each-ref"} {
 		t.Run(at, func(t *testing.T) {
 			t.Parallel()
 			remote := newEmptyRemote(t)
@@ -338,12 +338,9 @@ func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 				run(t, other, "commit", "--quiet", "-m", "b")
 				run(t, other, "push", "--quiet")
 				switch state {
-				case "detached", "unrecorded":
+				case "detached":
 					run(t, dir, "checkout", "--quiet", "--detach")
 					run(t, dir, "branch", "--quiet", "-D", "main")
-					if state == "unrecorded" {
-						unrecord(t, dir)
-					}
 				case "behind":
 					run(t, dir, "checkout", "--quiet", "--detach")
 				case "hand":
@@ -354,8 +351,7 @@ func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			_, err := Init(ctx, InitOptions{URL: remote, Dir: dir, Run: func(ctx context.Context, d string, stdin []byte, args ...string) (string, error) {
-				// A call named by several arguments, a+b, has all of them.
-				if !slices.ContainsFunc(strings.Split(at, "+"), func(arg string) bool { return !slices.Contains(args, arg) }) {
+				if slices.Contains(args, at) {
 					cancel()
 				}
 				return Git(ctx, d, stdin, args...)
@@ -764,12 +760,8 @@ func clonedState(t *testing.T, dir string) string {
 // set up before init recorded one has none.
 func unrecord(t *testing.T, dir string) {
 	t.Helper()
-	// git config exits 5 when there was nothing to take away.
-	if err := exec.Command("git", "-C", dir, "config", "--unset-all", "fleetd.branch").Run(); err != nil {
-		var exit *exec.ExitError
-		if !errors.As(err, &exit) || exit.ExitCode() != 5 {
-			t.Fatal(err)
-		}
+	if err := os.Remove(filepath.Join(dir, ".git", branchName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
 	}
 }
 
@@ -1601,6 +1593,23 @@ func TestInitRemembersTheBranchItPutsTheJournalOn(t *testing.T) {
 			t.Fatalf("sync on a clone switched to main: %v, want ErrNoUpstream", err)
 		}
 	})
+	t.Run("a stray branch the clone was switched to, deleted", func(t *testing.T) {
+		t.Parallel()
+		remote, _ := splitRemote(t)
+		c := filepath.Join(t.TempDir(), "c")
+		mustInit(t, InitOptions{URL: remote, Dir: c, Branch: "journal"})
+		run(t, c, "push", "--quiet", "origin", "journal:refs/heads/stray")
+		run(t, c, "fetch", "--quiet", "origin")
+		run(t, c, "switch", "--quiet", "-c", "stray", "--track", "origin/stray")
+		run(t, c, "push", "--quiet", "origin", ":refs/heads/stray")
+		if res := mustInit(t, InitOptions{URL: remote, Dir: c}); !res.Reattached || res.Branch != "journal" {
+			t.Fatalf("init = %+v, want the clone put back on journal", res)
+		}
+		if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/stray").Output(); err == nil {
+			t.Fatalf("stray came back, at %s", out)
+		}
+		onJournal(t, remote, c, "host-c", `{"id":"hive:later"}`)
+	})
 	t.Run("a recorded branch the remote deleted", func(t *testing.T) {
 		t.Parallel()
 		remote, _ := splitRemote(t)
@@ -1614,7 +1623,8 @@ func TestInitRemembersTheBranchItPutsTheJournalOn(t *testing.T) {
 		if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "journal is the journal's branch, the one init set this clone up on") {
 			t.Fatalf("init: %v, want ErrNoUpstream saying the recorded branch is gone", err)
 		}
-		for _, want := range []string{"`fleetd init --dir \"" + c + "\" --branch <branch> <journal URL>`", "`git push origin HEAD:<branch>` in its journal directory and journal for <branch>"} {
+		for _, want := range []string{"`fleetd init --dir \"" + c + "\" --branch <branch> <journal URL>`",
+			"`git -C \"" + c + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with journal for <local> and journal for <branch>"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("init: %v, want it to say %s", err, want)
 			}
@@ -1734,9 +1744,37 @@ func TestInitPutsRightAFetchThatTakesOriginsBranchesElsewhere(t *testing.T) {
 		write(t, cfg, "[include]\n\tpath = "+filepath.ToSlash(inc)+"\n"+readFile(t, cfg))
 		run(t, a, "fetch", "--quiet", "origin")
 		_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
-		if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "remote.origin.fetch line in a file") {
+		if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "for remote.origin.fetch or for the branch") {
 			t.Fatalf("init: %v, want ErrNoUpstream naming the included line", err)
 		}
+	})
+	t.Run("the branch's remote in a file the clone's config includes", func(t *testing.T) {
+		t.Parallel()
+		remote, m := newFleet(t, 1)
+		a := m[0]
+		run(t, a, "remote", "add", "backup", remote)
+		run(t, a, "fetch", "--quiet", "backup")
+		inc := filepath.Join(t.TempDir(), "branch.cfg")
+		write(t, inc, "[branch \"main\"]\n\tremote = backup\n")
+		run(t, a, "config", "--add", "include.path", filepath.ToSlash(inc))
+		run(t, a, "checkout", "--quiet", "--detach")
+		_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
+		if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "for remote.origin.fetch or for the branch") ||
+			!strings.Contains(err.Error(), "config --show-origin --list") {
+			t.Fatalf("init: %v, want ErrNoUpstream naming the included line, for the fetch or the branch", err)
+		}
+	})
+	t.Run("a branch named @", func(t *testing.T) {
+		t.Parallel()
+		remote := newEmptyRemote(t)
+		dir := filepath.Join(t.TempDir(), "journal")
+		mustInit(t, InitOptions{URL: remote, Dir: dir, Salt: "s", Branch: "@"})
+		run(t, dir, "checkout", "--quiet", "--detach")
+		if res := mustInit(t, InitOptions{URL: remote, Dir: dir}); !res.Reattached || res.Branch != "@" {
+			t.Fatalf("init = %+v, want the clone put back on @", res)
+		}
+		appendLines(t, filepath.Join(dir, "host-a.jsonl"), `{"id":"hive:a1"}`)
+		mustSync(t, options(dir, "host-a"))
 	})
 	t.Run("narrowed to the journal's branch", func(t *testing.T) {
 		t.Parallel()
@@ -1751,4 +1789,145 @@ func TestInitPutsRightAFetchThatTakesOriginsBranchesElsewhere(t *testing.T) {
 			t.Fatalf("the clone fetches %q", got)
 		}
 	})
+}
+
+// A record of the journal's branch that cannot be read, a directory put where
+// the file goes, say, stops sync and init alike, saying what to do, and is never
+// taken for no record, which would let sync publish wherever the clone points;
+// the advice followed works.
+func TestARecordOfTheJournalsBranchThatCannotBeReadStopsSyncAndInit(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	record := filepath.Join(a, ".git", branchName)
+	if got := strings.TrimSpace(readFile(t, record)); got != "main" {
+		t.Fatalf("init recorded %q, want main", got)
+	}
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(record, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	for _, step := range []string{"sync", "init"} {
+		var err error
+		if step == "sync" {
+			_, err = Sync(context.Background(), options(a, "host-a"))
+		} else {
+			_, err = Init(context.Background(), InitOptions{URL: remote, Dir: a})
+		}
+		if err == nil || !strings.Contains(err.Error(), record+", init's record of the journal's branch, cannot be read") ||
+			!strings.Contains(err.Error(), "delete it, then run fleetd init again") {
+			t.Fatalf("%s: %v, want it to say the record cannot be read", step, err)
+		}
+	}
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" {
+		t.Fatalf("init = %+v, want the clone on main", res)
+	}
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+}
+
+// The recorded branch, deleted from origin by mistake, is pushed back as init
+// says on a clone off it, switched to another branch or detached: never this
+// clone's HEAD, which is not the journal's, but the branch here that followed
+// the recorded one; with it back, init puts the clone on it again, keeping the
+// journal's salt, and the other machine's next sync takes it up again.
+func TestARecordedBranchGoneIsPushedBackFromTheBranchThatHeldIt(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, c := range []struct {
+		name string
+		off  func(t *testing.T, remote, a string)
+	}{
+		{"switched to a branch holding a README", func(t *testing.T, remote, a string) {
+			docs := filepath.Join(t.TempDir(), "docs")
+			run(t, filepath.Dir(docs), "init", "--quiet", "--initial-branch=docs", docs)
+			identify(t, docs)
+			write(t, filepath.Join(docs, "README.md"), "about this repository\n")
+			run(t, docs, "add", ".")
+			run(t, docs, "commit", "--quiet", "-m", "docs")
+			run(t, docs, "push", "--quiet", remote, "docs")
+			run(t, a, "fetch", "--quiet", "origin")
+			run(t, a, "switch", "--quiet", "docs")
+		}},
+		{"detached", func(t *testing.T, remote, a string) {
+			run(t, a, "checkout", "--quiet", "--detach")
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 2)
+			a, b := m[0], m[1]
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			mustInit(t, InitOptions{URL: remote, Dir: b, Salt: "s"})
+			appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b1"}`)
+			mustSync(t, options(b, "host-b"))
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			mustSync(t, options(a, "host-a"))
+			c.off(t, remote, a)
+			run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a})
+			if !errors.Is(err, ErrNoUpstream) || strings.Contains(err.Error(), "push origin HEAD") {
+				t.Fatalf("init: %v, want ErrNoUpstream, never saying to push this clone's HEAD", err)
+			}
+			want := "`git -C \"" + a + "\" push origin refs/heads/<local>:refs/heads/<branch>`, with main for <local> and main for <branch>"
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("init: %v, want it to say %s", err, want)
+			}
+			run(t, a, "push", "--quiet", "origin", "refs/heads/main:refs/heads/main")
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); res.Branch != "main" || res.Salt != "s" || res.WroteFleetFile {
+				t.Fatalf("init = %+v, want the clone back on main, with salt s", res)
+			}
+			appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b2"}`)
+			mustSync(t, options(b, "host-b"))
+			if got := remoteFile(t, remote, "host-b.jsonl"); got != "{\"id\":\"hive:b1\"}\n{\"id\":\"hive:b2\"}\n" {
+				t.Fatalf("main holds %q for host-b", got)
+			}
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+				t.Fatalf("main holds %q for host-a", got)
+			}
+		})
+	}
+}
+
+// Two machines adding fleetd.json at once to two branches that hold no journal,
+// a README each, would each find no journal before pushing; the one that looks
+// again after its push finds the other's, and says the journal was started on
+// two branches at once.
+func TestTwoMachinesAddingTheJournalToTwoBranchesAtOnceAreToldSo(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "init", "--quiet", "--initial-branch=main", w)
+	identify(t, w)
+	write(t, filepath.Join(w, "README.md"), "about\n")
+	run(t, w, "add", ".")
+	run(t, w, "commit", "--quiet", "-m", "readme")
+	run(t, w, "push", "--quiet", remote, "main", "main:docs")
+	a, b := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+	raced := false
+	var errB error
+	_, errA := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a",
+		Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+			if !raced && slices.Contains(args, "push") {
+				raced = true
+				_, errB = Init(ctx, InitOptions{URL: remote, Dir: b, Salt: "b", Branch: "docs"})
+			}
+			return Git(ctx, dir, stdin, args...)
+		}})
+	if !raced || errB != nil {
+		t.Fatalf("raced %v, the other machine's init: %v", raced, errB)
+	}
+	if errA == nil || !strings.Contains(errA.Error(), "the journal was started on two branches at once, main and docs") {
+		t.Fatalf("init: %v, want it told the journal was started on two branches at once", errA)
+	}
 }

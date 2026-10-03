@@ -28,13 +28,6 @@ func twoMachines(t *testing.T) (a, b string) {
 	if _, err := osexec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
-	empty := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", empty)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-
 	root := t.TempDir()
 	remote := filepath.Join(root, "journal.git")
 	gitIn(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
@@ -59,6 +52,7 @@ func twoMachines(t *testing.T) (a, b string) {
 }
 
 func TestTwoMachinesSyncAndEitherCanSayWhoDidWhat(t *testing.T) {
+	t.Parallel()
 	a, b := twoMachines(t)
 	// Distinct salts stand in for distinct machines: the host id is a salted
 	// digest, so each clone gets its own journal file, as two real PCs would.
@@ -95,6 +89,7 @@ func TestTwoMachinesSyncAndEitherCanSayWhoDidWhat(t *testing.T) {
 }
 
 func TestSyncReportsWhatItDidAsJSON(t *testing.T) {
+	t.Parallel()
 	a, _ := twoMachines(t)
 	if _, _, err := exec(t, "record", "--dir", a, "--salt", "s", "--type", "note", "--note", "one"); err != nil {
 		t.Fatal(err)
@@ -117,6 +112,7 @@ func TestSyncReportsWhatItDidAsJSON(t *testing.T) {
 }
 
 func TestSyncOutsideACloneExplainsItself(t *testing.T) {
+	t.Parallel()
 	if _, err := osexec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
@@ -127,6 +123,7 @@ func TestSyncOutsideACloneExplainsItself(t *testing.T) {
 }
 
 func TestSyncNamesAFileItLeftAloneAndHowToTakeTheRemotesCopy(t *testing.T) {
+	t.Parallel()
 	a, b := twoMachines(t)
 	if err := os.WriteFile(filepath.Join(a, "README.md"), []byte("edited on cnc-1\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -154,6 +151,7 @@ func TestSyncNamesAFileItLeftAloneAndHowToTakeTheRemotesCopy(t *testing.T) {
 // A lock file sync removes before it then fails is still reported, on stderr:
 // the next sync finds nothing to remove, so this is the only time it is said.
 func TestClearedLocksAreReportedWhenTheSyncThenFails(t *testing.T) {
+	t.Parallel()
 	a, _ := twoMachines(t)
 	lock := filepath.Join(a, ".git", "index.lock")
 	if err := os.WriteFile(lock, nil, 0o644); err != nil {
