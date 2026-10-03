@@ -317,6 +317,25 @@ Do NOT start work on a blocked task. Post empty status cells while waiting = pro
 
 ## Agent Dispatch Loop (agent-runner.sh)
 
+Runner outcomes preserve the agent process exit code in `data.exit_code`.
+A nonzero exit produces an `error` cell, never a `result`; this includes a
+timeout reported by the Codex wrapper. Claude's human-review handoff and
+insufficient successful output produce `blocked` cells. Neither failure nor
+cancellation satisfies a legacy `depends_on` prerequisite. The first terminal
+legacy event in file order is permanent; a later result cannot erase a failure.
+
+`result` remains an unverified process output. A successful CLI exit and a long
+answer do not establish artifact correctness or independent acceptance.
+Verification and deployment require their separate existing authority and checks.
+
+For an isolated one-poll check, set `RUNNER_ONCE=1`; the runner executes at most
+one eligible task and exits. `RUNNER_STATE_DIR` can point local processed receipts
+at a throwaway directory instead of `~/.ai`. A receipt is written only after the
+outcome writer succeeds. These controls do not provide lease expiry, transactional
+outbox recovery, or reconciliation of interrupted external actions. Do not replay
+an uncertain in-flight task automatically. Board/JSONL reconciliation and fenced
+attempt ownership remain separate work.
+
 Replaces manual prompting. Run once per agent terminal.
 
 ```bash
@@ -328,9 +347,9 @@ What it does:
 1. Polls channel every 5 seconds
 2. Finds SUBMITTED tasks tagged for this agent (or untagged)
 3. Checks dependencies — skips BLOCKED tasks
-4. Claims via race-safe lease
+4. Appends a claim and checks the first claimant in file order (no expiring attempt lease)
 5. Invokes CLI, captures output
-6. Posts COMPLETE result cell
+6. Posts result, error or blocked according to the actual invocation outcome
 7. Loops forever
 
 POLL_SECS env var overrides the 5-second default.

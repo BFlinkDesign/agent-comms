@@ -15,6 +15,8 @@
 #   AGENT_CMD    -- CLI binary to invoke: "gemini" | "codex" | "claude"
 #   POLL_SECS    -- poll interval in seconds (default: 5)
 #   CHANNELS_DIR -- override channel directory (default: ~/.ai/channels)
+#   RUNNER_STATE_DIR -- override local receipt directory (default: ~/.ai)
+#   RUNNER_ONCE -- set to 1 to perform one poll/at most one task, then exit
 # =============================================================================
 
 set -euo pipefail
@@ -42,7 +44,9 @@ CHANNEL_FILE="${CHANNELS_DIR}/${CHANNEL}.jsonl"
 # State file tracks which task IDs this runner has already processed
 # (prevents reprocessing after restart if tasks are already claimed/completed)
 AGENT_SLUG="${COMMS_AGENT//\//-}"
-STATE_FILE="${HOME}/.ai/runner-state-${AGENT_SLUG}.txt"
+RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-${HOME}/.ai}"
+STATE_FILE="${RUNNER_STATE_DIR}/runner-state-${AGENT_SLUG}.txt"
+RUNNER_ONCE="${RUNNER_ONCE:-0}"
 
 # ---------------------------------------------------------------------------
 # Safety guard: refuse to actually invoke claude CLI in runner context.
@@ -68,7 +72,7 @@ log() {
 
 ensure_dirs() {
   mkdir -p "${CHANNELS_DIR}"
-  mkdir -p "${HOME}/.ai"
+  mkdir -p "${RUNNER_STATE_DIR}"
   if [[ ! -f "$CHANNEL_FILE" ]]; then
     touch "$CHANNEL_FILE"
   fi
@@ -195,34 +199,33 @@ with open(channel_file, encoding='utf-8') as f:
 # ---------------------------------------------------------------------------
 invoke_agent() {
   local prompt="$1"
-  local output=""
 
   case "$AGENT_CMD" in
     gemini)
       # gemini -p "prompt" -- non-interactive, returns answer to stdout
-      output=$(gemini -p "$prompt" 2>&1) || true
+      gemini -p "$prompt" 2>&1
       ;;
     codex)
       # codex "prompt" -- routed through codex-wrap.py for clean output
       # The wrapper strips progress bars, formats test counts, and ensures
       # the result cell always contains meaningful content.
-      output=$(echo "$prompt" | python "C:/tools/agent-comms/codex-wrap.py" 2>&1) || true
+      printf '%s\n' "$prompt" | python "${COMMS_DIR}/codex-wrap.py" 2>&1
       ;;
     claude)
       # claude --print "prompt" -- non-interactive Claude Code
       # Special case: in runner mode we log rather than invoke (costly + session-aware)
       if [[ "$CLAUDE_RUNNER_MODE" == "true" ]]; then
-        output="[RUNNER] claude runner mode: task logged for human review. Prompt: ${prompt}"
+        printf '%s\n' "[RUNNER] claude runner mode: task requires human review. Prompt: ${prompt}"
+        return 75
       else
-        output=$(claude --print "$prompt" 2>&1) || true
+        claude --print "$prompt" 2>&1
       fi
       ;;
     *)
-      output="[RUNNER] ERROR: unknown AGENT_CMD '${AGENT_CMD}' — cannot invoke"
+      printf '%s\n' "[RUNNER] ERROR: unknown AGENT_CMD '${AGENT_CMD}' — cannot invoke"
+      return 127
       ;;
   esac
-
-  echo "$output"
 }
 
 # ---------------------------------------------------------------------------
@@ -257,9 +260,11 @@ while true; do
   log "Checking ${CHANNEL} for tasks..."
 
   # Read all open tasks (not yet claimed or completed)
-  open_tasks=$(find_open_tasks 2>/dev/null) || open_tasks=""
+  # A broken scanner is an error, never evidence that the channel is quiet.
+  open_tasks=$(find_open_tasks)
 
   if [[ -z "$open_tasks" ]]; then
+    [[ "$RUNNER_ONCE" == "1" ]] && break
     log "Channel quiet — ${POLL_SECS}s until next check"
     sleep "$POLL_SECS"
     continue
@@ -290,40 +295,47 @@ while true; do
     # Attempt to claim the task (race-safe)
     if claim_task "$task_id"; then
       log "Claimed task hive:${task_id}"
-      mark_processed "$task_id"
       found_work=true
 
       # Invoke the agent CLI
       log "Invoking ${AGENT_CMD}..."
-      agent_output=$(invoke_agent "$task_msg") || agent_output="[RUNNER] agent invocation failed or returned empty"
+      agent_exit=0
+      agent_output=$(invoke_agent "$task_msg") || agent_exit=$?
+      outcome_type="result"
+      if [[ "$CLAUDE_RUNNER_MODE" == "true" ]]; then
+        outcome_type="blocked"
+      elif [[ "$agent_exit" -ne 0 ]]; then
+        outcome_type="error"
+      elif [[ ${#agent_output} -lt 30 ]]; then
+        # A padded warning is not an accepted result. Preserve the short output
+        # and require review without unblocking dependent work.
+        outcome_type="blocked"
+        log "Agent returned insufficient output; task requires review"
+      fi
 
       # Truncate output for the msg field (channel cells have practical size limits)
       msg_summary="${agent_output:0:200}"
       [[ ${#agent_output} -gt 200 ]] && msg_summary="${msg_summary}...(truncated)"
 
-      # Output validation: flag suspiciously short responses before writing.
-      # Fewer than 30 chars almost always means the agent echoed an identifier
-      # instead of actual findings (the "TASK-3" / "deployer" garbage problem).
-      if [[ ${#agent_output} -lt 30 ]]; then
-        log "WARNING: agent output is ${#agent_output} chars (< 30) — possible empty response"
-        agent_output="${agent_output} [WARNING: output too short — possible empty response]"
-        msg_summary="${agent_output}"
-      fi
-
-      # Write result cell
+      # A result records process success, not independent verification.
+      # Nonzero exits and human handoffs must never become result cells.
       result_data=$(python -c "
 import json, sys
 data = {
     'task_id': sys.argv[1],
     'agent':   sys.argv[2],
     'output':  sys.argv[3],
+    'exit_code': int(sys.argv[4]),
+    'outcome': sys.argv[5],
 }
 print(json.dumps(data))
-" "$task_id" "$COMMS_AGENT" "$agent_output")
+" "$task_id" "$COMMS_AGENT" "$agent_output" "$agent_exit" "$outcome_type")
 
-      write_cell "$CHANNEL" "result" "result for ${task_id}: ${msg_summary}" "$result_data" > /dev/null
+      write_cell "$CHANNEL" "$outcome_type" "${outcome_type} for ${task_id}: ${msg_summary}" "$result_data" > /dev/null
+      # Only acknowledge locally after the outcome writer reports success.
+      mark_processed "$task_id"
 
-      log "Task hive:${task_id} complete — result posted"
+      log "Task ${task_id}: ${outcome_type} posted (process exit ${agent_exit}); independent verification remains separate"
       echo ""
 
       # Break after completing one task; re-poll for more
@@ -335,6 +347,8 @@ print(json.dumps(data))
     fi
 
   done <<< "$open_tasks"
+
+  [[ "$RUNNER_ONCE" == "1" ]] && break
 
   if [[ "$found_work" == "false" ]]; then
     log "Channel quiet — scanning for proactive work"

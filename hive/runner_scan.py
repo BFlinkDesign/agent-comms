@@ -36,15 +36,15 @@ def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
 
     A task is claimable when:
       1. no claim cell references it (via data.task_id), AND
-      2. no result/error cell references it (via data.task_id), AND
-      3. every task id in data.depends_on has a result/error cell.
+      2. no result/error/cancel/blocked cell references it (via data.task_id), AND
+      3. every task id in data.depends_on is a known successfully completed task.
 
     Unknown dependency ids count as unsatisfied (FLEET-OPS incident: Codex
     claimed TASK-3 before TASK-2 was even posted).
     """
     tasks: dict[str, dict[str, Any]] = {}
     claimed: set[str] = set()
-    done: set[str] = set()
+    terminal: dict[str, str] = {}
 
     for line in lines:
         line = line.strip()
@@ -53,6 +53,8 @@ def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
         try:
             cell = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(cell, dict):
             continue
 
         ctype = cell.get("type", "")
@@ -63,23 +65,25 @@ def scan(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
 
         if ctype == "task":
             tasks[cid] = cell
-        elif ctype == "claim":
+        elif ctype in ("claim", "blocked"):
             tid = data.get("task_id", "")
             if tid:
                 claimed.add(tid)
-        elif ctype in ("result", "error"):
+        elif ctype in ("result", "error", "cancel"):
             tid = data.get("task_id", "")
             if tid:
-                done.add(tid)
+                # Terminal state is permanent; file order, not writer clocks,
+                # decides conflicting legacy outcomes.
+                terminal.setdefault(tid, ctype)
 
     for tid, cell in tasks.items():
-        if tid in claimed or tid in done:
+        if tid in claimed or tid in terminal:
             continue
         deps = cell.get("data", {})
         deps = deps.get("depends_on", []) if isinstance(deps, dict) else []
         if not isinstance(deps, list):
             deps = []
-        if any(dep not in done for dep in deps):
+        if any(dep not in tasks or terminal.get(dep) != "result" for dep in deps):
             continue
         yield tid, cell.get("msg", "") or cell.get("data", {}).get("title", "")
 
