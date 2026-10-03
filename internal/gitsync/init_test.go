@@ -1818,7 +1818,9 @@ func TestARecordOfTheJournalsBranchThatCannotBeReadStopsSyncAndInit(t *testing.T
 		} else {
 			_, err = Init(context.Background(), InitOptions{URL: remote, Dir: a})
 		}
-		if err == nil || !strings.Contains(err.Error(), record+", init's record of the journal's branch, cannot be read") ||
+		// The path is the one git gives for the git directory, which on Windows
+		// can be the long form of a short temporary path.
+		if err == nil || !strings.Contains(err.Error(), branchName+", init's record of the journal's branch, cannot be read") ||
 			!strings.Contains(err.Error(), "delete it, then run fleetd init again") {
 			t.Fatalf("%s: %v, want it to say the record cannot be read", step, err)
 		}
