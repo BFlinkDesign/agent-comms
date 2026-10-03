@@ -792,6 +792,16 @@ func TestInitFailsWhenNoLaterSyncCanPublish(t *testing.T) {
 	}
 }
 
+// A sync that finds the clone off the journal's branch right after init put it
+// there, as when the remote deleted the branch meanwhile, finds it so again next
+// time: init fails, rather than promise a retry.
+func TestInitFailsWhenItsSyncFindsTheCloneOffTheJournalsBranch(t *testing.T) {
+	syncErr := fmt.Errorf("syncing: %w", gitsync.ErrNoUpstream)
+	if err := finalSyncError(syncErr, false); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "nothing can be published") {
+		t.Fatalf("finalSyncError = %v, want it to say nothing can be published", err)
+	}
+}
+
 // Re-filing is bounded by the sync's --timeout, whether git stalls or a rename
 // keeps failing, and a sync that runs out of time while re-filing says so,
 // rather than that the clone has no upstream.

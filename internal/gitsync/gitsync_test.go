@@ -623,27 +623,40 @@ func TestAnOlderCommitCheckedOutIsPutBackAndLeftForReclaim(t *testing.T) {
 	}
 }
 
-// A clone whose branch the remote deleted, or renamed, and whose remote-tracking
-// copy of it was pruned, is told so, not to push it: that would recreate the
-// branch the fleet left. A tag named like the branch changes nothing.
+// A clone whose branch the remote renamed, or deleted, is told so by sync and by
+// init, and nothing is pushed: a push would recreate the branch the fleet left.
+// Their own fetches prune the clone's copy of the branch, so this holds whether a
+// person pruned it or not, and a tag named like the branch changes nothing.
 func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
-	for _, tag := range []bool{false, true} {
-		t.Run(map[bool]string{false: "plain", true: "with a tag named like it"}[tag], func(t *testing.T) {
-			remote, m := fleet(t, 2)
-			a, admin := m[0], m[1]
-			if tag {
-				run(t, a, "tag", "main")
+	requireGit(t)
+	for _, c := range []struct {
+		name  string
+		leave [][]string
+	}{
+		{"renamed on the remote", nil},
+		{"renamed on the remote, and pruned by hand", [][]string{{"fetch", "--quiet", "--prune"}}},
+		{"renamed on the remote, beside a tag named like it", [][]string{{"tag", "main"}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 1)
+			a := m[0]
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			mustSync(t, options(a, "host-a"))
+			run(t, a, "--git-dir", remote, "branch", "-m", "main", "trunk")
+			for _, args := range c.leave {
+				run(t, a, args...)
 			}
-			run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
-			run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
-			run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
-			run(t, a, "fetch", "--quiet", "--prune")
-			_, err := Sync(context.Background(), options(a, "h"))
-			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "main follows origin/main, which this clone no longer has") {
-				t.Fatalf("expected ErrNoUpstream saying the branch is gone, got %v", err)
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+			gone := "main follows origin/main, which this clone no longer has"
+			if _, err := Sync(context.Background(), options(a, "host-a")); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
+				t.Fatalf("sync: %v, want ErrNoUpstream saying the branch is gone", err)
 			}
-			if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/main").Output(); err == nil {
-				t.Fatalf("the sync recreated main at %s", out)
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"}); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
+				t.Fatalf("init: %v, want ErrNoUpstream saying the branch is gone", err)
+			}
+			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); heads != "refs/heads/trunk" {
+				t.Fatalf("the remote has %q, want trunk alone", heads)
 			}
 		})
 	}
@@ -651,10 +664,12 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 
 // A sync whose context ends while git is answering a question says the time ran
 // out, never what a failure there would otherwise mean: not a clone, no
-// upstream, a detached HEAD, or commits fleetd did not make.
+// upstream, a branch gone from the remote, a detached HEAD, or commits fleetd did
+// not make.
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 	requireGit(t)
-	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "merge-base", "prepare", "detached symbolic-ref", "by hand for-each-ref"} {
+	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "merge-base", "prepare",
+		"detached symbolic-ref", "by hand for-each-ref"} {
 		t.Run(at, func(t *testing.T) {
 			t.Parallel()
 			_, m := newFleet(t, 1)

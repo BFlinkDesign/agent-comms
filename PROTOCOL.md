@@ -287,18 +287,28 @@ on its only branch; with several, init is refused. A clone a person moved off th
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch it follows, of
-the same name on origin, if origin still has it, else the remote's default, else
-its only branch. Only refs and the index change, never a file, and HEAD last; the
-journal's branch here starts at origin's tip and moves only forward to it, so one
-with commits of its own stays, and init's sync reports them. Nothing moves in a
+the same name on origin, if origin still has it; with several such branches, or
+none, the remote's default, the branch its HEAD names; else its only branch. A
+`--single-branch` clone fetches that branch from then on. Only refs and the index
+change, never a file, and HEAD last; the journal's branch here starts at origin's
+tip and moves only forward to it, so one with commits of its own stays, and
+init's sync reports them. The repair is refused, with nothing moved, in a
 repository that is not a journal, in the middle of a rebase, merge, cherry-pick,
-revert or bisect, with a commit only HEAD holds, or with the journal's branch
-checked out in another worktree. A branch that follows one of origin's the clone
-no longer has is left for a person. When the repository has no branch yet, a
-clone with no commit and no branch is told to delete its `.git` directory and run
-init again, and one with commits of its own to move its `.git` directory, and
-every file there but journal files and `fleetd.json`, out. A `fleetd.json`
-in the journal directory with another salt is replaced by the journal's, and so is
+revert or bisect, with a commit only HEAD holds (init names the command that
+keeps it on a branch), or with the journal's branch checked out in another
+worktree; a refusal after the repair, a salt that differs from the journal's
+say, leaves the clone on the journal's branch. Of a file the remote changed or
+removed since the commit the clone was on, the next sync brings one that holds
+only the start of the remote's copy up to date; a rewritten one stays changed
+until `git checkout -- <file>`, and a removed one stays, untracked, its records
+listed by `fleetd where` as not published, until deleted by hand. A branch that
+follows one of origin's the clone no longer has, as after init's pruning fetch,
+is left for a person, with nothing pushed. When the repository has no branch
+yet, a clone with no commit and no ref of any kind is told to delete its `.git`
+directory and run init again, and one with commits of its own to move its
+`.git` directory, and every file there but journal files and `fleetd.json`,
+out. A `fleetd.json` in the journal directory with another salt is replaced by
+the journal's, and so is
 one no command would read (over 64 KiB, say), whose salt is not noted, or one git
 converted on checkout, as a `.gitattributes` can have it do, so that fleetd cannot
 read the journal's salt from it. A journal
@@ -314,8 +324,9 @@ tell which. `--reclaim` says it is the first: under the sync lock it moves the f
 into `.git/fleetd-pre-init/`, puts the journal's copy back, and files the moved
 records the journal lacks after it. init exits non-zero when its sync failed with
 `--reclaim`, or for a reason no later sync gets past: this machine's file not
-starting with the journal's copy, commits fleetd did not make, or a push the
-remote declines (a hook, branch protection, a ruleset). Any other failure, a
+starting with the journal's copy, commits fleetd did not make, a push the
+remote declines (a hook, branch protection, a ruleset), or a clone off the
+journal's branch, as when the remote deleted it meanwhile. Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
@@ -326,8 +337,11 @@ a branch of the clone or another remote's, or no commit yet) is told to run
 `fleetd init --dir "<dir>" <journal URL>`, which puts it back on the journal's branch without touching a file,
 or says what stops it, as above: `git switch` refuses, or overwrites this
 machine's records, when they are in the work tree and the branch's files lack
-them. A branch that follows one the clone no longer has, deleted or renamed on the
-remote, is named as such. It notes each outcome in the clone's
+them. Its fetch prunes, so a branch the remote deleted or renamed goes from the
+clone too: a sync on a branch that followed it stops, pushing nothing, which
+would bring the branch back, and says what a person does: have the branch follow
+the new name (`git branch --set-upstream-to`), or push one deleted by mistake
+back from the machine that synced last. It notes each outcome in the clone's
 `.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never rewrites that file. A push rejected

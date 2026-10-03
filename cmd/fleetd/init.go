@@ -131,8 +131,9 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 // a timeout or a network failure. Only init --reclaim puts this machine's
 // published records back, so when its sync failed, perhaps before doing that, it
 // has to run again. A person has to act on the others: this machine's file not
-// starting with the remote's copy, commits fleetd did not make, and a push the
-// remote declines.
+// starting with the remote's copy, commits fleetd did not make, a push the remote
+// declines, and a clone off the journal's branch: right after init put it back, a
+// sync finds it so only when the remote deleted that branch meanwhile.
 func finalSyncError(syncErr error, reclaim bool) error {
 	switch {
 	case syncErr == nil:
@@ -141,7 +142,7 @@ func finalSyncError(syncErr error, reclaim bool) error {
 		return fmt.Errorf("the journal is set up, but its sync failed, perhaps before putting this machine's published "+
 			"records back, which no later sync does; run the same `fleetd init --reclaim` command again: %w", syncErr)
 	case errors.Is(syncErr, gitsync.ErrSameFile), errors.Is(syncErr, gitsync.ErrLocalCommits),
-		errors.Is(syncErr, gitsync.ErrRejected):
+		errors.Is(syncErr, gitsync.ErrRejected), errors.Is(syncErr, gitsync.ErrNoUpstream):
 		return fmt.Errorf("the journal is set up, but nothing can be published: %w", syncErr)
 	}
 	return nil

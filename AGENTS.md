@@ -128,33 +128,47 @@ follows nothing, a branch of the clone or another remote's, or with no commit
 yet, as a plain clone of the repository made while it was empty has, is put back
 on it by init. The journal's branch is the one this clone follows, of the same
 name on origin, if origin still has it, since a remote's default can change while
-its machines go on publishing where they did; else the remote's default; else its
-only branch. Only refs and git's index change, never a file, so this machine's
-records stay as they are, which git's own ways back (`git switch`, `git
-checkout`) refuse to promise; HEAD moves last, so init run again finishes a
-repair cut short. A branch with commits of its own is not moved, and init's sync
-then reports them. Nothing moves in a repository that is not a journal, in the
-middle of a rebase, merge, cherry-pick, revert or bisect, with a commit only HEAD
-holds, or with the journal's branch checked out in another worktree; init says
-which. Sync syncs only a branch that follows one of origin's, and tells any other
-clone to run `fleetd init --dir "<dir>" <journal URL>`. A branch that follows one
-of origin's the clone no longer has, deleted or renamed on the remote, is left for
-a person, and named as such; one that follows another of origin's branches, as
-`git switch stray` makes, syncs with that branch, as before. Files the remote
-changed or removed while the clone was on an older commit are kept as they are
-and reported by every sync, as any file with changes is; `git checkout
-'@{upstream}' -- <file>` takes the remote's copy. When the repository has no
-branch yet, a clone with no commit and no branch is told to delete its `.git`
-directory, which holds no commit, after which init sets the directory up as a new
-one, keeping its files; one with commits of its own, to move its `.git`
-directory, and every file there but journal files and `fleetd.json`, out of the
-journal directory. When two machines start the same empty repository at once, the one
-whose push loses takes the other's commit and salt. Two machines whose git
+its machines go on publishing where they did; with several such branches, or
+none, the remote's default, the branch its HEAD names; else its only branch. A
+clone made with `--single-branch` fetches the branch it is put back on from then
+on. Only refs and git's index change, never a file, so this machine's records
+stay as they are, which git's own ways back (`git switch`, `git checkout`) refuse
+to promise; HEAD moves last, so init run again finishes a repair cut short. A
+branch with commits of its own is not moved, and init's sync then reports them.
+The repair is refused, with nothing moved, in a repository that is not a journal,
+in the middle of a rebase, merge, cherry-pick, revert or bisect, with a commit
+only HEAD holds, or with the journal's branch checked out in another worktree;
+init says which, and for the commit names the command that keeps it on a branch.
+These are the repair's refusals: a clone on the journal's branch needs no repair,
+and one init refuses after the repair, for a salt that differs from the
+journal's say, stays on the journal's branch. A repair leaves every file as it
+is, so a clone put back from an older commit keeps that commit's copy of a file
+the remote has changed or removed since. The next sync brings a file that holds
+only the start of the remote's copy, as a journal file does, up to date; one the
+remote rewrote stays as it is, changed as far as `git status` can tell, until
+`git checkout -- <file>` takes the journal's copy; one the remote removed stays,
+untracked, and `fleetd where` lists its records as not published until it is
+deleted by hand. Sync syncs only a branch that follows one of origin's, and tells
+any other clone to run `fleetd init --dir "<dir>" <journal URL>`; one that follows
+another of origin's branches, as `git switch stray` makes, syncs with that
+branch, as before. Sync's and init's fetches prune, so a branch the remote
+deleted or renamed goes from the clone too: a sync or init on a branch that
+followed it stops and says so, pushing nothing, since a push would bring the
+branch back and split the journal. A person then has the branch follow the new
+name (`git branch --set-upstream-to`), or pushes a branch deleted by mistake back
+from the machine that synced last. When the repository has no branch yet, a
+clone with no commit and no ref of any kind (a branch, a tag, a stash) is told to
+delete its `.git` directory, which holds nothing, after which init sets the
+directory up as a new one, keeping its files; one with commits of its own, to
+move its `.git` directory, and every file there but journal files and
+`fleetd.json`, out of the journal directory. When two machines start the same
+empty repository at once, the one whose push loses takes the other's commit and
+salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal
 follows the other branch must have its journal's `.git` directory deleted before
-that branch is, or its next sync recreates it; init run there again keeps its
-records. Running init again finishes
+that branch is, or its next sync stops once the branch is gone; init run there
+again keeps its records. Running init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
 which init and every sync wait out for ten minutes. When this machine's journal
 directory was set up again, or restored from an older copy, its file no longer
@@ -166,8 +180,9 @@ git directory, `fleetd-pre-init/`, puts the journal's copy back, and files the
 moved records the journal lacks after it. No later sync does that, so an
 `init --reclaim` whose sync fails exits non-zero and says to run it again. A
 plain init fails too when its sync stops for a reason no later sync gets past
-(this machine's file, commits fleetd did not make, or a push the remote
-declines by a hook, branch protection or a ruleset). Anything else, such as a
+(this machine's file, commits fleetd did not make, a push the remote declines
+by a hook, branch protection or a ruleset, or a clone off the journal's branch,
+as when the remote deleted that branch meanwhile). Anything else, such as a
 timeout, the network, a credential that cannot push or the remote's own
 storage, is reported, and init says that the next sync retries.
 

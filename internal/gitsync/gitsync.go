@@ -329,12 +329,17 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	ssh := batchSSH(g)
 	var tip string
 	for res.Attempts = 1; ; res.Attempts++ {
-		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", remote)...); err != nil {
+		// Pruned, so that a branch the remote deleted or renamed is gone here too,
+		// and never recreated by this machine's push.
+		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", "--prune", remote)...); err != nil {
 			return res, err
 		}
 		remoteTip, err := g.line("rev-parse", "--verify", "refs/remotes/"+upstream)
 		if err != nil {
-			return res, err
+			if ctx.Err() != nil {
+				return res, err
+			}
+			return res, goneError(localRef, branch)
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
 			if ctx.Err() != nil {
@@ -761,8 +766,13 @@ func goneUpstream(g git, head string) (string, error) {
 	return theirs, g.ctx.Err()
 }
 
+// goneError says what to do about a branch that follows one of origin's the
+// clone no longer has. Branch names come from the remote, so none is put into a
+// command a person might paste.
 func goneError(head, theirs string) error {
-	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed it",
+	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
+		"it; if it was renamed, have this branch follow the new name (git branch --set-upstream-to), and if it was "+
+		"deleted by mistake, push it back from the machine that synced last (git push)",
 		ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs)
 }
 
