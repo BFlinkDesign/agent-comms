@@ -2137,3 +2137,17 @@ func TestFleetFileGoneOnlyWhereInitCanPutTheFileBack(t *testing.T) {
 		t.Fatalf("fleetd.json: %v; want the deletion taken in", err)
 	}
 }
+
+// exitedWith reads the code git exited with through Git's error: 1 for a merge
+// base that does not exist or an object --verify --quiet does not find, 128 for
+// a revision git cannot read.
+func TestExitedWithReadsTheCodeGitExitedWith(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 1)
+	ctx := context.Background()
+	_, absent := Git(ctx, m[0], nil, "rev-parse", "--verify", "--quiet", "HEAD:"+FleetFile)
+	_, bad := Git(ctx, m[0], nil, "merge-base", "HEAD", "no-such-revision")
+	if !exitedWith(absent, 1) || exitedWith(absent, 128) || !exitedWith(bad, 128) || exitedWith(bad, 1) || exitedWith(nil, 1) {
+		t.Fatalf("exitedWith: absent %v (%v), bad revision %v (%v)", exitedWith(absent, 1), absent, exitedWith(bad, 128), bad)
+	}
+}

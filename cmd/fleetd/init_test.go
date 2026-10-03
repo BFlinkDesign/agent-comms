@@ -2385,3 +2385,138 @@ func TestHostJSONDoesNotPrintTheSalt(t *testing.T) {
 		t.Fatalf("host --json: %v\n%s", err, stdout)
 	}
 }
+
+// onlyUnderTheFleetsId fails unless every host file on the remote's main branch
+// is the one fleetID names.
+func onlyUnderTheFleetsId(t *testing.T, remote, fleetID string) {
+	t.Helper()
+	out, err := osexec.Command("git", "--git-dir", remote, "ls-tree", "--name-only", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.ReplaceAll(fleetID, ":", "-") + ".jsonl"
+	for _, f := range strings.Fields(string(out)) {
+		if strings.HasPrefix(f, "host-") && f != want {
+			t.Fatalf("main holds %s: this machine's records went out under another id than the fleet's, %s", f, fleetID)
+		}
+	}
+}
+
+// Where the journal loses its fleetd.json with none to keep or put back, the
+// deletion comes in, and a machine whose clone has used the fleet's salt
+// publishes nothing under another id: its records wait, and the sync says why
+// and what to do. Given the salt the clone noted, a sync goes ahead, and init
+// puts a fleetd.json with it in place, after which a sync files them under the
+// fleet's id. The journal loses the file by a push that broke it and one that
+// deleted it, or by a history rewritten without it, which the sync's own advice
+// then takes in.
+func TestALostFleetdJsonWithNoneToPutBackPublishesNothingUnderAnotherId(t *testing.T) {
+	t.Parallel()
+	for _, how := range []string{"broken, then deleted", "rewritten without it"} {
+		t.Run(how, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			b := filepath.Join(t.TempDir(), "b")
+			if _, _, err := exec(t, "init", "--dir", b, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			fleetID := hostID(t, "--dir", b)
+			if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatal(err)
+			}
+			w := filepath.Join(t.TempDir(), "w")
+			gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			commit := []string{"-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet"}
+			if how == "broken, then deleted" {
+				if err := os.WriteFile(filepath.Join(w, gitsync.FleetFile), []byte("not json\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, w, append(commit, "-am", "oops")...)
+				gitIn(t, w, "push", "--quiet", "origin", "main")
+				if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, w, "rm", "--quiet", gitsync.FleetFile)
+				gitIn(t, w, append(commit, "-m", "tidy up")...)
+				gitIn(t, w, "push", "--quiet", "origin", "main")
+				if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				gitIn(t, w, "checkout", "--quiet", "--orphan", "squashed")
+				gitIn(t, w, "rm", "--quiet", "--cached", gitsync.FleetFile)
+				gitIn(t, w, append(commit, "-m", "squash")...)
+				gitIn(t, w, "push", "--quiet", "--force", "origin", "squashed:main")
+				if _, _, err := exec(t, "sync", "--dir", b); err == nil || !strings.Contains(err.Error(), "reset --soft") {
+					t.Fatalf("sync after the rewrite: %v; want the advice to reset --soft", err)
+				}
+				gitIn(t, b, "reset", "--quiet", "--soft", "@{upstream}")
+				if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := os.Lstat(filepath.Join(b, gitsync.FleetFile)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fleetd.json in b: %v; want the deletion taken in, there being none to put back", err)
+			}
+			if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b2"); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err := exec(t, "sync", "--dir", b)
+			if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "`fleetd init --dir \""+b+"\" <journal URL>`") ||
+				!strings.Contains(err.Error(), filepath.Join(".git", "fleetd-salt")) {
+				t.Fatalf("sync of a record written without fleetd.json: %v; want ErrNoFleetFile naming init and the salt this clone noted", err)
+			}
+			onlyUnderTheFleetsId(t, remote, fleetID)
+			// Given the salt the clone noted, a sync goes ahead: it would publish
+			// under the fleet's id. The record written without one still waits for
+			// fleetd.json to be in place.
+			if _, _, err := exec(t, "sync", "--dir", b, "--salt", "s"); err != nil {
+				t.Fatalf("sync given the salt this clone noted: %v", err)
+			}
+			onlyUnderTheFleetsId(t, remote, fleetID)
+			if _, _, err := exec(t, "init", "--dir", b, "--salt", "s", remote); err != nil {
+				t.Fatalf("init with the salt this clone noted: %v", err)
+			}
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatal(err)
+			}
+			onlyUnderTheFleetsId(t, remote, fleetID)
+			if _, ok := remoteHostRecords(t, remote, "s", "b2"); !ok {
+				t.Fatal("the record written without fleetd.json is not under the fleet's id")
+			}
+		})
+	}
+}
+
+// A hook derives this machine's id when it records, and syncs under it after.
+// When the clone held no fleetd.json at the record, and an unusable one has come
+// in before the sync, the sync publishes nothing under that id either: the clone
+// has used the fleet's salt, which is the one an unusable fleetd.json gives.
+func TestAHookThatDerivedItsIdWithoutFleetdJsonPublishesNothingOnceAnUnusableOneCameIn(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, gitsync.FleetFile)); err != nil {
+		t.Fatal(err)
+	}
+	var warn bytes.Buffer
+	rec, err := appendRecord(recordRequest{dir: dir, typ: "session", note: "claude SessionEnd"}, &warn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte("not json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := syncJournal(dir, rec.host, time.Minute, false, io.Discard); !errors.Is(err, gitsync.ErrNoFleetFile) {
+		t.Fatalf("the hook's sync: %v, want ErrNoFleetFile", err)
+	}
+	if n, _ := remoteHostRecords(t, remote, "", "claude SessionEnd"); n != 0 {
+		t.Fatalf("%d records under the unsalted id, %s; want none", n, rec.host.ID)
+	}
+}

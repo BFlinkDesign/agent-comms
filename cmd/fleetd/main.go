@@ -561,10 +561,26 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 		// h was derived before this sync took its lock: an init that has put the
 		// journal's fleetd.json in place since gives this machine another id, and
 		// files h's records under it. This sync publishes none of them.
-		if fleet, ok, err := gitsync.ReadFleet(store.Dir()); err == nil && ok && fleet.Salt != h.Salt {
+		fleet, ok, err := gitsync.ReadFleet(store.Dir())
+		if err == nil && ok && fleet.Salt != h.Salt {
 			stale = fmt.Errorf("the journal's %s now gives this machine another id than %s, which this command "+
 				"derived before the file was in place; nothing was published, and the next sync files this "+
 				"machine's records under the fleet's id", gitsync.FleetFile, h.ID)
+			cancel()
+			return
+		}
+		// A clone that has used the fleet's salt and holds no usable fleetd.json,
+		// as when the journal lost it with none to keep or put back, publishes
+		// nothing under another id: its records wait, as they do while the journal
+		// holds one, and the sync after init files them under the fleet's. With an
+		// unusable one every command derives the salt it last held, so only an id
+		// derived before one came in differs.
+		if last := cachedSalt(store.Dir()); !ok && last != "" && last != h.Salt {
+			stale = fmt.Errorf("%w, whose salt this clone used before: its records would go out under %s, another id "+
+				"than the fleet's, so nothing was published. `fleetd init --dir \"%s\" <journal URL>` puts the journal's "+
+				"%s in place, after which a sync files them under the fleet's id; if the journal has none to put back, "+
+				"give init that salt with --salt: %s holds it", gitsync.ErrNoFleetFile, h.ID, store.Dir(),
+				gitsync.FleetFile, filepath.Join(gitDir, saltCacheName))
 			cancel()
 			return
 		}

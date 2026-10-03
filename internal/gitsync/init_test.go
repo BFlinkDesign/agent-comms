@@ -3442,3 +3442,160 @@ func TestALookThatCannotSayWhetherACopyIsUntouchedStaysDue(t *testing.T) {
 		t.Fatalf("init run again = %+v, want backup taken for a copy of the journal on main", res)
 	}
 }
+
+// A deletion that reached the journal's branch through a merge, from a branch cut
+// before the fleet changed its salt by editing fleetd.json, is put back as the
+// branch held it right before the merge: plain history simplification followed
+// the merge down the side branch, to the salt from before the change.
+func TestInitPutsBackWhatTheBranchLastHeldWhenAMergeDeletedIt(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s-old"})
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	run(t, w, "checkout", "--quiet", "-b", "cleanup")
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "cleanup: drop fleetd.json")
+	run(t, w, "checkout", "--quiet", "main")
+	write(t, filepath.Join(w, FleetFile), "{\"salt\": \"s-new\"}\n")
+	run(t, w, "commit", "--quiet", "-am", "change the fleet's salt")
+	current := run(t, w, "rev-parse", "HEAD:"+FleetFile)
+	// A modify/delete conflict, settled by taking the deletion.
+	merge := exec.Command("git", "merge", "--no-edit", "cleanup")
+	merge.Dir = w
+	_ = merge.Run()
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "--no-edit")
+	run(t, w, "push", "--quiet", "origin", "main")
+	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
+	if got := run(t, "", "--git-dir", remote, "rev-parse", "main:"+FleetFile); !res.PutBackFleetFile || res.Salt != "s-new" || got != current {
+		t.Fatalf("init = %+v, main's fleetd.json %s; want it put back as main held it before the merge (%s, salt s-new)",
+			res, got, current)
+	}
+}
+
+// An unrelated history merged into the journal's branch, the merge dropping
+// fleetd.json, leaves a fleetd.json to put back: the branch's own line held it.
+// Until it is back, a clone keeps its copy and says so; plain history
+// simplification followed the merge down the other history, which never held
+// one, and the clone took the deletion in.
+func TestAFleetdJsonAnUnrelatedMergeDroppedIsKeptAndPutBack(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	before := readFile(t, filepath.Join(a, FleetFile))
+	other := filepath.Join(t.TempDir(), "other")
+	run(t, filepath.Dir(other), "init", "--quiet", "--initial-branch=main", other)
+	identify(t, other)
+	write(t, filepath.Join(other, "host-o.jsonl"), "{\"id\":\"hive:o1\"}\n")
+	run(t, other, "add", ".")
+	run(t, other, "commit", "--quiet", "-m", "another journal")
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	run(t, w, "fetch", "--quiet", other, "main:other")
+	run(t, w, "merge", "--quiet", "--no-commit", "--allow-unrelated-histories", "other")
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "merge another journal")
+	run(t, w, "push", "--quiet", "origin", "main")
+	if res := mustSync(t, options(a, "host-a")); !res.FleetFileGone || readFile(t, filepath.Join(a, FleetFile)) != before {
+		t.Fatalf("sync = %+v; want this clone's copy kept, and it said", res)
+	}
+	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
+	if !res.PutBackFleetFile || res.Salt != "s" {
+		t.Fatalf("init = %+v; want fleetd.json put back, with the salt s", res)
+	}
+}
+
+// A look whose git cannot say what a branch holding a journal shares with the
+// journal's branch, or whether that holds fleetd.json, fails with git's error and
+// stays due: it does not take a copy of the journal for a second journal, which
+// would have a person delete the branch.
+func TestALookWhoseGitCannotSayWhatABranchSharesStaysDue(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, step := range []string{"merge-base", "rev-parse"} {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			remote := newEmptyRemote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+				t.Fatal("init succeeded although its look failed")
+			}
+			run(t, a, "--git-dir", remote, "branch", "backup", "main")
+			looking := false
+			failing := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+				if slices.Contains(args, "merge-base") && slices.Contains(args, "refs/remotes/origin/backup") {
+					looking = true
+					if step == "merge-base" {
+						return "", errors.New("git merge-base: exit status 128: fatal: unable to read tree")
+					}
+				}
+				if looking && step == "rev-parse" && slices.Contains(args, "rev-parse") && strings.HasSuffix(args[len(args)-1], ":"+FleetFile) {
+					return "", errors.New("git rev-parse: exit status 128: fatal: unable to read tree")
+				}
+				return Git(ctx, dir, stdin, args...)
+			}
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failing})
+			if errors.Is(err, ErrTwoJournals) || err == nil || !strings.Contains(err.Error(), "unable to read tree") {
+				t.Fatalf("init: %v; want git's error, not a second journal on backup, a copy of main", err)
+			}
+			if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); err != nil {
+				t.Fatalf("the look is no longer noted as due: %v", err)
+			}
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"}); res.Branch != "main" {
+				t.Fatalf("init run again = %+v, want backup taken for a copy of the journal on main", res)
+			}
+		})
+	}
+}
+
+// A journal with no records yet, whose fleetd.json a push deleted, beside a copy
+// of it on another branch, gets the file back from init, as the sync's message
+// says: a copy is no journal elsewhere. Beside a journal of another's own, init
+// is refused as before, naming the branch.
+func TestInitPutsBackAFleetdJsonBesideACopyButNotBesideAnotherJournal(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, beside := range []string{"a copy", "another journal"} {
+		t.Run(beside, func(t *testing.T) {
+			t.Parallel()
+			remote := newEmptyRemote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			w := filepath.Join(t.TempDir(), "w")
+			run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			identify(t, w)
+			if beside == "a copy" {
+				run(t, w, "push", "--quiet", "origin", "main:backup")
+			} else {
+				run(t, w, "checkout", "--quiet", "--orphan", "backup")
+				write(t, filepath.Join(w, FleetFile), "{\"salt\": \"another\"}\n")
+				run(t, w, "add", FleetFile)
+				run(t, w, "commit", "--quiet", "-m", "another journal")
+				run(t, w, "push", "--quiet", "origin", "backup")
+				run(t, w, "checkout", "--quiet", "main")
+			}
+			run(t, w, "rm", "--quiet", FleetFile)
+			run(t, w, "commit", "--quiet", "-m", "tidy up")
+			run(t, w, "push", "--quiet", "origin", "main")
+			if res := mustSync(t, options(a, "host-a")); !res.FleetFileGone {
+				t.Fatalf("sync = %+v; want this clone's copy kept, and it said", res)
+			}
+			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
+			if beside == "a copy" && (err != nil || !res.PutBackFleetFile || res.Salt != "s" || res.Branch != "main") {
+				t.Fatalf("init = %+v, %v; want fleetd.json put back on main", res, err)
+			}
+			if beside == "another journal" && !errors.Is(err, ErrJournalElsewhere) {
+				t.Fatalf("init = %+v, %v; want ErrJournalElsewhere", res, err)
+			}
+		})
+	}
+}

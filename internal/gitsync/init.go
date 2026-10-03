@@ -1026,15 +1026,20 @@ func recordedGone(g git, url, recorded string) error {
 
 // journalElsewhere refuses to start the journal on branch, whose top level is
 // top, when branch holds none, neither FleetFile nor a host journal file, while
-// another of origin's branches holds one: the fleet publishes there, and a
-// journal started here, with a salt of its own, would split it. dir is the
-// journal directory, for the advice.
+// another of origin's branches holds one, not a copy of branch's: the fleet
+// publishes there, and a journal started here, with a salt of its own, would
+// split it. dir is the journal directory, for the advice.
 func journalElsewhere(g git, url, dir, branch string, top map[string]string) error {
 	if holdsJournal(top) {
 		return nil
 	}
 	holding, err := journalsBut(g, branch)
 	if err != nil || len(holding) == 0 {
+		return err
+	}
+	// A copy of the journal branch held, before a push deleted its fleetd.json,
+	// is no journal elsewhere: init puts the file back on branch.
+	if holding, err = notCopies(g, branch, holding); err != nil || len(holding) == 0 {
 		return err
 	}
 	on := holding[0]
@@ -1044,6 +1049,38 @@ func journalElsewhere(g git, url, dir, branch string, top map[string]string) err
 	return fmt.Errorf("%w: %s holds no journal on %s, but holds one on %s, where the fleet publishes; a journal started "+
 		"on %s would split it. `fleetd init --dir \"%s\" --branch <branch> <journal URL>` follows the one on <branch>",
 		ErrJournalElsewhere, url, branch, on, branch, dir)
+}
+
+// notCopies returns the branches of holding, origin's branches holding a
+// journal, that are not copies of the journal on branch. A copy, a branch made
+// from it since, holds the FleetFile of the last commit it shares with branch,
+// untouched since; a journal another machine started at the same time holds its
+// own, or the one it put back after a push deleted it. A git that cannot say
+// returns its error: only its exit 1, which comes with nothing said, means none,
+// no common commit or no FleetFile in it.
+func notCopies(g git, branch string, holding []string) ([]string, error) {
+	var others []string
+	for _, h := range holding {
+		base, err := g.line("merge-base", "refs/remotes/origin/"+branch, "refs/remotes/origin/"+h)
+		if err != nil && !exitedWith(err, 1) {
+			return nil, err
+		}
+		if base != "" {
+			shared, err := g.line("rev-parse", "--verify", "--quiet", base+":"+FleetFile)
+			if err != nil && !exitedWith(err, 1) {
+				return nil, err
+			}
+			since, err := g.line("rev-list", "-1", base+"..refs/remotes/origin/"+h, "--", FleetFile)
+			if err != nil {
+				return nil, err
+			}
+			if shared != "" && since == "" {
+				continue
+			}
+		}
+		others = append(others, h)
+	}
+	return others, nil
 }
 
 // journalsBut names the branches of origin's, as this clone last fetched them,
@@ -1208,12 +1245,15 @@ func deletedFleet(g git, tip string) (f Fleet, content []byte, ok bool, err erro
 	if tip == "" {
 		return Fleet{}, nil, false, nil
 	}
-	last, err := g.line("rev-list", "-1", tip, "--", FleetFile)
+	// Along first parents, the branch's own line: plain history simplification
+	// follows a merge that took a side branch's deletion down that side, to a
+	// fleetd.json the branch had changed since, or none at all.
+	last, err := g.line("rev-list", "-1", "--first-parent", tip, "--", FleetFile)
 	if err != nil || last == "" {
 		return Fleet{}, nil, false, err
 	}
-	// tip lacks it, so last, the newest commit that changed it, deleted it, and
-	// its first parent held it.
+	// tip lacks it, so last, the newest commit on that line that changed it,
+	// deleted it, and its first parent held it.
 	entry, err := g.line("ls-tree", last+"^", "--", FleetFile)
 	if err != nil {
 		return Fleet{}, nil, false, err
@@ -1251,24 +1291,10 @@ func look(g git, gitDir, branch string) error {
 		return err
 	}
 	if len(holding) > 0 {
-		// A copy of this journal, a branch made from it since, holds the
-		// FleetFile of the last commit it shares with the journal's branch,
-		// untouched since; a journal another machine started at the same time
-		// holds its own, or the one it put back after a push deleted it.
-		var others []string
-		for _, h := range holding {
-			base, _ := g.line("merge-base", "refs/remotes/origin/"+branch, "refs/remotes/origin/"+h)
-			if base != "" {
-				shared, _ := g.line("rev-parse", "--verify", "--quiet", base+":"+FleetFile)
-				since, err := g.line("rev-list", "-1", base+"..refs/remotes/origin/"+h, "--", FleetFile)
-				if err != nil {
-					return err
-				}
-				if shared != "" && since == "" {
-					continue
-				}
-			}
-			others = append(others, h)
+		// A git that cannot say fails the look, which stays due.
+		others, err := notCopies(g, branch, holding)
+		if err != nil {
+			return err
 		}
 		if err := g.ctx.Err(); err != nil {
 			return err

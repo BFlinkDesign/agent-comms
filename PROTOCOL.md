@@ -281,8 +281,9 @@ mentions for a week.
 once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
 an `about` line), on the branch it names as its default, else `main`; one whose
-`fleetd.json` a push deleted gets it back as it last held it (a `--salt` that
-contradicts it is refused: the salt changes by editing the file, not deleting it);
+`fleetd.json` a push deleted gets it back as its branch last held it, along its
+first parents (a `--salt` that contradicts it is refused: the salt changes by
+editing the file, not deleting it);
 a repository that already holds records and no usable `fleetd.json` to put back
 needs the salt its machines use (`--salt` or
 `$FLEET_SALT`), or a new one if they ran without a salt (the records they published
@@ -290,7 +291,8 @@ keep the ids they had). When the repository's default branch does not exist, the
 on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
 on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
-no host journal file) while another branch holds one: it is refused, naming the
+no host journal file) while another branch holds one, other than a copy of the
+journal it held before a push deleted its `fleetd.json`: it is refused, naming the
 branch the journal is on, with nothing pushed or moved. Two machines that make two
 such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
@@ -370,7 +372,8 @@ credential that cannot push included, is reported and retried by the next sync.
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository whose init is done (no look due in `.git/fleetd-look`, or in a
 clone init kept beside the directory, and `fleetd.json` in place whenever the
-journal's branch holds it; else it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
+journal's branch holds it, or the clone has used the fleet's salt and this machine's
+would differ; else it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
 look, nor, once init has recorded the journal's branch, another of origin's. Any
 other clone (detached, an orphan branch, a branch that follows nothing, a branch
@@ -429,8 +432,12 @@ The salt is the one in the journal's `fleetd.json`. `--salt` may repeat it but n
 contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning. A
 push that deletes a usable `fleetd.json` leaves in place the copy each clone's work
 tree holds, so those machines keep their ids, and every sync says so; `fleetd init`
-on any machine puts it back as the journal last held it, refusing a `--salt` that
-contradicts it, so a machine set up meanwhile gets the fleet's id too.
+on any machine puts it back as the journal's branch last held it, along its first
+parents, refusing a `--salt` that contradicts it, so a machine set up meanwhile gets
+the fleet's id too. Where there is none to put back (invalid when deleted, or a
+history rewritten without it), the deletion comes in, and a clone that has used the
+fleet's salt publishes nothing under another until init puts a `fleetd.json` in
+place, given with `--salt` the salt its `.git/fleetd-salt` holds.
 Without `fleetd.json` they supply it. It must be identical on every machine in the
 fleet, or one machine will appear as several. It is not a credential. A sync files
 under this machine's fleet id the records it wrote under another salt (none or

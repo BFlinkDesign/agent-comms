@@ -74,7 +74,8 @@ var (
 	// made another branch the journal's at the same time.
 	ErrLookDue = errors.New("gitsync: init has yet to finish setting the journal up")
 	// ErrNoFleetFile means the journal directory lacks the journal's FleetFile,
-	// which records take their salt from, while the journal's branch holds it.
+	// which records take their salt from, while the journal's branch holds one or
+	// the clone has used one: what it would publish would go out under another id.
 	ErrNoFleetFile = errors.New("gitsync: the journal directory lacks the journal's fleetd.json")
 )
 
@@ -196,6 +197,12 @@ func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string,
 func isExit(err error) bool {
 	var exit *exec.ExitError
 	return errors.As(err, &exit)
+}
+
+// exitedWith reports whether err is git exiting with code.
+func exitedWith(err error, code int) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == code
 }
 
 // Options says what to publish.
