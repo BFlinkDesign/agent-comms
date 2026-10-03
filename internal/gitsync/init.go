@@ -279,10 +279,11 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	// A clone with no commit, no branch and nothing of origin's, such as a plain
 	// clone of the journal repository made while it was still empty, has nothing
 	// to follow. Its git directory holds no commit: without it, init sets the
-	// directory up as a new one, keeping every file in it. A clone with branches,
-	// or with origin's, on a branch with no commit yet (git checkout --orphan), is
-	// refused below for want of an upstream, so that none of its branches is moved
-	// and nothing in its git directory is lost.
+	// directory up as a new one, keeping every file in it. Any other clone whose
+	// HEAD has no commit, on an orphan branch, or a plain clone of the empty
+	// repository that has since fetched another machine's start, is told how to get
+	// to the journal's branch, so that none of its branches is moved and nothing in
+	// its git directory is lost.
 	if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err != nil {
 		if ctx.Err() != nil {
 			return res, err
@@ -296,6 +297,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 				"delete its .git directory, then run fleetd init again, which sets it up and keeps every other file there",
 				ErrNoUpstream, o.Dir)
 		}
+		return res, noUpstream(g)
 	}
 	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err != nil {

@@ -1692,3 +1692,29 @@ func TestInitReadsBackAFleetFileGitConvertedOnCheckout(t *testing.T) {
 		t.Fatalf("after init fleetd.json reads as %+v (%v, %v), want the journal's salt", fleet, ok, err)
 	}
 }
+
+// A plain clone of the journal repository made while it was still empty, which
+// has fetched since another machine started the journal, has a branch with no
+// commit that follows origin's. init tells it how to get to the journal's branch,
+// rather than failing on the commit it does not have; and then sets it up.
+func TestInitOnAPlainCloneOfTheEmptyJournalThatHasSinceFetched(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "fetch", "--quiet")
+	_, _, err := exec(t, "init", "--dir", dir, remote)
+	want := "`git -C \"" + dir + "\" switch --track origin/main`"
+	if !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("init on a plain clone of the empty journal that has fetched since: %v; want ErrNoUpstream saying %s", err, want)
+	}
+	gitIn(t, dir, "switch", "--quiet", "--track", "origin/main")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatalf("init once the advice was followed: %v", err)
+	}
+	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s" {
+		t.Fatalf("after init fleetd.json is %+v (%v, %v), want the journal's", fleet, ok, err)
+	}
+}

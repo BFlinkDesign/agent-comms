@@ -500,23 +500,82 @@ func TestABranchNameAShellWouldNotTakeIsNotPrinted(t *testing.T) {
 }
 
 // origin's default as this clone last heard it can be a branch origin has since
-// deleted, or renamed. It is not offered then: following the advice would fail.
+// deleted, or renamed. It is not offered then, since following the advice would
+// fail; origin's only branch is, as init would follow it, and with several the
+// name is left to the person.
 func TestADefaultBranchOriginNoLongerHasIsNotOffered(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		stray  bool
+		advice []string
+	}{
+		{"origin has one branch left", false, []string{"switch", "--track", "origin/trunk"}},
+		{"origin has several", true, []string{"switch", "--track", "origin/<branch>"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			remote, m := fleet(t, 2)
+			a, admin := m[0], m[1]
+			run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
+			if c.stray {
+				run(t, admin, "push", "--quiet", "origin", "main:refs/heads/stray")
+			}
+			run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
+			run(t, a, "checkout", "--quiet", "--detach")
+			run(t, a, "branch", "--quiet", "-D", "main")
+			run(t, a, "fetch", "--quiet", "--prune")
+			if got := run(t, a, "symbolic-ref", "refs/remotes/origin/HEAD"); got != "refs/remotes/origin/main" {
+				t.Fatalf("origin/HEAD is %s; the test needs it left at the deleted main", got)
+			}
+			_, err := Sync(context.Background(), options(a, "h"))
+			if want := "`git -C \"" + a + "\" " + strings.Join(c.advice, " ") + "`"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+				t.Fatalf("expected ErrNoUpstream saying %s, got %v", want, err)
+			}
+			if !c.stray {
+				run(t, a, c.advice...)
+				mustSync(t, options(a, "h"))
+			}
+		})
+	}
+}
+
+// A branch here that follows another of origin's branches than the journal's is
+// not offered: switching to it would publish to that branch. With origin's default
+// known, the advice leads to the journal's branch.
+func TestABranchFollowingAnotherOfOriginsBranchesIsNotOffered(t *testing.T) {
 	remote, m := fleet(t, 2)
-	a, admin := m[0], m[1]
-	run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
-	run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
-	run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
+	a, b := m[0], m[1]
+	run(t, b, "push", "--quiet", "origin", "main:refs/heads/stray")
+	run(t, a, "fetch", "--quiet")
+	run(t, a, "branch", "--quiet", "--track", "stray", "origin/stray")
 	run(t, a, "checkout", "--quiet", "--detach")
 	run(t, a, "branch", "--quiet", "-D", "main")
-	run(t, a, "fetch", "--quiet", "--prune")
-	if got := run(t, a, "symbolic-ref", "refs/remotes/origin/HEAD"); got != "refs/remotes/origin/main" {
-		t.Fatalf("origin/HEAD is %s; the test needs it left at the deleted main", got)
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	advice := []string{"switch", "--track", "origin/main"}
+	if want := "`git -C \"" + a + "\" " + strings.Join(advice, " ") + "`"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected ErrNoUpstream saying %s, got %v", want, err)
 	}
-	_, err := Sync(context.Background(), options(a, "h"))
-	if !errors.Is(err, ErrNoUpstream) || strings.Contains(err.Error(), "origin/main") || !strings.Contains(err.Error(), "switch --track origin/<branch>`") {
-		t.Fatalf("expected ErrNoUpstream with <branch>, not the deleted main, got %v", err)
+	run(t, a, advice...)
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+		t.Fatalf("main holds %q for host-a after the advice was followed", got)
 	}
+}
+
+// git before 2.48 never records origin's default on the machine that started the
+// journal. origin's only branch is then named all the same, as init follows it.
+func TestOriginsOnlyBranchIsNamedWhenItsDefaultIsUnknown(t *testing.T) {
+	_, m := fleet(t, 1)
+	run(t, m[0], "remote", "set-head", "origin", "--delete")
+	run(t, m[0], "branch", "--unset-upstream")
+	_, err := Sync(context.Background(), options(m[0], "h"))
+	advice := []string{"branch", "--set-upstream-to=origin/main"}
+	if want := "`git -C \"" + m[0] + "\" " + strings.Join(advice, " ") + "`"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected ErrNoUpstream saying %s, got %v", want, err)
+	}
+	run(t, m[0], advice...)
+	mustSync(t, options(m[0], "h"))
 }
 
 // A detached HEAD beside a branch named like origin's default that lost its
@@ -536,20 +595,23 @@ func TestADetachedHeadBesideABranchThatLostItsUpstreamIsLedBack(t *testing.T) {
 	mustSync(t, options(m[0], "h"))
 }
 
-// Only a branch that follows the journal's remote is offered: not one that
-// follows another remote, which init refuses, nor one that follows a branch of
-// this clone.
+// Only a branch that follows the journal's branch on origin is offered, whatever
+// it is called: not one that follows another remote, which init refuses, nor one
+// that follows a branch of this clone.
 func TestOnlyABranchThatFollowsTheJournalIsNamed(t *testing.T) {
 	remote, m := fleet(t, 1)
+	run(t, m[0], "branch", "--quiet", "-m", "main", "mine")
 	run(t, m[0], "remote", "add", "other", remote)
 	run(t, m[0], "fetch", "--quiet", "other")
 	run(t, m[0], "branch", "--quiet", "--track", "theirs", "other/main")
-	run(t, m[0], "branch", "--quiet", "--track", "local", "main")
+	run(t, m[0], "branch", "--quiet", "--track", "local", "mine")
 	run(t, m[0], "checkout", "--quiet", "--detach")
 	_, err := Sync(context.Background(), options(m[0], "h"))
-	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "switch main`") {
-		t.Fatalf("expected ErrNoUpstream naming main alone, got %v", err)
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "switch mine`") {
+		t.Fatalf("expected ErrNoUpstream naming mine alone, got %v", err)
 	}
+	run(t, m[0], "switch", "--quiet", "mine")
+	mustSync(t, options(m[0], "h"))
 }
 
 // A clone whose branch the remote deleted, or renamed, and whose remote-tracking
@@ -661,7 +723,7 @@ func TestARepositoryWithNoCommitSaysHowToSetAnUpstream(t *testing.T) {
 	dir := t.TempDir()
 	run(t, dir, "init", "--quiet", "--initial-branch=main")
 	_, err := Sync(context.Background(), options(dir, "h"))
-	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "git push -u") {
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "fetch origin") || !strings.Contains(err.Error(), "git push -u") {
 		t.Fatalf("expected ErrNoUpstream with a fix, got %v", err)
 	}
 }

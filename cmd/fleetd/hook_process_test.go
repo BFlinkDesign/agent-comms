@@ -23,11 +23,14 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	// The tests set journals up and file at once, a hundred times over: waiting
-	// out settleTime each time was most of their run. The test of the wait itself
-	// puts it back.
-	refileSettle = 100 * time.Millisecond
+	// out the settle time each time was most of their run. The test of the wait
+	// itself puts back the value fleetd runs with.
+	productionSettle, refileSettle = refileSettle, 100*time.Millisecond
 	os.Exit(m.Run())
 }
+
+// productionSettle is refileSettle as fleetd runs with it.
+var productionSettle time.Duration
 
 // runFleetd runs fleetd as a process with stdin on a pipe and returns what a tool
 // would see.

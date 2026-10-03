@@ -123,14 +123,16 @@ directory that is already a clone of another repository is refused too. A
 journal's, and init's own sync files the records written under its salt under the
 journal's, and so is one git converted on checkout, as a `.gitattributes` can have
 it do, so that fleetd cannot read the journal's salt from it. A plain clone of the
-repository made while it was still empty has no commit to follow: init refuses it
-and says to delete its `.git` directory, which holds no commit, after which init
-sets the directory up as a new one, keeping its files. A clone whose HEAD follows
-no branch, detached, on an orphan or on a branch made by hand, is told how to get
-back to the journal's branch, by init and sync alike: `git -C "<dir>" switch main`
-to a branch that follows one of origin's, else `branch --set-upstream-to` or
-`switch --track` to origin's default, never another of origin's branches; a
-branch name a shell would not take as it stands is printed as `<branch>`. When two machines start the same empty repository at once, the one
+repository made while it was still empty, and not fetched since, has nothing to
+follow: init refuses it and says to delete its `.git` directory, which holds no
+commit, after which init sets the directory up as a new one, keeping its files. A
+clone whose HEAD follows no branch, detached, on an orphan, on a branch made by
+hand, or with no commit while it holds origin's branches, is told how to get to the
+journal's branch, by init and sync alike. That branch is origin's default, else
+origin's only branch: `git -C "<dir>" switch main` to a branch there that follows
+it, else `branch --set-upstream-to` or `switch --track` to it, never another of
+origin's branches; a branch name a shell would not take as it stands is printed
+as `<branch>`. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal

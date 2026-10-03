@@ -710,15 +710,16 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 var shellSafe = regexp.MustCompile(`^[A-Za-z0-9._][A-Za-z0-9._/-]*$`)
 
 // noUpstream is the error for a clone whose HEAD follows no remote branch. Every
-// command it prints works when followed, and names only the journal's branch: a
-// branch here that follows one of origin's, else origin's default, which init
-// follows; a name a shell would not take as it stands is printed as <branch>.
-// Pushing the current branch, the advice for a clone that never followed the
-// journal, would start the journal on a second branch, so it is given only when
-// origin has no branch at all. A current branch that follows one this clone no
-// longer has is told so: the remote may have deleted or renamed it, and pushing
-// would recreate it. Branches are compared by full name, since a tag can share a
-// branch's short one.
+// command it prints works when followed, and names only the journal's branch:
+// origin's default, which init follows, else origin's only branch. A branch here
+// that follows it is the way back; with the journal's branch unknown, so is the
+// only branch here that follows one of origin's. A name a shell would not take as
+// it stands is printed as <branch>. Pushing the current branch, the advice for a
+// clone that never followed the journal, would start the journal on a second
+// branch, so it is given only to a clone that holds none of origin's branches. A
+// current branch that follows one this clone no longer has is told so: the remote
+// may have deleted or renamed it, and pushing would recreate it. Branches are
+// compared by full name, since a tag can share a branch's short one.
 func noUpstream(g git) error {
 	head, _ := g.line("symbolic-ref", "--quiet", "HEAD")
 	out, err := g.line("for-each-ref", "--format=%(refname) %(upstream)", "refs/heads/")
@@ -726,7 +727,7 @@ func noUpstream(g git) error {
 		return err
 	}
 	local := map[string]bool{}
-	var following []string
+	follows := map[string]string{} // a branch here, and the branch of origin's it follows
 	for _, line := range strings.Split(out, "\n") {
 		ref, upstream, _ := strings.Cut(line, " ")
 		if ref == "" {
@@ -734,42 +735,62 @@ func noUpstream(g git) error {
 		}
 		name := strings.TrimPrefix(ref, "refs/heads/")
 		local[name] = true
-		if !strings.HasPrefix(upstream, "refs/remotes/origin/") {
+		theirs, ok := strings.CutPrefix(upstream, "refs/remotes/origin/")
+		if !ok {
 			continue
 		}
 		if ref == head {
-			return fmt.Errorf("%w: %s follows %s, which this clone no longer has, as when the remote deleted or renamed it",
-				ErrNoUpstream, name, strings.TrimPrefix(upstream, "refs/remotes/"))
+			return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed it",
+				ErrNoUpstream, name, theirs)
 		}
-		following = append(following, name)
+		follows[name] = theirs
 	}
-	switch {
-	case len(following) == 1 && shellSafe.MatchString(following[0]):
-		return fmt.Errorf("%w: switch to the branch that follows the journal: `git -C \"%s\" switch %s`",
-			ErrNoUpstream, g.dir, following[0])
-	case len(following) > 0:
-		return fmt.Errorf("%w: switch to a branch that follows the journal, as `git -C \"%s\" branch -vv` shows: "+
-			"`git -C \"%s\" switch <branch>`", ErrNoUpstream, g.dir, g.dir)
-	}
-	remote, err := g.line("for-each-ref", "--format=%(refname)", "refs/remotes/origin/")
+	out, err = g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
 	if err != nil {
 		return err
 	}
-	if remote == "" {
-		return fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, g.dir)
+	var origins []string
+	for _, name := range strings.Split(out, "\n") {
+		if name != "" && name != "HEAD" {
+			origins = append(origins, name)
+		}
+	}
+	if len(origins) == 0 {
+		return fmt.Errorf("%w: this clone holds none of origin's branches; `git -C \"%s\" fetch origin` brings them in, "+
+			"and if origin has none, set one with `git push -u origin <branch>`", ErrNoUpstream, g.dir)
+	}
+	journal := ""
+	if def, err := g.line("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil {
+		if _, err := g.line("rev-parse", "--verify", "--quiet", def); err == nil {
+			journal = strings.TrimPrefix(def, "refs/remotes/origin/")
+		}
+	}
+	if journal == "" && len(origins) == 1 {
+		journal = origins[0]
+	}
+	var back []string // the branches here that are the way back
+	for name, theirs := range follows {
+		if journal == "" || theirs == journal {
+			back = append(back, name)
+		}
+	}
+	switch {
+	case len(back) == 1 && shellSafe.MatchString(back[0]):
+		return fmt.Errorf("%w: switch to the branch that follows the journal: `git -C \"%s\" switch %s`",
+			ErrNoUpstream, g.dir, back[0])
+	case len(back) > 0:
+		return fmt.Errorf("%w: switch to a branch that follows the journal, as `git -C \"%s\" branch -vv` shows: "+
+			"`git -C \"%s\" switch <branch>`", ErrNoUpstream, g.dir, g.dir)
 	}
 	branch := "<branch>"
-	if def, err := g.line("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil {
-		name := strings.TrimPrefix(def, "refs/remotes/origin/")
-		if _, err := g.line("rev-parse", "--verify", "--quiet", def); err == nil && shellSafe.MatchString(name) {
-			branch = name
-		}
+	if shellSafe.MatchString(journal) {
+		branch = journal
 	}
 	if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil && head != "" {
 		return fmt.Errorf("%w: make this branch follow the journal's: `git -C \"%s\" branch --set-upstream-to=origin/%s`",
 			ErrNoUpstream, g.dir, branch)
 	}
-	if local[branch] {
+	if local[journal] {
 		return fmt.Errorf("%w: switch to the journal's branch: `git -C \"%s\" switch %s`", ErrNoUpstream, g.dir, branch)
 	}
 	return fmt.Errorf("%w: switch to the journal's branch: `git -C \"%s\" switch --track origin/%s`",

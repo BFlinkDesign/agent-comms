@@ -1003,7 +1003,7 @@ func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
 // hook that resolved its salt just before it appeared has finished appending.
 func TestRefilingWaitsForTheFleetFileToSettle(t *testing.T) {
 	defer func(d time.Duration) { refileSettle = d }(refileSettle)
-	refileSettle = settleTime
+	refileSettle = productionSettle
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
