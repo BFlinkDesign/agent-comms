@@ -340,8 +340,10 @@ func TestInitWithoutASaltRefusesAJournalThatHoldsRecords(t *testing.T) {
 	gitIn(t, seed, "push", "--quiet", "-u", "origin", "main")
 
 	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote)
-	if !errors.Is(err, gitsync.ErrNeedSalt) || !strings.Contains(err.Error(), "FLEET_SALT") || !strings.Contains(err.Error(), "ran without one") {
-		t.Fatalf("err = %v, want ErrNeedSalt saying how to give the salt, and what to do if the fleet had none", err)
+	if !errors.Is(err, gitsync.ErrNeedSalt) || !strings.Contains(err.Error(), "FLEET_SALT") || !strings.Contains(err.Error(), "ran without one") ||
+		!strings.Contains(err.Error(), "the records they published stay under the ids they had") {
+		t.Fatalf("err = %v, want ErrNeedSalt saying how to give the salt, what to do if the fleet had none, and which "+
+			"records keep their ids", err)
 	}
 	t.Setenv("FLEET_SALT", "the-fleets")
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), remote); err != nil {

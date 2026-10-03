@@ -230,7 +230,9 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	// left the look it made due only in its own clone, which this one replaces:
 	// this one makes it, and only then removes that clone.
 	due := abandonedLooks(o.Dir)
-	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
+	// MkdirTemp puts its digits where the pattern's last * is: at the end, as
+	// besideClones names them, and never where Dir's own name has one.
+	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-*")
 	if err != nil {
 		return res, err
 	}

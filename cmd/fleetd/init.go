@@ -66,8 +66,9 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		return saltMismatch(from, url)
 	case errors.Is(err, gitsync.ErrNeedSalt):
 		return fmt.Errorf("%w. Give init the salt its machines record with, with --salt or FLEET_SALT, so they keep "+
-			"their host ids. If they ran without one, as fleetd v0.1.0 allowed, give a new salt: their records so far "+
-			"stay under the ids they had, and each machine's new records go under a new one", err)
+			"their host ids. If they ran without one, as fleetd v0.1.0 allowed, give a new salt: the records they "+
+			"published stay under the ids they had, and the rest, with every new one, go under new ones once each "+
+			"machine has run fleetd init", err)
 	case err != nil:
 		return err
 	}

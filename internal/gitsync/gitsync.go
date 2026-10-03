@@ -391,7 +391,13 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		// another id, for good once published. They wait for init, which puts the
 		// file in place, after which a sync files them under the fleet's.
 		if _, err := os.Lstat(filepath.Join(o.Dir, FleetFile)); errors.Is(err, os.ErrNotExist) {
-			if entry, _ := g.line("ls-tree", remoteTip, "--", FleetFile); entry != "" {
+			// A git that cannot say stops the sync too: the records would go out
+			// for good, and the next sync asks again.
+			entry, err := g.line("ls-tree", remoteTip, "--", FleetFile)
+			if err != nil {
+				return res, err
+			}
+			if entry != "" {
 				return res, fmt.Errorf("%w, which origin's %s holds, so this machine's records would go out under "+
 					"another id; they wait, and `fleetd init --dir \"%s\" <journal URL>` puts it in place, after which "+
 					"a sync files them under the fleet's", ErrNoFleetFile, branch, g.dir)
