@@ -292,17 +292,23 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 
-	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	// Only a branch of origin's: fleetd's clone follows the journal there, and a
+	// branch of another remote, or of the clone, would take this machine's records
+	// somewhere the fleet never looks. Full names, so that a branch here named
+	// origin/main never passes for origin's.
+	upstream, err := g.line("rev-parse", "--symbolic-full-name", "@{u}")
 	if err != nil {
 		if ctx.Err() != nil {
 			return res, err
 		}
 		return res, noUpstream(g)
 	}
-	remote, branch, ok := strings.Cut(upstream, "/")
+	branch, ok := strings.CutPrefix(upstream, "refs/remotes/origin/")
 	if !ok {
 		return res, noUpstream(g)
 	}
+	remote := "origin"
+	upstream = remote + "/" + branch
 	localRef, err := g.line("symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		if ctx.Err() != nil {
@@ -711,31 +717,53 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 }
 
 // noUpstream is the error for a clone whose HEAD is not on a branch that follows
-// one of origin's: detached, on a branch with no commit, made by hand, or that
-// follows something else. fleetd init puts such a clone back on the journal's
-// branch, moving refs only and never a file, so running it is the advice: the git
-// commands that move a branch would refuse, or would overwrite this machine's
-// records, when the work tree has records the branch's files lack. A current
-// branch that follows one of origin's the clone no longer has is told so instead:
-// the remote may have deleted or renamed it, and init would not know where the
-// journal went.
+// one of origin's: detached, on a branch with no commit, or on one that follows
+// nothing, a branch of the clone or another remote's. fleetd init puts such a
+// clone back on the journal's branch, moving refs only and never a file, so
+// running it is the advice: the git commands that move a branch would refuse, or
+// would overwrite this machine's records, when the work tree has records the
+// branch's files lack. A current branch that follows one of origin's the clone no
+// longer has is told so instead: the remote may have deleted or renamed it, and
+// init would not know where the journal went.
 func noUpstream(g git) error {
 	head, err := g.line("symbolic-ref", "--quiet", "HEAD")
 	if err != nil && g.ctx.Err() != nil {
 		return err
 	}
 	if err == nil {
-		upstream, err := g.line("for-each-ref", "--format=%(upstream)", head)
+		theirs, err := goneUpstream(g, head)
 		if err != nil {
 			return err
 		}
-		if theirs, ok := strings.CutPrefix(upstream, "refs/remotes/origin/"); ok {
-			return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed it",
-				ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs)
+		if theirs != "" {
+			return goneError(head, theirs)
 		}
 	}
-	return fmt.Errorf("%w: `fleetd init --dir \"%s\" <journal URL>` puts it back there and leaves its files as they are",
-		ErrNoUpstream, g.dir)
+	return fmt.Errorf("%w: `fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, "+
+		"or says what stops it", ErrNoUpstream, g.dir)
+}
+
+// goneUpstream names the branch of origin's that the branch head follows when
+// this clone no longer has it, else "". The branch is looked up by its full name,
+// never as a pattern, which would take zz/a for zz.
+func goneUpstream(g git, head string) (string, error) {
+	ups, err := upstreams(g)
+	if err != nil {
+		return "", err
+	}
+	theirs, ok := strings.CutPrefix(ups[strings.TrimPrefix(head, "refs/heads/")], "refs/remotes/origin/")
+	if !ok {
+		return "", nil
+	}
+	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+theirs); err == nil {
+		return "", nil
+	}
+	return theirs, g.ctx.Err()
+}
+
+func goneError(head, theirs string) error {
+	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed it",
+		ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs)
 }
 
 func mapKeys(m map[string]bool) []string {

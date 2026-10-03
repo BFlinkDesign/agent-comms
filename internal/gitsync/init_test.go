@@ -17,6 +17,13 @@ import (
 func emptyRemote(t *testing.T) string {
 	t.Helper()
 	requireGit(t)
+	return newEmptyRemote(t)
+}
+
+// newEmptyRemote is emptyRemote for a parallel test, which cannot set the
+// environment requireGit sets: its parent calls requireGit instead.
+func newEmptyRemote(t *testing.T) string {
+	t.Helper()
 	root := t.TempDir()
 	remote := filepath.Join(root, "journal.git")
 	run(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
@@ -299,11 +306,13 @@ func TestASecondMachineFollowsTheOnlyBranchWhenTheServerNamesNone(t *testing.T) 
 // out, never what a failure there would otherwise mean: not a clone, a clone of
 // another repository, or no upstream.
 func TestAnInitThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
+	requireGit(t)
 	for _, at := range []string{"--show-toplevel", "remote.origin.url", "@{u}",
 		"detached symbolic-ref", "detached ls-remote", "detached update-ref", "detached read-tree",
 		"behind merge-base", "hand for-each-ref"} {
 		t.Run(at, func(t *testing.T) {
-			remote := emptyRemote(t)
+			t.Parallel()
+			remote := newEmptyRemote(t)
 			dir := filepath.Join(t.TempDir(), "journal")
 			mustInit(t, InitOptions{URL: remote, Dir: dir, Salt: "s"})
 			// Off the journal's branch, the time can run out while init puts the clone
@@ -572,14 +581,16 @@ func TestInitPutsACloneBackOnTheRemotesDefaultBranch(t *testing.T) {
 	}
 }
 
-// With several branches and none of them the remote's default, the journal could
-// be on any: init moves nothing, and says to make the right one the default.
+// With several branches, none of them the remote's default, and no branch here
+// that follows one of them, the journal could be on any: init moves nothing, and
+// says to make the right one the default.
 func TestInitPutsNoCloneBackOnABranchItWouldHaveToGuess(t *testing.T) {
 	remote, m := fleet(t, 2)
 	a, admin := m[0], m[1]
 	run(t, admin, "push", "--quiet", "origin", "main:refs/heads/stray")
 	run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/gone")
 	run(t, a, "checkout", "--quiet", "--detach")
+	run(t, a, "branch", "--quiet", "-D", "main")
 	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
 	if !errors.Is(err, ErrNoDefaultBranch) {
 		t.Fatalf("init with several branches and no default: %v, want ErrNoDefaultBranch", err)
@@ -650,6 +661,7 @@ func TestInitLeavesABranchTheCloneNoLongerHasForAPerson(t *testing.T) {
 // commits with it, out of the journal directory, rather than to delete it, from a
 // branch, an orphan branch or a detached HEAD alike.
 func TestInitTellsACloneWithCommitsBesideAnEmptyRepositoryToMoveThemOut(t *testing.T) {
+	requireGit(t)
 	for _, c := range []struct {
 		name  string
 		leave [][]string
@@ -659,7 +671,8 @@ func TestInitTellsACloneWithCommitsBesideAnEmptyRepositoryToMoveThemOut(t *testi
 		{"detached, with no branch", [][]string{{"checkout", "--quiet", "--detach"}, {"branch", "--quiet", "-D", "main"}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			remote := emptyRemote(t)
+			t.Parallel()
+			remote := newEmptyRemote(t)
 			dir := filepath.Join(t.TempDir(), "journal")
 			run(t, filepath.Dir(dir), "init", "--quiet", "--initial-branch=main", dir)
 			identify(t, dir)
@@ -671,9 +684,280 @@ func TestInitTellsACloneWithCommitsBesideAnEmptyRepositoryToMoveThemOut(t *testi
 				run(t, dir, args...)
 			}
 			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir, Salt: "s"})
-			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "move its .git directory out of") || strings.Contains(err.Error(), "delete") {
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "move its .git directory, and every file there but journal files") ||
+				strings.Contains(err.Error(), "delete") {
 				t.Fatalf("init beside an empty repository with commits of its own: %v, want ErrNoUpstream saying to move them out", err)
 			}
 		})
 	}
+}
+
+// clonedState is what init must leave as it was when it refuses: where HEAD is,
+// every ref, the index and every branch's upstream.
+func clonedState(t *testing.T, dir string) string {
+	t.Helper()
+	head, err := exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "HEAD").Output()
+	if err != nil {
+		head = []byte(run(t, dir, "rev-parse", "HEAD"))
+	}
+	branches, _ := exec.Command("git", "-C", dir, "config", "--get-regexp", `^branch\.`).Output()
+	return strings.Join([]string{string(head), run(t, dir, "for-each-ref", "--format=%(refname) %(objectname)"),
+		run(t, dir, "ls-files", "--stage"), string(branches)}, "\n--\n")
+}
+
+// A repository that is not a journal, given to init by mistake with its own URL,
+// is refused before anything in it moves: not its branches, not HEAD, not a change
+// a person staged.
+func TestInitMovesNothingInARepositoryThatIsNotAJournal(t *testing.T) {
+	requireGit(t)
+	for _, c := range []struct {
+		name  string
+		leave [][]string
+	}{
+		{"on a branch of its own", [][]string{{"switch", "--quiet", "-c", "feature"}}},
+		{"detached", [][]string{{"checkout", "--quiet", "--detach"}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			remote := filepath.Join(root, "project.git")
+			run(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
+			seed := filepath.Join(root, "seed")
+			run(t, root, "clone", "--quiet", remote, seed)
+			identify(t, seed)
+			write(t, filepath.Join(seed, "go.mod"), "module example.com/project\n")
+			run(t, seed, "add", ".")
+			run(t, seed, "commit", "--quiet", "-m", "start")
+			run(t, seed, "push", "--quiet", "origin", "main")
+			dir := filepath.Join(root, "project")
+			run(t, root, "clone", "--quiet", remote, dir)
+			// main falls a commit behind origin's, where a repair would move it.
+			write(t, filepath.Join(seed, "go.mod"), "module example.com/project\n\ngo 1.27\n")
+			run(t, seed, "commit", "--quiet", "-am", "go")
+			run(t, seed, "push", "--quiet", "origin", "main")
+			run(t, dir, "fetch", "--quiet")
+			for _, args := range c.leave {
+				run(t, dir, args...)
+			}
+			write(t, filepath.Join(dir, "staged.txt"), "a change a person staged\n")
+			run(t, dir, "add", "staged.txt")
+			before := clonedState(t, dir)
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir, Salt: "s"}); !errors.Is(err, ErrNotJournal) {
+				t.Fatalf("init on a project's clone: %v, want ErrNotJournal", err)
+			}
+			if after := clonedState(t, dir); after != before {
+				t.Fatalf("init moved things in a repository it refused:\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+// A repair cut short at any step, by a git that fails or a kill, leaves a clone
+// off the journal's branch, which init run again puts back: HEAD moves last, and
+// a branch's upstream never reads as one origin no longer has.
+func TestARepairCutShortIsFinishedByInitRunAgain(t *testing.T) {
+	requireGit(t)
+	orphan := [][]string{{"checkout", "--quiet", "--orphan", "scratch"}, {"rm", "-r", "-q", "--cached", "."}}
+	followsX := [][]string{{"branch", "--quiet", "x"}, {"branch", "--quiet", "-u", "x"}}
+	for _, c := range []struct {
+		name  string
+		leave [][]string
+		at    []string
+	}{
+		{"an orphan branch, filling the index", orphan, []string{"read-tree"}},
+		{"an orphan branch, moving main", orphan, []string{"update-ref"}},
+		{"an orphan branch, main's upstream branch", orphan, []string{"config", "branch.main.merge"}},
+		{"an orphan branch, main's upstream remote", orphan, []string{"config", "branch.main.remote"}},
+		{"an orphan branch, HEAD", orphan, []string{"symbolic-ref", "refs/heads/main"}},
+		{"main following a branch of the clone, its upstream branch", followsX, []string{"config", "branch.main.merge"}},
+		{"main following a branch of the clone, its upstream remote", followsX, []string{"config", "branch.main.remote"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, a, _ := offBranch(t)
+			for _, args := range c.leave {
+				run(t, a, args...)
+			}
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+			cut := false
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s",
+				Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+					if !cut && len(args) > 0 && !slices.ContainsFunc(c.at, func(s string) bool { return !slices.Contains(args, s) }) {
+						cut = true
+						return "", errors.New("cut short")
+					}
+					return Git(ctx, dir, stdin, args...)
+				}})
+			if !cut || err == nil {
+				t.Fatalf("the repair was not cut short at %v: %v", c.at, err)
+			}
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached {
+				t.Fatalf("init run again = %+v, want it to finish putting the clone back", res)
+			}
+			mustSync(t, options(a, "host-a"))
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+				t.Fatalf("main holds %q for host-a", got)
+			}
+			if got := readFile(t, filepath.Join(a, "host-b.jsonl")); got != "{\"id\":\"hive:b1\"}\n{\"id\":\"hive:b2\"}\n" {
+				t.Fatalf("the work tree holds %q for host-b", got)
+			}
+			if out := run(t, a, "status", "--porcelain", "--untracked-files=no"); out != "" {
+				t.Fatalf("git status after the sync:\n%s", out)
+			}
+		})
+	}
+}
+
+// A remote's default can change while its machines go on publishing to the branch
+// they follow. A clone put back goes to the branch it follows, if the remote still
+// has it, rather than split the journal; with that branch gone, to the default.
+func TestInitPutsACloneBackOnTheBranchItFollows(t *testing.T) {
+	requireGit(t)
+	for _, c := range []struct {
+		name       string
+		deleteMain bool
+		want       string
+	}{
+		{"the default changed to trunk, main still in use", false, "main"},
+		{"main renamed to trunk", true, "trunk"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 2)
+			a, admin := m[0], m[1]
+			run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
+			run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			if c.deleteMain {
+				run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
+			}
+			run(t, a, "checkout", "--quiet", "--detach")
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached || res.Branch != c.want {
+				t.Fatalf("init = %+v, want the clone put back on %s", res, c.want)
+			}
+		})
+	}
+}
+
+// A clone that follows several of origin's branches goes back to the remote's
+// default among them; with none of them the default, init moves nothing.
+func TestInitPutsACloneFollowingSeveralBranchesBackOnTheDefault(t *testing.T) {
+	requireGit(t)
+	for _, c := range []struct{ name, head, want string }{
+		{"trunk the default", "refs/heads/trunk", "trunk"},
+		{"neither the default", "refs/heads/gone", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 2)
+			a, admin := m[0], m[1]
+			run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
+			run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", c.head)
+			run(t, a, "fetch", "--quiet")
+			run(t, a, "branch", "--quiet", "--track", "trunk", "origin/trunk")
+			run(t, a, "checkout", "--quiet", "--detach")
+			before := clonedState(t, a)
+			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
+			if c.want == "" {
+				if !errors.Is(err, ErrNoDefaultBranch) || !strings.Contains(err.Error(), "main, trunk") {
+					t.Fatalf("init on a clone following two branches, neither the default: %v, want ErrNoDefaultBranch naming both", err)
+				}
+				if after := clonedState(t, a); after != before {
+					t.Fatalf("init moved things in a clone it refused:\nbefore:\n%s\nafter:\n%s", before, after)
+				}
+				return
+			}
+			if err != nil || !res.Reattached || res.Branch != c.want {
+				t.Fatalf("init = %+v, %v; want the clone put back on %s", res, err, c.want)
+			}
+		})
+	}
+}
+
+// A clone in the middle of something a person does by hand is left to them, with
+// nothing moved: a rebase stopped on a conflict, a commit on a detached HEAD that no
+// branch holds, the journal's branch checked out in another worktree.
+func TestInitLeavesACloneInTheMiddleOfSomethingToAPerson(t *testing.T) {
+	requireGit(t)
+	for _, c := range []struct {
+		name string
+		do   func(t *testing.T, a string)
+		want string
+	}{
+		{"a rebase stopped on a conflict", func(t *testing.T, a string) {
+			run(t, a, "switch", "--quiet", "-c", "mine")
+			write(t, filepath.Join(a, "README.md"), "mine\n")
+			run(t, a, "commit", "--quiet", "-am", "mine")
+			run(t, a, "switch", "--quiet", "main")
+			write(t, filepath.Join(a, "README.md"), "theirs\n")
+			run(t, a, "commit", "--quiet", "-am", "theirs")
+			run(t, a, "switch", "--quiet", "mine")
+			if err := exec.Command("git", "-C", a, "rebase", "--quiet", "main").Run(); err == nil {
+				t.Fatal("the rebase did not stop on a conflict")
+			}
+		}, "in the middle of a rebase"},
+		{"a commit on a detached HEAD", func(t *testing.T, a string) {
+			run(t, a, "checkout", "--quiet", "--detach")
+			write(t, filepath.Join(a, "notes.txt"), "mine\n")
+			run(t, a, "add", "notes.txt")
+			run(t, a, "commit", "--quiet", "-m", "mine")
+		}, "a commit no branch or tag holds"},
+		{"main checked out in another worktree", func(t *testing.T, a string) {
+			run(t, a, "checkout", "--quiet", "--detach")
+			run(t, a, "worktree", "add", "--quiet", filepath.Join(t.TempDir(), "other"), "main")
+		}, "is checked out in the worktree at"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 1)
+			a := m[0]
+			c.do(t, a)
+			before := clonedState(t, a)
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("init: %v, want ErrNoUpstream saying %q", err, c.want)
+			}
+			if after := clonedState(t, a); after != before {
+				t.Fatalf("init moved things in a clone it left to a person:\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+// A branch of origin's that init's own fetch did not bring in, such as one made
+// just after it, is fetched for the repair.
+func TestInitFetchesTheJournalsBranchItPutsTheCloneBackOn(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "checkout", "--quiet", "--detach")
+	run(t, a, "branch", "--quiet", "-D", "main")
+	run(t, a, "update-ref", "-d", "refs/remotes/origin/main")
+	first := true
+	res, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s",
+		Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+			if first && slices.Contains(args, "fetch") {
+				first = false
+				return "", nil
+			}
+			return Git(ctx, dir, stdin, args...)
+		}})
+	if err != nil || !res.Reattached || res.Branch != "main" {
+		t.Fatalf("init = %+v, %v; want the clone put back on main", res, err)
+	}
+	mustSync(t, options(a, "host-a"))
+}
+
+// A clone with no remote named origin is told so: fleetd syncs with origin alone.
+func TestInitSaysWhenThereIsNoRemoteNamedOrigin(t *testing.T) {
+	remote, m := fleet(t, 1)
+	run(t, m[0], "remote", "rename", "origin", "upstream")
+	_, err := Sync(context.Background(), options(m[0], "h"))
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "fleetd init --dir") {
+		t.Fatalf("sync on a clone whose remote is upstream: %v, want ErrNoUpstream saying to run init", err)
+	}
+	_, err = Init(context.Background(), InitOptions{URL: remote, Dir: m[0], Salt: "s"})
+	if !errors.Is(err, ErrOtherRemote) || !strings.Contains(err.Error(), "has no remote named origin") {
+		t.Fatalf("init on a clone whose remote is upstream: %v, want ErrOtherRemote saying it has no origin", err)
+	}
+	run(t, m[0], "remote", "rename", "upstream", "origin")
+	mustInit(t, InitOptions{URL: remote, Dir: m[0], Salt: "s"})
 }

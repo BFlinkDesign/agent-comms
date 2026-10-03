@@ -123,20 +123,32 @@ directory that is already a clone of another repository is refused too. A
 journal's, and init's own sync files the records written under its salt under the
 journal's, and so is one git converted on checkout, as a `.gitattributes` can have
 it do, so that fleetd cannot read the journal's salt from it. A clone a person
-moved off the journal's branch, detached, on an orphan branch or one made by hand,
-on a branch that follows something else, or with no commit yet, as a plain clone of
-the repository made while it was empty has, is put back on it by init: the
-remote's default branch, else its only branch. Only refs and git's index change,
-never a file, so this machine's records stay as they are, which git's own ways
-back (`git switch`, `git checkout`) refuse to promise; a branch with commits of its
-own is not moved, and init's sync then reports them. Sync tells any such clone to
-run `fleetd init --dir "<dir>" <journal URL>`. A branch that follows one of
-origin's the clone no longer has, deleted or renamed on the remote, is left for a
-person, and named as such. When the repository has no branch yet, a clone with no
-commit and no branch is told to delete its `.git` directory, which holds no
-commit, after which init sets the directory up as a new one, keeping its files;
-one with commits of its own, to move its `.git` directory out of the journal
-directory. When two machines start the same empty repository at once, the one
+moved off the journal's branch, detached, on an orphan branch, on a branch that
+follows nothing, a branch of the clone or another remote's, or with no commit
+yet, as a plain clone of the repository made while it was empty has, is put back
+on it by init. The journal's branch is the one this clone follows, of the same
+name on origin, if origin still has it, since a remote's default can change while
+its machines go on publishing where they did; else the remote's default; else its
+only branch. Only refs and git's index change, never a file, so this machine's
+records stay as they are, which git's own ways back (`git switch`, `git
+checkout`) refuse to promise; HEAD moves last, so init run again finishes a
+repair cut short. A branch with commits of its own is not moved, and init's sync
+then reports them. Nothing moves in a repository that is not a journal, in the
+middle of a rebase, merge, cherry-pick, revert or bisect, with a commit only HEAD
+holds, or with the journal's branch checked out in another worktree; init says
+which. Sync syncs only a branch that follows one of origin's, and tells any other
+clone to run `fleetd init --dir "<dir>" <journal URL>`. A branch that follows one
+of origin's the clone no longer has, deleted or renamed on the remote, is left for
+a person, and named as such; one that follows another of origin's branches, as
+`git switch stray` makes, syncs with that branch, as before. Files the remote
+changed or removed while the clone was on an older commit are kept as they are
+and reported by every sync, as any file with changes is; `git checkout
+'@{upstream}' -- <file>` takes the remote's copy. When the repository has no
+branch yet, a clone with no commit and no branch is told to delete its `.git`
+directory, which holds no commit, after which init sets the directory up as a new
+one, keeping its files; one with commits of its own, to move its `.git`
+directory, and every file there but journal files and `fleetd.json`, out of the
+journal directory. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal

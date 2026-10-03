@@ -53,6 +53,13 @@ func run(t *testing.T, dir string, args ...string) string {
 func fleet(t *testing.T, n int) (remote string, machines []string) {
 	t.Helper()
 	requireGit(t)
+	return newFleet(t, n)
+}
+
+// newFleet is fleet for a parallel test, which cannot set the environment
+// requireGit sets: its parent calls requireGit instead.
+func newFleet(t *testing.T, n int) (remote string, machines []string) {
+	t.Helper()
 	root := t.TempDir()
 	remote = filepath.Join(root, "remote.git")
 	run(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
@@ -426,10 +433,11 @@ func initAdvice(dir string) string {
 }
 
 // offBranch is a journal whose clone a has published a1 and fetched b2, which it
-// has not taken in: its main is one commit behind origin's.
+// has not taken in: its main is one commit behind origin's. Its caller has called
+// requireGit, so that a parallel test can use it.
 func offBranch(t *testing.T) (remote, a, b string) {
 	t.Helper()
-	remote, m := fleet(t, 2)
+	remote, m := newFleet(t, 2)
 	a, b = m[0], m[1]
 	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b1"}`)
 	mustSync(t, options(b, "host-b"))
@@ -447,6 +455,7 @@ func offBranch(t *testing.T) (remote, a, b string) {
 // branch's files lack them. Each state ends with every record published to main,
 // from a work tree that holds every machine's file.
 func TestAClonePutOffTheJournalsBranchIsPutBackByInit(t *testing.T) {
+	requireGit(t)
 	for _, c := range []struct {
 		name  string
 		leave [][]string
@@ -476,11 +485,22 @@ func TestAClonePutOffTheJournalsBranchIsPutBackByInit(t *testing.T) {
 		{"an orphan branch with an emptied index and main deleted", [][]string{
 			{"checkout", "--quiet", "--orphan", "scratch"}, {"rm", "-r", "-q", "--cached", "."}, {"branch", "--quiet", "-D", "main"},
 		}},
+		{"a detached HEAD beside a branch named mine that follows main", [][]string{
+			{"branch", "--quiet", "-m", "main", "mine"}, {"checkout", "--quiet", "--detach"},
+		}},
+		{"a detached HEAD beside a branch named stray that follows main, which origin has too", [][]string{
+			{"push", "--quiet", "origin", "main:refs/heads/stray"}, {"fetch", "--quiet"},
+			{"branch", "--quiet", "-m", "main", "stray"}, {"checkout", "--quiet", "--detach"},
+		}},
+		{"a detached HEAD beside main following two branches at once", [][]string{
+			{"config", "--add", "branch.main.merge", "refs/heads/other"}, {"checkout", "--quiet", "--detach"},
+		}},
 		{"a detached HEAD at origin's tip, with main behind its own", [][]string{
 			{"checkout", "--quiet", "--detach", "origin/main"}, {"branch", "--quiet", "-f", "main", "main~1"},
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			remote, a, _ := offBranch(t)
 			for _, args := range c.leave {
 				run(t, a, args...)
@@ -514,11 +534,77 @@ func TestAClonePutOffTheJournalsBranchIsPutBackByInit(t *testing.T) {
 	}
 }
 
+// A branch that follows another remote's branch would take this machine's records
+// where the fleet never looks: sync stops, and says to run init, which puts the
+// clone back on origin's.
+func TestABranchFollowingAnotherRemotesIsPutBackOnOrigins(t *testing.T) {
+	requireGit(t)
+	remote, a, _ := offBranch(t)
+	backup := filepath.Join(t.TempDir(), "backup.git")
+	run(t, a, "clone", "--quiet", "--bare", remote, backup)
+	run(t, a, "remote", "add", "backup", backup)
+	run(t, a, "fetch", "--quiet", "backup")
+	run(t, a, "branch", "--quiet", "-u", "backup/main")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), initAdvice(a)) {
+		t.Fatalf("expected ErrNoUpstream saying %s, got %v", initAdvice(a), err)
+	}
+	if got := remoteFile(t, backup, "host-a.jsonl"); strings.Contains(got, "hive:a2") {
+		t.Fatalf("the sync published to the other remote: %q", got)
+	}
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached || res.Branch != "main" {
+		t.Fatalf("init = %+v, want the clone put back on main", res)
+	}
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+}
+
+// Branches are looked up by full name: a branch here named origin/main never
+// passes for origin's main, and an orphan zz is not taken for a branch zz/a that
+// follows one of origin's. Neither reads as a branch the clone no longer has.
+func TestABranchIsLookedUpByItsFullName(t *testing.T) {
+	requireGit(t)
+	for _, c := range []struct {
+		name  string
+		leave [][]string
+	}{
+		{"main following a branch here named origin/main", [][]string{
+			{"branch", "--quiet", "origin/main"}, {"config", "branch.main.remote", "."},
+			{"config", "branch.main.merge", "refs/heads/origin/main"},
+		}},
+		{"an orphan zz beside zz/a, which follows a branch origin no longer has", [][]string{
+			{"push", "--quiet", "origin", "main:refs/heads/gone"}, {"fetch", "--quiet"},
+			{"branch", "--quiet", "--track", "zz/a", "origin/gone"}, {"push", "--quiet", "origin", ":refs/heads/gone"},
+			{"fetch", "--quiet", "--prune"}, {"checkout", "--quiet", "--orphan", "zz"},
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, a, _ := offBranch(t)
+			for _, args := range c.leave {
+				run(t, a, args...)
+			}
+			_, err := Sync(context.Background(), options(a, "host-a"))
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), initAdvice(a)) {
+				t.Fatalf("expected ErrNoUpstream saying %s, got %v", initAdvice(a), err)
+			}
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached || res.Branch != "main" {
+				t.Fatalf("init = %+v, want the clone put back on main", res)
+			}
+			mustSync(t, options(a, "host-a"))
+		})
+	}
+}
+
 // A person who checks out an older commit has git rewrite this machine's file to
 // that commit's copy, without the records it published since. init puts the clone
 // back all the same, and leaves the file as it is: the sync then says the remote
 // holds records this copy lacks, which init --reclaim puts back.
 func TestAnOlderCommitCheckedOutIsPutBackAndLeftForReclaim(t *testing.T) {
+	requireGit(t)
 	remote, a, _ := offBranch(t)
 	run(t, a, "checkout", "--quiet", "HEAD~1")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
@@ -567,9 +653,11 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 // out, never what a failure there would otherwise mean: not a clone, no
 // upstream, a detached HEAD, or commits fleetd did not make.
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
+	requireGit(t)
 	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "merge-base", "prepare", "detached symbolic-ref", "by hand for-each-ref"} {
 		t.Run(at, func(t *testing.T) {
-			_, m := fleet(t, 1)
+			t.Parallel()
+			_, m := newFleet(t, 1)
 			appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
 			// Off the journal's branch, the time can run out while the sync works out
 			// what to say about it.
@@ -666,9 +754,11 @@ func TestARepositoryWithNoCommitIsToldToRunInit(t *testing.T) {
 // whether it has fetched since or not, and init puts it on the journal's branch,
 // keeping its git directory and the records written meanwhile.
 func TestAPlainCloneOfTheEmptyJournalIsPutOnItsBranchByInit(t *testing.T) {
+	requireGit(t)
 	for _, fetched := range []bool{false, true} {
 		t.Run(map[bool]string{false: "not fetched since", true: "fetched since"}[fetched], func(t *testing.T) {
-			remote := emptyRemote(t)
+			t.Parallel()
+			remote := newEmptyRemote(t)
 			root := filepath.Dir(remote)
 			a := filepath.Join(root, "a")
 			run(t, root, "clone", "--quiet", remote, a)

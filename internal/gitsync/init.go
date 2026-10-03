@@ -278,6 +278,10 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if err != nil && ctx.Err() != nil {
 		return res, err
 	}
+	if origin == "" {
+		return res, fmt.Errorf("%w: %s has no remote named origin, the one fleetd syncs with; if one of its remotes is "+
+			"%s, name it origin (git remote rename), then run fleetd init again", ErrOtherRemote, o.Dir, url)
+	}
 	if !sameURL(origin, url) {
 		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
 	}
@@ -289,7 +293,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
 		return res, err
 	}
-	if res.Branch, res.Reattached, err = onBranch(g, url); err != nil {
+	if res.Branch, res.Reattached, err = onBranch(g, gitDir, url); err != nil {
 		return res, err
 	}
 	// An init stopped after moving its clone's git directory in, and before
@@ -312,19 +316,24 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 
 // onBranch returns the branch of origin's that the clone follows. A clone a person
 // moved off the journal's branch is put back on it first: detached, on an orphan
-// branch or one made by hand, on a branch that follows something else, or with no
-// commit yet, as a plain clone made while the repository was empty has. Only refs
-// and the index change, never a file, since this machine's records are in the work
-// tree and the commands that move a branch would refuse, or overwrite them, when
-// the branch's files lack them: restoreMissing then brings back the files the work
-// tree lacks, and init's sync the rest. The journal's branch here starts at
-// origin's tip, and moves only forward to it; one with commits of its own stays
-// where it is, for the sync to report them. A current branch that follows one of
-// origin's the clone no longer has is left for a person: the remote may have
-// deleted or renamed it, and init would not know where the journal went.
-func onBranch(g git, url string) (branch string, reattached bool, err error) {
-	if upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); err == nil {
-		if theirs, ok := strings.CutPrefix(upstream, "origin/"); ok {
+// branch, on a branch that follows nothing, a branch of the clone or another
+// remote's, or with no commit yet, as a plain clone made while the repository was
+// empty has. Only refs and the index change, never a file, since this machine's
+// records are in the work tree and the commands that move a branch would refuse,
+// or overwrite them, when the branch's files lack them: restoreMissing then brings
+// back the files the work tree lacks, and init's sync the rest. Nothing moves in a
+// repository that is not a journal, in the middle of a rebase, merge, cherry-pick,
+// revert or bisect, with a commit only HEAD holds, or with the journal's branch
+// checked out in another worktree. The journal's branch here starts at origin's
+// tip, and moves only forward to it; one with commits of its own stays where it
+// is, for the sync to report them. HEAD moves last, so that a repair cut short
+// leaves a clone off the branch, which init repairs again. A current branch that
+// follows one of origin's the clone no longer has is left for a person: the
+// remote may have deleted or renamed it, and init would not know where the
+// journal went.
+func onBranch(g git, gitDir, url string) (branch string, reattached bool, err error) {
+	if upstream, err := g.line("rev-parse", "--symbolic-full-name", "@{u}"); err == nil {
+		if theirs, ok := strings.CutPrefix(upstream, "refs/remotes/origin/"); ok {
 			if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
 				return theirs, false, nil
 			}
@@ -333,37 +342,63 @@ func onBranch(g git, url string) (branch string, reattached bool, err error) {
 	if err := g.ctx.Err(); err != nil {
 		return "", false, err
 	}
-	if head, err := g.line("symbolic-ref", "--quiet", "HEAD"); err == nil {
-		upstream, err := g.line("for-each-ref", "--format=%(upstream)", head)
+	head, _ := g.line("symbolic-ref", "--quiet", "HEAD")
+	if head != "" {
+		theirs, err := goneUpstream(g, head)
 		if err != nil {
 			return "", false, err
 		}
-		if strings.HasPrefix(upstream, "refs/remotes/origin/") {
-			return "", false, noUpstream(g)
+		if theirs != "" {
+			return "", false, goneError(head, theirs)
 		}
 	}
 	if branch, err = journalBranch(g, url); err != nil {
 		return "", false, err
 	}
+	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch); err != nil {
+		// A branch made after init's fetch, or one a narrowed refspec leaves out.
+		if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin",
+			"+refs/heads/"+branch+":refs/remotes/origin/"+branch)...); err != nil {
+			return "", false, err
+		}
+	}
 	tip, err := g.line("rev-parse", "--verify", "refs/remotes/origin/"+branch)
 	if err != nil {
 		return "", false, err
 	}
+	top, err := topLevel(g, tip)
+	if err != nil {
+		return "", false, err
+	}
+	if err := looksLikeJournal(top); err != nil {
+		return "", false, fmt.Errorf("%w (%s): %v", ErrNotJournal, url, err)
+	}
+	if err := leftAsItIs(g, gitDir, head, branch); err != nil {
+		return "", false, err
+	}
 	ref := "refs/heads/" + branch
-	if have, err := g.line("rev-parse", "--verify", "--quiet", ref); err != nil {
-		if _, err := g.line("update-ref", ref, tip, ""); err != nil {
-			return "", false, err
-		}
-	} else if _, err := g.line("merge-base", "--is-ancestor", have, tip); err == nil {
-		if _, err := g.line("update-ref", ref, tip, have); err != nil {
-			return "", false, err
+	target, old := tip, ""
+	if have, err := g.line("rev-parse", "--verify", "--quiet", ref); err == nil {
+		old = have
+		if _, err := g.line("merge-base", "--is-ancestor", have, tip); err != nil {
+			if err := g.ctx.Err(); err != nil {
+				return "", false, err
+			}
+			target = have
 		}
 	}
-	for _, args := range [][]string{
-		{"branch", "--quiet", "--set-upstream-to=origin/" + branch, branch},
-		{"symbolic-ref", "HEAD", ref},
-		{"read-tree", "HEAD"},
-	} {
+	steps := [][]string{{"read-tree", target}}
+	if target != old {
+		steps = append(steps, []string{"update-ref", ref, target, old})
+	}
+	// The upstream's branch before its remote: cut short between the two, the
+	// branch follows itself, or one of another remote's, which init repairs
+	// again, never one of origin's it might take for gone.
+	steps = append(steps,
+		[]string{"config", "--replace-all", "branch." + branch + ".merge", ref},
+		[]string{"config", "--replace-all", "branch." + branch + ".remote", "origin"},
+		[]string{"symbolic-ref", "HEAD", ref})
+	for _, args := range steps {
 		if _, err := g.line(args...); err != nil {
 			return "", false, err
 		}
@@ -371,40 +406,104 @@ func onBranch(g git, url string) (branch string, reattached bool, err error) {
 	return branch, true, nil
 }
 
+// leftAsItIs refuses to move a clone a person is in the middle of something in:
+// a rebase, merge, cherry-pick, revert or bisect, a commit only HEAD holds, or the
+// journal's branch checked out in another worktree, which would then hold a branch
+// that moved under it.
+func leftAsItIs(g git, gitDir, head, branch string) error {
+	for _, name := range []string{"rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"} {
+		if _, err := os.Lstat(filepath.Join(gitDir, name)); err == nil {
+			return fmt.Errorf("%w: %s is in the middle of a rebase, merge, cherry-pick, revert or bisect; finish or abort "+
+				"it, then run fleetd init again", ErrNoUpstream, g.dir)
+		}
+	}
+	if head == "" {
+		if commit, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
+			holders, err := g.line("for-each-ref", "--contains", commit, "--format=%(refname)")
+			if err != nil {
+				return err
+			}
+			if holders == "" {
+				return fmt.Errorf("%w: %s's HEAD is at %s, a commit no branch or tag holds; give it a branch if it is "+
+					"to be kept, then run fleetd init again", ErrNoUpstream, g.dir, commit)
+			}
+		}
+	}
+	list, err := g.line("worktree", "list", "--porcelain")
+	if err != nil {
+		return err
+	}
+	for _, block := range strings.Split(list, "\n\n") {
+		var path, checked string
+		for _, line := range strings.Split(block, "\n") {
+			if p, ok := strings.CutPrefix(line, "worktree "); ok {
+				path = p
+			} else if b, ok := strings.CutPrefix(line, "branch "); ok {
+				checked = b
+			}
+		}
+		if checked == "refs/heads/"+branch && path != "" && !SameDir(path, g.dir) {
+			return fmt.Errorf("%w: %s, the journal's branch, is checked out in the worktree at %s; run fleetd init again "+
+				"once it is not", ErrNoUpstream, branch, path)
+		}
+	}
+	return nil
+}
+
 // journalBranch names the journal's branch for a clone that does not follow it:
-// the remote's default, as init's own clone would follow, else origin's only
-// branch. With several and no default among them the journal could be on any.
-// A repository with no branch at all has no journal to follow yet: a clone with no
-// commit and no branch of its own, such as a plain clone made while the repository
-// was empty, holds nothing in its git directory, and without it init sets the
-// directory up as a new one, starting the journal; a clone with commits of its own
-// keeps them in its git directory, moved aside.
+// a branch this clone has followed, of the same name on origin, if origin still
+// has it, since a remote's default can change while its machines go on publishing
+// to the branch they follow; else the remote's default, as init's own clone would
+// follow; else origin's only branch. With several and no default among them the
+// journal could be on any. A repository with no branch at all has no journal to
+// follow yet: a clone with no commit and no branch of its own, such as a plain
+// clone made while the repository was empty, holds nothing in its git directory,
+// and without it init sets the directory up as a new one, starting the journal; a
+// clone with commits of its own keeps them in its git directory, moved aside.
 func journalBranch(g git, url string) (string, error) {
-	out, err := g.line(append(batchSSH(g), "ls-remote", "--symref", "origin", "HEAD")...)
+	out, err := g.line(append(batchSSH(g), "ls-remote", "--symref", "origin", "HEAD", "refs/heads/*")...)
 	if err != nil {
 		return "", err
 	}
 	def := ""
+	heads := map[string]bool{}
 	for _, l := range strings.Split(out, "\n") {
 		if ref, ok := strings.CutPrefix(l, "ref: refs/heads/"); ok {
 			def, _, _ = strings.Cut(ref, "\t")
+		} else if _, ref, ok := strings.Cut(l, "\t"); ok {
+			if name, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
+				heads[name] = true
+			}
 		}
 	}
-	if def != "" {
-		if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+def); err == nil {
-			return def, nil
-		}
-	}
-	out, err = g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
+	ups, err := upstreams(g)
 	if err != nil {
 		return "", err
 	}
-	var branches []string
-	for _, name := range strings.Split(out, "\n") {
-		if name != "" && name != "HEAD" {
-			branches = append(branches, name)
+	var followed []string
+	for name, upstream := range ups {
+		if upstream == "refs/remotes/origin/"+name && heads[name] {
+			followed = append(followed, name)
 		}
 	}
+	slices.Sort(followed)
+	switch {
+	case slices.Contains(followed, def):
+		return def, nil
+	case len(followed) == 1:
+		return followed[0], nil
+	case len(followed) > 1:
+		return "", fmt.Errorf("%w: this clone follows %s on %s, none of them its default; make the branch that holds "+
+			"the journal its default, then run fleetd init again", ErrNoDefaultBranch, strings.Join(followed, ", "), url)
+	}
+	if heads[def] {
+		return def, nil
+	}
+	var branches []string
+	for name := range heads {
+		branches = append(branches, name)
+	}
+	slices.Sort(branches)
 	switch {
 	case len(branches) == 1:
 		return branches[0], nil
@@ -420,17 +519,31 @@ func journalBranch(g git, url string) (string, error) {
 		return "", err
 	}
 	_, headErr := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-	local, err := g.line("for-each-ref", "--format=%(refname)", "refs/heads/")
-	if err != nil {
-		return "", err
-	}
-	if headErr != nil && local == "" {
+	if len(ups) == 0 && headErr != nil {
 		return "", fmt.Errorf("%w: %s has no commit, as a clone made while the journal repository was empty has none; "+
 			"delete its .git directory, then run fleetd init again, which sets it up and keeps every other file there",
 			ErrNoUpstream, g.dir)
 	}
-	return "", fmt.Errorf("%w: %s has no branch, and %s has commits of its own; move its .git directory out of %s, "+
-		"keeping them, then run fleetd init again, which starts the journal there", ErrNoUpstream, url, g.dir, g.dir)
+	return "", fmt.Errorf("%w: %s has no branch, and %s has commits of its own; move its .git directory, and every "+
+		"file there but journal files and %s, out of it, then run fleetd init again, which starts the journal there",
+		ErrNoUpstream, url, g.dir, FleetFile)
+}
+
+// upstreams maps each branch here to the full name of the branch it follows, or
+// to "" for one that follows none.
+func upstreams(g git) (map[string]string, error) {
+	out, err := g.line("for-each-ref", "--format=%(refname) %(upstream)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		ref, upstream, _ := strings.Cut(line, " ")
+		if name, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
+			m[name] = upstream
+		}
+	}
+	return m, nil
 }
 
 // adoptFleetFile makes a clone's FleetFile the journal's, file and index entry,
