@@ -3251,3 +3251,194 @@ func TestAKeptCloneSomethingElseWroteIntoStopsNoSyncOnceItsLookIsMade(t *testing
 		})
 	}
 }
+
+// deletedFleetJournal starts a journal whose first commit holds fleetd.json, as
+// content gives it, and a machine's records, then deletes fleetd.json from it by
+// a push, as one made by mistake can. It returns the remote and the blob the
+// deleted fleetd.json was.
+func deletedFleetJournal(t *testing.T, content string) (remote, blob string) {
+	t.Helper()
+	remote = newEmptyRemote(t)
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	if strings.HasSuffix(content, "/") {
+		if err := os.MkdirAll(filepath.Join(w, FleetFile), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(w, FleetFile, "x"), "x\n")
+	} else {
+		write(t, filepath.Join(w, FleetFile), content)
+	}
+	write(t, filepath.Join(w, "host-a.jsonl"), "{\"id\":\"hive:a1\"}\n")
+	run(t, w, "add", "-A")
+	run(t, w, "commit", "--quiet", "-m", "start")
+	blob = run(t, w, "rev-parse", "HEAD:"+FleetFile)
+	run(t, w, "rm", "-r", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "tidy up")
+	run(t, w, "push", "--quiet", "origin", "main")
+	return remote, blob
+}
+
+// While a push has deleted the journal's fleetd.json, init on any machine puts
+// it back as it was, byte for byte, so its salt stays the fleet's: with no salt
+// given, with the same one, and with a different one not insisted on, as a stale
+// FLEET_SALT is, which it says differs.
+func TestInitPutsBackAFleetdJsonAPushDeletedAsItWas(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	const content = "{\"salt\": \"the fleet's\", \"about\": \"kept by hand\", \"note\": \"a field fleetd ignores\"}\r\n"
+	for _, c := range []struct {
+		name, salt string
+		strict     bool
+	}{{"no salt given", "", false}, {"the same salt insisted on", "the fleet's", true}, {"a stale salt", "stale", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote, blob := deletedFleetJournal(t, content)
+			a := filepath.Join(t.TempDir(), "a")
+			res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: c.salt, Strict: c.strict})
+			if !res.PutBackFleetFile || !res.WroteFleetFile || res.Started || res.Salt != "the fleet's" ||
+				res.SaltDiffers != (c.salt == "stale") {
+				t.Fatalf("init = %+v, want fleetd.json put back with the fleet's salt", res)
+			}
+			if got := run(t, "", "--git-dir", remote, "rev-parse", "main:"+FleetFile); got != blob {
+				t.Fatalf("main's fleetd.json is %s, want %s, the blob the push deleted", got, blob)
+			}
+			setUp(t, a, "the fleet's")
+		})
+	}
+}
+
+// While a push has deleted the journal's fleetd.json, a salt insisted on that
+// contradicts the one it held is refused, with nothing pushed: taken, it would
+// give every machine another id.
+func TestInitRefusesASaltThatContradictsAFleetdJsonAPushDeleted(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote, _ := deletedFleetJournal(t, "{\"salt\": \"s3cret-fleet\"}\n")
+	before := run(t, "", "--git-dir", remote, "rev-parse", "main")
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "a"), Salt: "s3cret-fleat", Strict: true})
+	if !errors.Is(err, ErrSaltMismatch) {
+		t.Fatalf("init: %v, want ErrSaltMismatch", err)
+	}
+	if after := run(t, "", "--git-dir", remote, "rev-parse", "main"); after != before {
+		t.Fatalf("main went from %s to %s", before, after)
+	}
+}
+
+// A fleetd.json a person put back, by reverting the push that deleted it, while
+// this init's push was on its way is not this init's: it says it wrote nothing,
+// and takes the salt put back. (Two inits putting it back at once in the same
+// second build the same commit, so the second push finds it there.)
+func TestInitDoesNotClaimAPutBackSomeoneElseMade(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote, _ := deletedFleetJournal(t, "{\"salt\": \"s\"}\n")
+	raced := false
+	loser := InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "loser"), Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if !raced && slices.Contains(args, "push") {
+			raced = true
+			w := filepath.Join(t.TempDir(), "w")
+			run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			identify(t, w)
+			run(t, w, "revert", "--no-edit", "HEAD")
+			run(t, w, "push", "--quiet", "origin", "main")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}}
+	res := mustInit(t, loser)
+	if !raced || remoteFile(t, remote, FleetFile) != "{\"salt\": \"s\"}\n" {
+		t.Fatalf("the race did not happen: main holds %q", remoteFile(t, remote, FleetFile))
+	}
+	if res.PutBackFleetFile || res.WroteFleetFile || res.Salt != "s" {
+		t.Fatalf("loser = %+v, want no fleetd.json of its own, and the salt put back", res)
+	}
+}
+
+// A journal whose last fleetd.json was not usable, invalid JSON, too large, or a
+// directory, has none to put back: as for a journal that never held one, init
+// needs the salt its machines use.
+func TestInitPutsBackNoUnusableFleetdJson(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for name, content := range map[string]string{
+		"invalid JSON": "not json\n",
+		"too large":    "{\"salt\": \"s\", \"pad\": \"" + strings.Repeat("x", maxFleetFileBytes) + "\"}\n",
+		"a directory":  "/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			remote, _ := deletedFleetJournal(t, content)
+			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "a")})
+			if !errors.Is(err, ErrNeedSalt) || res.PutBackFleetFile {
+				t.Fatalf("init = %+v, %v; want ErrNeedSalt", res, err)
+			}
+		})
+	}
+}
+
+// A git that cannot read the journal's history stops init, with nothing pushed:
+// the fleetd.json a push deleted may be there to put back, and any other would
+// give every machine another id. Run again, init puts it back.
+func TestInitStopsWhenGitCannotReadTheDeletedFleetdJson(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, step := range []string{"rev-list", "ls-tree", "cat-file"} {
+		t.Run(step, func(t *testing.T) {
+			t.Parallel()
+			remote, _ := deletedFleetJournal(t, "{\"salt\": \"s\"}\n")
+			before := run(t, "", "--git-dir", remote, "rev-parse", "main")
+			a := filepath.Join(t.TempDir(), "a")
+			failing := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+				if slices.Contains(args, step) && slices.ContainsFunc(args, func(arg string) bool {
+					return strings.HasSuffix(arg, "^") || strings.HasSuffix(arg, "^:"+FleetFile) || (step == "rev-list" && arg == FleetFile)
+				}) {
+					return "", errors.New("git " + step + ": exit status 128: fatal: unable to read tree")
+				}
+				return Git(ctx, dir, stdin, args...)
+			}
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "other", Run: failing}); err == nil ||
+				!strings.Contains(err.Error(), "unable to read tree") {
+				t.Fatalf("init: %v, want the %s's error", err, step)
+			}
+			if after := run(t, "", "--git-dir", remote, "rev-parse", "main"); after != before {
+				t.Fatalf("main went from %s to %s", before, after)
+			}
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a}); !res.PutBackFleetFile || res.Salt != "s" {
+				t.Fatalf("init run again = %+v, want fleetd.json put back", res)
+			}
+		})
+	}
+}
+
+// A look whose git cannot say whether a branch holding the journal's
+// fleetd.json has touched it since the commit it shares with the journal's
+// fails with git's error, and stays due: it neither takes the branch for a copy
+// nor says a second journal was started.
+func TestALookThatCannotSayWhetherACopyIsUntouchedStaysDue(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+		t.Fatal("init succeeded although its look failed")
+	}
+	run(t, a, "--git-dir", remote, "branch", "backup", "main")
+	failing := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "rev-list") && slices.ContainsFunc(args, func(arg string) bool {
+			return strings.HasSuffix(arg, "..refs/remotes/origin/backup")
+		}) {
+			return "", errors.New("git rev-list: exit status 128: fatal: unable to read tree")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failing}); err == nil ||
+		!strings.Contains(err.Error(), "unable to read tree") || errors.Is(err, ErrTwoJournals) {
+		t.Fatalf("init: %v, want the rev-list's error", err)
+	}
+	if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); err != nil {
+		t.Fatalf("the look is no longer noted as due: %v", err)
+	}
+	if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"}); res.Branch != "main" {
+		t.Fatalf("init run again = %+v, want backup taken for a copy of the journal on main", res)
+	}
+}

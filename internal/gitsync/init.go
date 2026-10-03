@@ -150,6 +150,9 @@ type InitResult struct {
 	Started bool `json:"started"`
 	// WroteFleetFile is set when Init committed FleetFile to the repository.
 	WroteFleetFile bool `json:"wrote_fleet_file"`
+	// PutBackFleetFile is set when the FleetFile Init committed is the one the
+	// journal's branch held before a push deleted it, as it was.
+	PutBackFleetFile bool `json:"put_back_fleet_file"`
 	// Cloned is set when Dir was not a clone and now is.
 	Cloned bool `json:"cloned"`
 	// Branch is the branch the clone follows.
@@ -1138,7 +1141,20 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 				return err
 			}
 		}
+		// A branch whose FleetFile a push deleted gets it back as it was: its salt
+		// is the fleet's, which every clone set up before still uses, and any other
+		// would give every machine another id.
+		past, content, deleted, err := deletedFleet(g, tip)
+		if err != nil {
+			return err
+		}
 		salt := o.Salt
+		if deleted {
+			if o.Salt != "" && o.Salt != past.Salt && o.Strict {
+				return fmt.Errorf("%w, as it was before a push deleted it", ErrSaltMismatch)
+			}
+			salt = past.Salt
+		}
 		if salt == "" {
 			for name := range top {
 				if strings.HasSuffix(name, ".jsonl") {
@@ -1150,7 +1166,7 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 				return err
 			}
 		}
-		commit, err := fleetCommit(g, tip, salt)
+		commit, err := fleetCommit(g, tip, salt, content)
 		if err != nil {
 			return err
 		}
@@ -1167,7 +1183,7 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 			"origin", commit+":refs/heads/"+res.Branch)...)
 		switch {
 		case err == nil:
-			res.WroteFleetFile, res.Started = true, tip == ""
+			res.WroteFleetFile, res.Started, res.PutBackFleetFile = true, tip == "", deleted
 		case refused(out):
 			return fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w", ErrRejected, res.Branch, err)
 		case !lostRace(out):
@@ -1182,6 +1198,40 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 			return err
 		}
 	}
+}
+
+// deletedFleet returns the FleetFile tip's branch held before a commit since
+// deleted it, and its content: ok is false when the branch never held one, or
+// held last one that is not usable, a directory or invalid JSON, say. git's own
+// failures are returned.
+func deletedFleet(g git, tip string) (f Fleet, content []byte, ok bool, err error) {
+	if tip == "" {
+		return Fleet{}, nil, false, nil
+	}
+	last, err := g.line("rev-list", "-1", tip, "--", FleetFile)
+	if err != nil || last == "" {
+		return Fleet{}, nil, false, err
+	}
+	// tip lacks it, so last, the newest commit that changed it, deleted it, and
+	// its first parent held it.
+	entry, err := g.line("ls-tree", last+"^", "--", FleetFile)
+	if err != nil {
+		return Fleet{}, nil, false, err
+	}
+	if fields := strings.Fields(entry); len(fields) < 3 || fields[1] != "blob" {
+		return Fleet{}, nil, false, nil
+	}
+	data, err := fleetBlob(g, last+"^", "the journal's history")
+	if errors.Is(err, ErrBadFleetFile) {
+		return Fleet{}, nil, false, nil
+	}
+	if err != nil {
+		return Fleet{}, nil, false, err
+	}
+	if f, err = parseFleet([]byte(data), FleetFile); err != nil {
+		return Fleet{}, nil, false, nil
+	}
+	return f, []byte(data), true, nil
 }
 
 // lookName is the file, in a clone's git directory, that notes a look at
@@ -1202,15 +1252,19 @@ func look(g git, gitDir, branch string) error {
 	}
 	if len(holding) > 0 {
 		// A copy of this journal, a branch made from it since, holds the
-		// FleetFile of the last commit it shares with the journal's branch; a
-		// journal another machine started at the same time holds its own.
+		// FleetFile of the last commit it shares with the journal's branch,
+		// untouched since; a journal another machine started at the same time
+		// holds its own, or the one it put back after a push deleted it.
 		var others []string
 		for _, h := range holding {
 			base, _ := g.line("merge-base", "refs/remotes/origin/"+branch, "refs/remotes/origin/"+h)
 			if base != "" {
 				shared, _ := g.line("rev-parse", "--verify", "--quiet", base+":"+FleetFile)
-				theirs, _ := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+h+":"+FleetFile)
-				if shared != "" && shared == theirs {
+				since, err := g.line("rev-list", "-1", base+"..refs/remotes/origin/"+h, "--", FleetFile)
+				if err != nil {
+					return err
+				}
+				if shared != "" && since == "" {
 					continue
 				}
 			}
@@ -1496,13 +1550,18 @@ func looksLikeJournal(top map[string]string) error {
 
 // fleetCommit builds a commit, without touching a work tree or the index, that
 // adds FleetFile to parent, or that holds only FleetFile when parent is empty,
-// meaning the repository has no commits yet.
-func fleetCommit(g git, parent, salt string) (string, error) {
-	content, err := json.MarshalIndent(Fleet{About: fleetAbout, Salt: salt}, "", "  ")
-	if err != nil {
-		return "", err
+// meaning the repository has no commits yet. The FleetFile holds salt, or, put
+// back, past, the content it held before, byte for byte.
+func fleetCommit(g git, parent, salt string, past []byte) (string, error) {
+	content, message := past, "journal: put back fleetd.json, which a push deleted"
+	if content == nil {
+		var err error
+		if content, err = json.MarshalIndent(Fleet{About: fleetAbout, Salt: salt}, "", "  "); err != nil {
+			return "", err
+		}
+		content, message = append(content, '\n'), "journal: record the fleet's salt"
 	}
-	blob, err := g.raw(append(content, '\n'), "hash-object", "-w", "--stdin")
+	blob, err := g.raw(content, "hash-object", "-w", "--stdin")
 	if err != nil {
 		return "", err
 	}
@@ -1523,7 +1582,7 @@ func fleetCommit(g git, parent, salt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	args := []string{"commit-tree", strings.TrimSpace(tree), "-m", "journal: record the fleet's salt"}
+	args := []string{"commit-tree", strings.TrimSpace(tree), "-m", message}
 	if parent != "" {
 		args = append(args, "-p", parent)
 	}

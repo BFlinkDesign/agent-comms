@@ -94,7 +94,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	if *asJSON {
 		out := map[string]any{
 			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head, "started": res.Started,
-			"wrote_fleet_file": res.WroteFleetFile, "cloned": res.Cloned, "reattached": res.Reattached, "restored": res.Restored,
+			"wrote_fleet_file": res.WroteFleetFile, "put_back_fleet_file": res.PutBackFleetFile, "cloned": res.Cloned, "reattached": res.Reattached, "restored": res.Restored,
 			"published": published,
 		}
 		if syncErr != nil {
@@ -106,6 +106,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		return failed
 	}
 	switch {
+	case res.PutBackFleetFile:
+		fmt.Fprintf(stdout, "put %s back in %s, as it was before a push deleted it\n", gitsync.FleetFile, url)
 	case res.Started && given == "":
 		fmt.Fprintf(stdout, "started the journal in %s: its first commit holds %s, with a new salt for this fleet\n", url, gitsync.FleetFile)
 	case res.Started:

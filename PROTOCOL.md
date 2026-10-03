@@ -280,8 +280,11 @@ mentions for a week.
 `fleetd init URL` makes the journal directory a clone of the journal repository,
 once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
-an `about` line), on the branch it names as its default, else `main`; a repository
-that already holds records without one needs the salt its machines use (`--salt` or
+an `about` line), on the branch it names as its default, else `main`; one whose
+`fleetd.json` a push deleted gets it back as it last held it (a `--salt` that
+contradicts it is refused: the salt changes by editing the file, not deleting it);
+a repository that already holds records and no usable `fleetd.json` to put back
+needs the salt its machines use (`--salt` or
 `$FLEET_SALT`), or a new one if they ran without a salt (the records they published
 keep the ids they had). When the repository's default branch does not exist, the journal is
 on its only branch; with several, init is refused, unless `--branch` names the
@@ -298,7 +301,8 @@ directory, marked `.git/fleetd-kept`, unless the remote declined the push, and o
 killed right after its push leaves it there unmarked; every init makes the look
 such a clone notes, then removes the kept ones it made it for and any over ten
 minutes old, but for one holding anything else, whose look it notes as made); a copy of the journal, a branch holding the `fleetd.json` of the
-last commit it shares with the journal's branch, is not a second journal. Till the
+last commit it shares with the journal's branch, untouched since, is not a second
+journal (one whose `fleetd.json` was deleted and put back since is). Till the
 look is made, sync publishes nothing, nor while a kept clone beside the directory
 notes one. A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
@@ -423,8 +427,10 @@ the top of a clone and git could say.
 
 The salt is the one in the journal's `fleetd.json`. `--salt` may repeat it but not
 contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning. A
-push that deletes `fleetd.json` leaves each clone's copy in place, and every sync
-says to put it back, so no machine's id changes.
+push that deletes a usable `fleetd.json` leaves in place the copy each clone's work
+tree holds, so those machines keep their ids, and every sync says so; `fleetd init`
+on any machine puts it back as the journal last held it, refusing a `--salt` that
+contradicts it, so a machine set up meanwhile gets the fleet's id too.
 Without `fleetd.json` they supply it. It must be identical on every machine in the
 fleet, or one machine will appear as several. It is not a credential. A sync files
 under this machine's fleet id the records it wrote under another salt (none or

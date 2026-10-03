@@ -228,9 +228,10 @@ type Result struct {
 	// Kept lists files the remote changed that were left as they are, because
 	// this clone has changes to them that are not on the remote.
 	Kept []string `json:"kept,omitempty"`
-	// FleetFileGone is set when the remote no longer holds FleetFile, which gives
-	// every machine of the fleet its id: this clone keeps its copy, so that this
-	// machine's records keep their id, till a person puts the file back.
+	// FleetFileGone is set when the remote deleted the FleetFile it held, which
+	// gives every machine of the fleet its id, and this clone's work tree holds
+	// one: it keeps that copy, so that this machine's records keep their id, till
+	// an init, on any machine, puts the file back.
 	FleetFileGone bool `json:"fleet_file_gone,omitempty"`
 	// Cleared lists git lock files, relative to the git directory, that were
 	// older than staleLock and removed: left by a git command that was killed.
@@ -627,10 +628,11 @@ func blobAt(g git, commit, name string) (string, bool, error) {
 // index, so an edit staged with `git add` and not changed since is reset to tip,
 // and such a new file that tip lacks is removed; git keeps their content until it
 // prunes unreachable objects. FleetFile, which gives every record here its salt,
-// stays when the remote deleted it outright, as a push made by mistake can, and
-// gone says so: without it this machine's records would go out under another
-// id, for good. One the remote turned into a directory is brought in, and the
-// salt it last held is used, as for any FleetFile that cannot be read.
+// stays when the remote deleted it outright, as a push made by mistake can, the
+// last it held being one init puts back, and the work tree holds it; gone says
+// so: without it this machine's records would go out under another id until an
+// init put it back. One the remote turned into a directory is brought in, and
+// the salt it last held is used, as for any FleetFile that cannot be read.
 func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool, err error) {
 	if _, err := g.line("update-ref", "-m", "fleetd sync", localRef, tip, local); err != nil {
 		return nil, false, err
@@ -651,6 +653,19 @@ func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool,
 	for i := 0; i+1 < len(fields); i += 2 {
 		if strings.HasPrefix(fields[i+1], FleetFile+"/") {
 			gone = false
+		}
+	}
+	// A copy is kept only of one init puts back, the last the remote held, and
+	// only where the work tree holds it: a new one staged here goes, as any staged
+	// new file does, and so does the index entry of one this work tree no longer
+	// has.
+	if gone {
+		if info, err := os.Lstat(filepath.Join(g.dir, FleetFile)); err != nil || !info.Mode().IsRegular() {
+			gone = false
+		} else if _, _, putBack, err := deletedFleet(g, tip); err != nil {
+			return nil, false, err
+		} else {
+			gone = putBack
 		}
 	}
 	for i := 0; i+1 < len(fields); i += 2 {

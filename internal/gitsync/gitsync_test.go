@@ -3,6 +3,7 @@ package gitsync
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ import (
 // whole package, so that tests can run in parallel; one that cares about hostile
 // settings sets them itself, and so runs on its own.
 func TestMain(m *testing.M) {
+	moreParallel()
 	dir, err := os.MkdirTemp("", "gitsync-test")
 	if err != nil {
 		panic(err)
@@ -46,6 +48,21 @@ func TestMain(m *testing.M) {
 	}
 	os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// moreParallel runs four tests to a processor, at most 32 at once, unless the
+// run sets -test.parallel itself: they wait on the git processes they start far
+// more than they use a processor, and on Windows, which starts processes slowly,
+// one test to a processor took most of the CI job's time.
+func moreParallel() {
+	flag.Parse()
+	set := false
+	flag.Visit(func(f *flag.Flag) { set = set || f.Name == "test.parallel" })
+	if !set {
+		if err := flag.Set("test.parallel", strconv.Itoa(min(4*runtime.GOMAXPROCS(0), 32))); err != nil {
+			panic(err)
+		}
+	}
 }
 
 func requireGit(t *testing.T) {
@@ -2019,5 +2036,121 @@ func TestAFleetdJsonTheRemoteDeletedStaysAndIsReported(t *testing.T) {
 				t.Fatalf("git status for fleetd.json: %q, want it clean", got)
 			}
 		})
+	}
+}
+
+// A fleetd.json the remote never held is a staged new file like any other, as a
+// person may stage one in a clone of a journal fleetd v0.1.0 left without it:
+// sync deletes it, as documented, and says nothing gone.
+func TestAStagedFleetdJsonTheRemoteNeverHeldIsDeleted(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	write(t, filepath.Join(a, FleetFile), "{\"salt\": \"s\"}\n")
+	run(t, a, "add", FleetFile)
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	res := mustSync(t, options(a, "host-a"))
+	if n := run(t, "", "--git-dir", remote, "log", "--oneline", "main", "--", FleetFile); n != "" {
+		t.Fatalf("the remote's history holds fleetd.json: %q", n)
+	}
+	if _, err := os.Lstat(filepath.Join(a, FleetFile)); res.FleetFileGone || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sync = %+v, fleetd.json: %v; want the staged new file deleted, and nothing said gone", res, err)
+	}
+}
+
+// Only a work tree that holds a fleetd.json keeps a copy. One that lost it, or
+// holds a link there, does not, so when the remote deletes the file too the sync
+// says nothing gone; the one that lost it takes the deletion in.
+func TestFleetFileGoneOnlyWhereTheWorkTreeHoldsTheFile(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, local := range []string{"deleted", "a link"} {
+		t.Run(local, func(t *testing.T) {
+			t.Parallel()
+			remote := newEmptyRemote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			if err := os.Remove(filepath.Join(a, FleetFile)); err != nil {
+				t.Fatal(err)
+			}
+			if local == "a link" {
+				if err := os.Symlink("elsewhere.json", filepath.Join(a, FleetFile)); err != nil {
+					t.Skipf("cannot make a link here: %v", err)
+				}
+			}
+			w := filepath.Join(t.TempDir(), "w")
+			run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			identify(t, w)
+			run(t, w, "rm", "--quiet", FleetFile)
+			run(t, w, "commit", "--quiet", "-m", "tidy up")
+			run(t, w, "push", "--quiet", "origin", "main")
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			res := mustSync(t, options(a, "host-a"))
+			if res.FleetFileGone {
+				t.Fatalf("sync = %+v: it says this clone keeps its copy of fleetd.json, but its work tree holds %s", res, local)
+			}
+			if indexed := run(t, a, "ls-files", "--", FleetFile); local == "deleted" && indexed != "" {
+				t.Fatalf("the index still holds %q; want the deletion taken in", indexed)
+			}
+		})
+	}
+}
+
+// A git that cannot say whether the remote held the fleetd.json it deleted
+// stops the sync before anything is brought in, rather than deleting the copy
+// this machine's id comes from. The next sync asks again.
+func TestAGitThatCannotSayWhetherTheRemoteHeldFleetdJsonStopsTheSync(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	before := readFile(t, filepath.Join(a, FleetFile))
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "tidy up")
+	run(t, w, "push", "--quiet", "origin", "main")
+	o := options(a, "host-a")
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "rev-list") && slices.Contains(args, FleetFile) {
+			return "", errors.New("git rev-list: exit status 128: fatal: unable to read tree")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Sync(context.Background(), o); err == nil || !strings.Contains(err.Error(), "unable to read tree") {
+		t.Fatalf("sync: %v, want the rev-list's error", err)
+	}
+	if got := readFile(t, filepath.Join(a, FleetFile)); got != before {
+		t.Fatalf("fleetd.json holds %q, want %q", got, before)
+	}
+	if res := mustSync(t, options(a, "host-a")); !res.FleetFileGone {
+		t.Fatalf("the next sync = %+v, want this clone's copy kept, and it said", res)
+	}
+}
+
+// A clone keeps its copy of a fleetd.json the remote deleted only where init
+// can put the file back: when the last the remote held was not usable, invalid
+// JSON say, the deletion comes in as any other, and nothing is said gone.
+func TestFleetFileGoneOnlyWhereInitCanPutTheFileBack(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	write(t, filepath.Join(w, FleetFile), "not json\n")
+	run(t, w, "commit", "--quiet", "-am", "break it")
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "tidy up")
+	run(t, w, "push", "--quiet", "origin", "main")
+	if res := mustSync(t, options(a, "host-a")); res.FleetFileGone {
+		t.Fatalf("sync = %+v: it says this clone keeps its copy, which no init can put back", res)
+	}
+	if _, err := os.Lstat(filepath.Join(a, FleetFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fleetd.json: %v; want the deletion taken in", err)
 	}
 }

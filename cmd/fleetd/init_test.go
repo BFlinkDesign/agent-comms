@@ -2213,3 +2213,175 @@ func TestAHookThatDerivedItsIdBeforeInitPublishesNothingUnderTheOldId(t *testing
 		t.Fatal("the fleet id's file lacks the hook's record")
 	}
 }
+
+// goneJournal sets machine b up with the given salt and publishes a record of
+// it, deletes fleetd.json from the journal by a push, and syncs b, which keeps
+// its copy and says so. It returns the remote and b's journal directory.
+func goneJournal(t *testing.T, salt string) (remote, b string) {
+	t.Helper()
+	remote = emptyJournalRemote(t)
+	b = filepath.Join(t.TempDir(), "b")
+	if _, _, err := exec(t, "init", "--dir", b, "--salt", salt, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	w := filepath.Join(t.TempDir(), "w")
+	gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	gitIn(t, w, "rm", "--quiet", gitsync.FleetFile)
+	gitIn(t, w, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "tidy up")
+	gitIn(t, w, "push", "--quiet", "origin", "main")
+	stdout, _, err := exec(t, "sync", "--dir", b)
+	if err != nil || !strings.Contains(stdout, "no longer holds fleetd.json") {
+		t.Fatalf("b's sync: %q, %v; want it to say the repository no longer holds fleetd.json", stdout, err)
+	}
+	return remote, b
+}
+
+// What the sync says to do while the journal lacks fleetd.json works where it
+// says: init, in the clone the sync names or on any other machine, puts the
+// file back as it was, with no salt to type, so a machine set up meanwhile gets
+// the fleet's id and the others keep theirs.
+func TestInitPutsBackTheFleetdJsonAPushDeleted(t *testing.T) {
+	t.Parallel()
+	for _, where := range []string{"the clone the sync names", "a new machine"} {
+		t.Run(where, func(t *testing.T) {
+			t.Parallel()
+			remote, b := goneJournal(t, "s")
+			fleetID := hostID(t, "--dir", b)
+			stdout, _, _ := exec(t, "sync", "--dir", b)
+			if !strings.Contains(stdout, "`fleetd init --dir \""+b+"\" <journal URL>` puts it back") {
+				t.Fatalf("sync said %q; want it to name the init that puts fleetd.json back", stdout)
+			}
+			dir := b
+			if where == "a new machine" {
+				dir = filepath.Join(t.TempDir(), "d")
+			}
+			stdout, _, err := exec(t, "init", "--dir", dir, remote)
+			if err != nil || !strings.Contains(stdout, "put fleetd.json back in "+remote+", as it was before a push deleted it") {
+				t.Fatalf("init in %s: %q, %v; want fleetd.json put back", where, stdout, err)
+			}
+			if got := hostID(t, "--dir", dir); got != fleetID {
+				t.Fatalf("the id in %s is %s, want the fleet's, %s", where, got, fleetID)
+			}
+			stdout, _, err = exec(t, "sync", "--dir", b)
+			if err != nil || strings.Contains(stdout, "no longer holds") || hostID(t, "--dir", b) != fleetID {
+				t.Fatalf("b's sync once fleetd.json is back: %q, %v; b's id %s, want %s", stdout, err, hostID(t, "--dir", b), fleetID)
+			}
+			if got, err := osexec.Command("git", "-C", b, "status", "--porcelain").Output(); err != nil || len(got) != 0 {
+				t.Fatalf("b's git status: %q, %v; want it clean", got, err)
+			}
+		})
+	}
+}
+
+// init --json says when it put fleetd.json back.
+func TestInitJSONSaysItPutFleetdJsonBack(t *testing.T) {
+	t.Parallel()
+	remote, _ := goneJournal(t, "s")
+	stdout, _, err := exec(t, "init", "--json", "--dir", filepath.Join(t.TempDir(), "d"), remote)
+	var out map[string]any
+	if err != nil || json.Unmarshal([]byte(stdout), &out) != nil || out["put_back_fleet_file"] != true || out["wrote_fleet_file"] != true {
+		t.Fatalf("init --json: %q, %v; want put_back_fleet_file and wrote_fleet_file true", stdout, err)
+	}
+}
+
+// While the journal lacks fleetd.json, a --salt that contradicts the one it
+// held is refused, in the clone that keeps it and on a new machine, with
+// nothing pushed: as the advice used to ask for the salt typed by hand, a letter
+// wrong would have given every machine another id.
+func TestInitRefusesASaltThatContradictsTheFleetdJsonAPushDeleted(t *testing.T) {
+	t.Parallel()
+	for _, where := range []string{"the clone that keeps it", "a new machine"} {
+		t.Run(where, func(t *testing.T) {
+			t.Parallel()
+			remote, b := goneJournal(t, "s3cret-fleet")
+			before := hostID(t, "--dir", b)
+			dir := b
+			if where == "a new machine" {
+				dir = filepath.Join(t.TempDir(), "d")
+			}
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s3cret-fleat", remote); !errors.Is(err, gitsync.ErrSaltMismatch) {
+				t.Fatalf("init with a salt that contradicts the deleted fleetd.json: %v, want ErrSaltMismatch", err)
+			}
+			if held := gitShow(t, remote, "main:"+gitsync.FleetFile); held != "" {
+				t.Fatalf("the journal holds %q", held)
+			}
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil || hostID(t, "--dir", b) != before {
+				t.Fatalf("b's sync: %v; b's id went from %s to %s", err, before, hostID(t, "--dir", b))
+			}
+		})
+	}
+}
+
+// A FLEET_SALT that contradicts the fleetd.json a push deleted is overridden,
+// as for one the journal holds, with a warning: refusing it would leave a
+// machine whose environment carries a stale one unable to set up.
+func TestInitOverridesAStaleFleetSaltWhenPuttingFleetdJsonBack(t *testing.T) {
+	remote, b := goneJournal(t, "s")
+	fleetID := hostID(t, "--dir", b)
+	t.Setenv("FLEET_SALT", "stale")
+	d := filepath.Join(t.TempDir(), "d")
+	stdout, stderr, err := exec(t, "init", "--dir", d, remote)
+	if err != nil || !strings.Contains(stdout, "put fleetd.json back") ||
+		!strings.Contains(stderr, "FLEET_SALT differs from the salt in "+remote+"'s fleetd.json, which is used") {
+		t.Fatalf("init with a stale FLEET_SALT: %q, %q, %v; want fleetd.json put back, with a warning", stdout, stderr, err)
+	}
+	if got := hostID(t, "--dir", d); got != fleetID {
+		t.Fatalf("the new machine's id is %s, want the fleet's, %s", got, fleetID)
+	}
+}
+
+func gitShow(t *testing.T, remote, what string) string {
+	t.Helper()
+	out, err := osexec.Command("git", "--git-dir", remote, "show", what).Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// A journal without fleetd.json, as a fleet of fleetd v0.1.0 that used a salt
+// has, syncs under the salt it is given: the check that a sync's salt is still
+// fleetd.json's applies only where there is one.
+func TestASyncGivenASaltOnAJournalWithoutFleetdJsonPublishes(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "init", "--quiet", "--initial-branch=main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("one file per machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "start")
+	gitIn(t, seed, "push", "--quiet", remote, "main")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "x", "--type", "note", "--note", "under x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir, "--salt", "x"); err != nil {
+		t.Fatalf("sync with --salt on a journal without fleetd.json: %v", err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "x", "under x"); !ok {
+		t.Fatal("the record was not published under the salt given")
+	}
+}
+
+// hostOut carries the salt its id was derived with, which `fleetd host --json`
+// must not print: it is nobody's business.
+func TestHostJSONDoesNotPrintTheSalt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "visible-salt-123"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "host", "--json", "--dir", dir)
+	if err != nil || strings.Contains(stdout, "visible-salt-123") {
+		t.Fatalf("host --json: %v\n%s", err, stdout)
+	}
+}

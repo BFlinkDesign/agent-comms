@@ -132,7 +132,9 @@ changing any of them):
   file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path; a
   file holding only the start of git's copy has nothing of its own and is updated. The
   clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
-  staged new file, even one the remote never had. `git fsck --lost-found` recovers such content
+  staged new file, even one the remote never had. The one deletion sync does not bring in is of a
+  `fleetd.json` init can put back, while the work tree holds one (`Result.FleetFileGone`): it gives
+  the machine its id. `git fsck --lost-found` recovers such content
   until the gc a sync runs prunes it, which it may as soon as the content is two weeks old.
 - Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push

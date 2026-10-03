@@ -105,8 +105,11 @@ without a work tree beside the directory, makes sure the repository has
 uses its salt, and only then moves the clone's git directory in and checks out the
 files the directory lacks. When the repository is empty, its first commit holds
 `fleetd.json` with a new salt for the fleet, on the branch the repository names as
-its default, else `main`. One that already holds records needs the salt its
-machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A fleet
+its default, else `main`. One whose `fleetd.json` a push deleted gets it back,
+as it last held it, so the fleet keeps its salt; a `--salt` that contradicts it
+is refused, so the salt is changed by editing the file, not by deleting it. One
+that already holds records and no usable `fleetd.json` to put back needs the
+salt its machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A fleet
 that ran without a salt, as v0.1.0 allowed, gives a new one: the records its
 machines published stay under the ids they had, and the rest, with every new
 one, go under new ones once each machine has run init. When the
@@ -220,7 +223,8 @@ one finds none. Till then no sync publishes: the clone may lack the journal's
 `fleetd.json`, and this machine's records would go out under another id; they
 wait, and the sync after init files them under the fleet's. A copy of the journal,
 a branch made from it, holds the `fleetd.json` of the last commit it shares with
-the journal's branch, and is not a second journal. A first init in a new directory
+the journal's branch, untouched since, and is not a second journal; one whose
+`fleetd.json` was deleted and put back since is. A first init in a new directory
 whose push went through, or whose look found another journal, keeps its clone
 there, even when it fails, so that init run again looks. One whose push failed,
 which may have gone through all the same (the connection dropped after the remote
@@ -395,9 +399,13 @@ was wrong:
   larger than 64 KiB, or is a link or a directory, as one pushed by mistake
   would be (on unix, anything but a regular file). The salt it last held, which
   init and every command that reads it keep in the clone's git directory, is
-  used until a sync brings in a fixed one. A push that deletes it outright
-  leaves every clone's copy in place, so no machine's id changes, and every
-  `fleetd sync`, and the hook's log, says to put it back. init itself refuses a journal whose
+  used until a sync brings in a fixed one. A push that deletes a usable one
+  outright leaves in place the copy each clone's work tree holds, so those
+  machines keep their ids, and every `fleetd sync`, and the hook's log, says so.
+  `fleetd init`, on any machine, puts it back as the journal last held it, so a
+  machine set up meanwhile gets the fleet's id too; a `--salt` that contradicts
+  it is refused, and a `FLEET_SALT` that does is overridden with a warning. A
+  clone that lost its own copy as well takes the deletion in. init itself refuses a journal whose
   `fleetd.json` is invalid, or larger than 32 KiB in git: checked out with CRLF
   line endings, as Git for Windows does by default, it can be twice that.
   A missing `fleetd.json` stops every sync while the journal's branch holds

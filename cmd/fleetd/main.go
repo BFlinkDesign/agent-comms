@@ -595,9 +595,8 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 // journal's fleetd.json, which the clone in dir keeps.
 func fleetFileGone(dir string) string {
 	return fmt.Sprintf("the journal repository no longer holds %s, which gives every machine of the fleet its id: "+
-		"this machine keeps its copy in %s, so its records keep their id. Put it back in the repository, as by "+
-		"reverting the commit that removed it, or with `fleetd init --dir \"%s\" --salt <the salt in that copy> "+
-		"<journal URL>`; a machine set up without it gets another id", gitsync.FleetFile, dir, dir)
+		"this machine keeps its copy in %s, so its records keep their id. `fleetd init --dir \"%s\" <journal URL>` "+
+		"puts it back as the repository last held it, as init on any machine does", gitsync.FleetFile, dir, dir)
 }
 
 // printSyncStatus says how fresh the answer is: a clone holds the other machines'
