@@ -76,8 +76,12 @@ var (
 // value as no fsmonitor at all. Automatic gc and maintenance are off: a fetch
 // would otherwise start them inside the sync's deadline, and one killed partway
 // leaves lock files that fail every later sync until someone deletes them.
+// diff.autoRefreshIndex is on, as by default: with it off, `git diff` lists a file
+// whose content matches git's copy but whose index entry is out of date, and
+// fleetd would take it for one with records git does not have.
 var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false"}
+	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+	"-c", "diff.autoRefreshIndex=true"}
 
 // repositoryVariables are the variables git reads to find a repository, its
 // index or its objects, and a git command's own -c settings, as

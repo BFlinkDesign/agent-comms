@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // FleetFile is the journal repository's own settings file. It holds the fleet's
@@ -114,7 +117,8 @@ type InitResult struct {
 	Started bool `json:"started"`
 	// WroteFleetFile is set when Init committed FleetFile to the repository.
 	WroteFleetFile bool `json:"wrote_fleet_file"`
-	// Cloned is set when Dir was not a clone and now is.
+	// Cloned is set when Dir was not a clone, or was one with no commit, and now
+	// follows the journal.
 	Cloned bool `json:"cloned"`
 	// Branch is the branch the clone follows.
 	Branch string `json:"branch"`
@@ -142,7 +146,8 @@ type InitResult struct {
 // has FleetFile added to its repository the same way, with plumbing; then the
 // journal's FleetFile replaces the one in its work tree, if they differ, and the
 // tracked files it lacks are checked out. The rest of its work tree is left to
-// the next sync.
+// the next sync. A clone with no commit, such as a plain clone of the repository
+// made while it was empty, is set up in place, on the branch it is on.
 //
 // A repository without FleetFile gets it in a commit of its own, pushed at once;
 // an empty repository gets it as its first commit. One that already holds
@@ -255,18 +260,37 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if !sameURL(origin, url) {
 		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
 	}
-	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-	if err != nil {
-		if ctx.Err() != nil {
+	// A clone with no commit, such as a plain clone of the journal repository made
+	// while it was still empty, has nothing to follow yet: it is set up in place,
+	// as initNew sets up a new directory, on the branch it is on. One with branches
+	// is not, even on a branch with no commit (git checkout --orphan): setting it
+	// up would move a branch that may hold commits of its own.
+	_, err = g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if err != nil && ctx.Err() != nil {
+		return res, err
+	}
+	unborn := err != nil
+	if unborn {
+		branches, err := g.line("for-each-ref", "--format=%(refname)", "refs/heads/")
+		if err != nil {
 			return res, err
 		}
-		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+		unborn = branches == ""
 	}
-	remote, branch, ok := strings.Cut(upstream, "/")
-	if !ok || remote != "origin" {
-		return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
+	if !unborn {
+		upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+		if err != nil {
+			if ctx.Err() != nil {
+				return res, err
+			}
+			return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+		}
+		remote, branch, ok := strings.Cut(upstream, "/")
+		if !ok || remote != "origin" {
+			return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
+		}
+		res.Branch = branch
 	}
-	res.Branch = branch
 	unlock, gitDir, err := lock(g)
 	if err != nil {
 		return res, err
@@ -275,7 +299,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	// An init stopped after moving its clone's git directory in, and before
 	// filling the index, left a clone with no index: every file would look
 	// deleted, and untracked, to git. Filling it now finishes that init.
-	if _, err := os.Stat(filepath.Join(gitDir, "index")); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(gitDir, "index")); !unborn && errors.Is(err, os.ErrNotExist) {
 		if _, err := g.line("read-tree", "HEAD"); err != nil {
 			return res, err
 		}
@@ -283,8 +307,26 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
 		return res, err
 	}
+	if unborn {
+		if res.Branch, err = startBranch(g, o.URL); err != nil {
+			return res, err
+		}
+	}
 	if err := bootstrap(g, o, &res); err != nil {
 		return res, err
+	}
+	if unborn {
+		for _, args := range [][]string{
+			{"update-ref", "refs/heads/" + res.Branch, res.Head},
+			{"symbolic-ref", "HEAD", "refs/heads/" + res.Branch},
+			{"branch", "--quiet", "--set-upstream-to=origin/" + res.Branch, res.Branch},
+			{"read-tree", "HEAD"},
+		} {
+			if _, err := g.line(args...); err != nil {
+				return res, err
+			}
+		}
+		res.Cloned = true
 	}
 	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
 		return res, err
@@ -293,13 +335,15 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	return res, err
 }
 
-// adoptFleetFile makes a clone's FleetFile the journal's, index and all, as
-// placeFleetFile does for a new one. A FleetFile with another salt, edited by
+// adoptFleetFile makes a clone's FleetFile the journal's, file and index entry,
+// as placeFleetFile does for a new one. A FleetFile with another salt, edited by
 // hand or left by an earlier setup, gives way, and its salt is noted in gitDir as
 // placeFleetFile notes it, so that init's own sync files the records this machine
-// wrote under it. The index gets the journal's entry, or a sync would keep the
-// file as this machine's change; git writes the file only when it sees it differ,
+// wrote under it. The file is compared with the journal's as git would store it,
 // so that an equal one, CRLF endings and all, is never rewritten under a hook.
+// One that differs is replaced before the index entry changes: an init stopped
+// between the two then leaves the journal's salt in place, where the other order
+// would leave a file that differs from git's copy, which no sync replaces.
 func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
 	if err != nil {
@@ -326,20 +370,24 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	}
 	mode, rest, _ := strings.Cut(entry, " ")
 	id, _, _ := strings.Cut(strings.TrimPrefix(rest, "blob "), "\t")
-	staged, err := g.line("ls-files", "--stage", "--", FleetFile)
-	if err != nil {
-		return err
+	same := false
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		got, err := g.line("hash-object", "--", FleetFile)
+		if err != nil {
+			return err
+		}
+		same = got == id
 	}
-	if staged != mode+" "+id+" 0\t"+FleetFile {
-		if _, err := g.line("update-index", "--add", "--cacheinfo", mode+","+id+","+FleetFile); err != nil {
+	if !same {
+		if err := writeFleetFile(g.ctx, gitDir, path, want); err != nil {
 			return err
 		}
 	}
-	differs, err := g.raw(nil, "diff", "--name-only", "-z", "--", FleetFile)
-	if err != nil || differs == "" {
+	staged, err := g.line("ls-files", "--stage", "--", FleetFile)
+	if err != nil || staged == mode+" "+id+" 0\t"+FleetFile {
 		return err
 	}
-	_, err = g.line("checkout", "--", FleetFile)
+	_, err = g.line("update-index", "--add", "--cacheinfo", mode+","+id+","+FleetFile)
 	return err
 }
 
@@ -538,17 +586,22 @@ func placeFleetFile(g git, dir, gitDir, tip string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	// Written beside dir and renamed in, so a reader never sees half of it.
-	f, err := os.CreateTemp(filepath.Dir(dir), "."+FleetFile+".*")
+	return writeFleetFile(g.ctx, filepath.Dir(dir), path, want)
+}
+
+// writeFleetFile puts content at path by renaming in a file written in tmpDir, so
+// that a reader never sees half of it.
+func writeFleetFile(ctx context.Context, tmpDir, path, content string) error {
+	f, err := os.CreateTemp(tmpDir, "."+FleetFile+".*")
 	if err != nil {
 		return err
 	}
-	_, err = f.WriteString(want)
+	_, err = f.WriteString(content)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
-		err = RenameRetry(g.ctx, f.Name(), path)
+		err = RenameRetry(ctx, f.Name(), path)
 	}
 	if err != nil {
 		os.Remove(f.Name())
@@ -576,13 +629,10 @@ func NotePastSalt(gitDir, salt string) error {
 // its own, holding it as a quoted Go string, so that it reads back exactly,
 // bytes that are not UTF-8 included. A line is appended in a single write, so
 // that processes noting salts at once lose none of them, as they would if each
-// rewrote the file. A symbolic link at path, which an account able to write
-// there could plant, is not written through.
+// rewrote the file. Anything at path but a regular file, such as a symbolic link
+// or a FIFO an account able to write there could plant, is refused.
 func AppendSalt(path, salt string) error {
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing to write through the symbolic link %s", path)
-	}
-	data, err := os.ReadFile(path)
+	data, err := readRegular(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -595,7 +645,7 @@ func AppendSalt(path, salt string) error {
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		line = "\n" + line
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := journal.OpenRegular(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -607,10 +657,21 @@ func AppendSalt(path, salt string) error {
 }
 
 // ReadSalts returns the salts in the salts file at path, oldest first. A line
-// that is not a whole quoted string is skipped.
+// that is not a whole quoted string is skipped, and so is anything at path but a
+// regular file.
 func ReadSalts(path string) []string {
-	data, _ := os.ReadFile(path)
+	data, _ := readRegular(path)
 	return parseSalts(data)
+}
+
+// readRegular reads the file at path if it is a regular file.
+func readRegular(path string) ([]byte, error) {
+	f, err := journal.OpenRegular(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }
 
 func parseSalts(data []byte) []string {

@@ -121,7 +121,9 @@ journal directory holding anything but journal files and `fleetd.json`. A
 directory that is already a clone of another repository is refused too. A
 `fleetd.json` already in the journal directory with another salt is replaced by the
 journal's, and init's own sync files the records written under its salt under the
-journal's. When two machines start the same empty repository at once, the one
+journal's. A plain clone of the repository made while it was still empty has no
+commit to follow; init starts the journal there as in a new directory, on the
+branch that clone is on. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Running init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
 which init and every sync wait out for ten minutes. When this machine's journal
@@ -272,7 +274,14 @@ was wrong:
   are filed under the fleet's id by the next sync, while it holds its lock. A
   salt a record was written under for want of `fleetd.json` (`--salt` or
   `FLEET_SALT`) is noted in `journal.salts` beside the journal directory, so the
-  sync that files those records need not have it set. It
+  sync that files those records need not have it set. The salt of a replaced
+  `fleetd.json`, or the journal's before it changed, is noted in the clone's git
+  directory, or in `journal.salts` when that cannot be written. While neither
+  can be, fleetd warns, keeps that salt as the one an invalid `fleetd.json`
+  falls back to, and notes it once it can. Either note is one quoted salt per
+  line, and anything there but a regular file, such as a symbolic link or a
+  FIFO, is refused rather than written through or waited on; so is the hook
+  log. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
   published, and one a killed sync left missing is put back too. A file git

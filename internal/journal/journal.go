@@ -372,3 +372,32 @@ func (s *Store) readFile(p, stem string) ([]Record, error) {
 		}
 	}
 }
+
+// refuseIrregular refuses a path that holds anything but a regular file, before
+// OpenRegular opens it; a path that holds nothing yet is fine.
+func refuseIrregular(path string) error {
+	fi, err := os.Lstat(path)
+	switch {
+	case err != nil:
+		return nil
+	case fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("refusing to open the symbolic link %s", path)
+	case !fi.Mode().IsRegular():
+		return fmt.Errorf("refusing to open %s: it is not a regular file", path)
+	}
+	return nil
+}
+
+// checkRegular returns f if it is a regular file, and closes it otherwise: the
+// path may have been replaced between refuseIrregular's look and the open.
+func checkRegular(f *os.File) (*os.File, error) {
+	fi, err := f.Stat()
+	if err == nil && !fi.Mode().IsRegular() {
+		err = fmt.Errorf("refusing to open %s: it is not a regular file", f.Name())
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}

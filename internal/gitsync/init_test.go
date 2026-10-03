@@ -425,3 +425,39 @@ func TestASaltNotedAfterAnUnfinishedLineIsKept(t *testing.T) {
 		t.Fatalf("the salts read back are %q, want first and third", got)
 	}
 }
+
+// init on a clone puts the journal's fleetd.json in git's index only once the
+// work tree holds it. The other way round, an init stopped between the two
+// leaves a file that differs from git's copy, which no sync replaces.
+func TestInitPutsTheJournalsFleetFileInTheIndexOnlyOnceTheWorkTreeHasIt(t *testing.T) {
+	remote := emptyRemote(t)
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	mustInit(t, InitOptions{URL: remote, Dir: first, Salt: "A"})
+	clone := filepath.Join(root, "clone")
+	run(t, root, "clone", "--quiet", remote, clone)
+	want := `{"salt": "B"}` + "\n"
+	if err := os.WriteFile(filepath.Join(first, FleetFile), []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, first, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "a new salt")
+	run(t, first, "push", "--quiet")
+	var early []string
+	_, err := Init(context.Background(), InitOptions{URL: remote, Dir: clone, Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "update-index") && slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, FleetFile) }) {
+			if have, _ := os.ReadFile(filepath.Join(clone, FleetFile)); string(have) != want {
+				early = append(early, strings.Join(args, " "))
+			}
+		}
+		return Git(ctx, dir, stdin, args...)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(early) > 0 {
+		t.Fatalf("init put fleetd.json in the index before the work tree held the journal's copy: %q", early)
+	}
+	if have, err := os.ReadFile(filepath.Join(clone, FleetFile)); err != nil || string(have) != want {
+		t.Fatalf("after init the clone's fleetd.json is %q (%v), want the journal's", have, err)
+	}
+}

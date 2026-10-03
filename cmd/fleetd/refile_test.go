@@ -851,9 +851,10 @@ func TestTheSaltsNoteIsNotWrittenThroughASymlink(t *testing.T) {
 	}
 }
 
-// A note of a past salt that cannot be written is tried again by the next run:
-// until it is written, the salt is remembered in the cache it would otherwise
-// leave, and the records written under it are filed once it is.
+// A note of a past salt that cannot be written, in the clone's git directory or
+// beside the journal, is tried again by the next run: until it is written, the
+// salt is remembered in the cache it would otherwise leave, and the records
+// written under it are filed once it is.
 func TestASaltNoteThatFailsIsTriedAgain(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
@@ -868,23 +869,133 @@ func TestASaltNoteThatFailsIsTriedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitIn(t, dir, "checkout", "--", gitsync.FleetFile)
-	// The note cannot be written: a directory stands where it goes.
-	obstacle := filepath.Join(dir, ".git", "fleetd-past-salts")
-	if err := os.MkdirAll(obstacle, 0o755); err != nil {
-		t.Fatal(err)
+	// Neither note can be written: a directory stands where each goes.
+	obstacles := []string{filepath.Join(dir, ".git", "fleetd-past-salts"), saltsNote(dir)}
+	for _, obstacle := range obstacles {
+		if err := os.MkdirAll(obstacle, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	fleetFileAged(t, dir)
 	if _, stderr, err := exec(t, "sync", "--dir", dir); err != nil || !strings.Contains(stderr, "could not note") {
 		t.Fatalf("sync with the note failing: %v; stderr %q, want a warning", err, stderr)
 	}
-	if err := os.Remove(obstacle); err != nil {
-		t.Fatal(err)
+	for _, obstacle := range obstacles {
+		if err := os.Remove(obstacle); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
 		t.Fatal("once the note could be written, the record written under the other salt was still not filed")
+	}
+}
+
+// A past salt whose note in the clone's git directory cannot be written is noted
+// beside the journal instead, which re-filing reads as well: the records written
+// under it are filed at once, with nothing to warn about.
+func TestAPastSaltWhoseNoteFailsIsNotedBesideTheJournal(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published under A"); err != nil {
+		t.Fatal(err)
+	}
+	rotateSalt(t, remote, "B")
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	// A hook that read fleetd.json just before that sync replaced it.
+	current, err := os.ReadFile(filepath.Join(dir, gitsync.FleetFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "A"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "a hook that held A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), current, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".git", "fleetd-past-salts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		fleetFileAged(t, dir)
+		if _, stderr, err := exec(t, "sync", "--dir", dir); err != nil || strings.Contains(stderr, "could not note") {
+			t.Fatalf("sync: %v; stderr %q", err, stderr)
+		}
+	}
+	if _, ok := remoteHostRecords(t, remote, "B", "a hook that held A"); !ok {
+		t.Fatal("the record written under the journal's previous salt was not filed under its new one")
+	}
+}
+
+// An invalid fleetd.json is not trusted: the salt it last held is used. That
+// holds while the past-salts note in the clone's git directory cannot be written.
+func TestAnInvalidFleetFileUsesTheSaltItLastHeldWhenThePastSaltsNoteFails(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".git", "fleetd-past-salts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rotateSalt(t, remote, "B")
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "while fleetd.json holds B"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "B",}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "while fleetd.json is invalid"); err != nil {
+		t.Fatal(err)
+	}
+	b := filepath.Join(dir, strings.ReplaceAll(hostID(t, "--salt", "B", "--dir", t.TempDir()), ":", "-")+".jsonl")
+	if data, err := os.ReadFile(b); err != nil || !strings.Contains(string(data), "while fleetd.json is invalid") {
+		t.Fatalf("the record written while fleetd.json was invalid is not under B, the salt it last held: %v", err)
+	}
+}
+
+// A file of an identity this machine no longer uses, published in full, is left
+// where it is by every later sync, whatever the person's git configuration says
+// about refreshing git's index. Moved again, it would be copied into the git
+// directory by every sync, without end.
+func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if err := os.WriteFile(os.Getenv("GIT_CONFIG_GLOBAL"), []byte("[diff]\n\tautoRefreshIndex = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "A", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published under A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	rotateSalt(t, remote, "B")
+	for range 4 {
+		fleetFileAged(t, dir)
+		if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copies, err := filepath.Glob(filepath.Join(dir, ".git", "fleetd-pre-init", "*"))
+	if err != nil || len(copies) != 0 {
+		t.Fatalf("syncs copied a published file into fleetd-pre-init: %v (%v)", copies, err)
 	}
 }
 

@@ -1156,3 +1156,180 @@ func TestInitOnACloneKeepsAFleetFileWhoseSaltItCannotNote(t *testing.T) {
 		t.Fatalf("init run again did not note the replaced salt: %q", past)
 	}
 }
+
+// rotateSalt changes the journal's fleetd.json to one with salt, as a person
+// changing the fleet's salt from another machine would.
+func rotateSalt(t *testing.T, remote, salt string) {
+	t.Helper()
+	editor := filepath.Join(t.TempDir(), "editor")
+	gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
+	if err := os.WriteFile(filepath.Join(editor, gitsync.FleetFile), []byte(`{"salt": "`+salt+`"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "a new salt")
+	gitIn(t, editor, "push", "--quiet")
+}
+
+// init on a clone writes the journal's fleetd.json before it puts it in git's
+// index. An init stopped between the two, by a locked index say, leaves the
+// journal's salt in place for every record from then on, and init run again
+// finishes. Put in the index first, the journal's copy would sit beside a work
+// tree file no sync replaces, since a sync keeps a file that differs from git's.
+func TestAnInitWhoseIndexUpdateFailsLeavesTheJournalsSaltInPlace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script in place of git")
+	}
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "A", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	rotateSalt(t, remote, "B")
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\ncase \"$*\" in *update-index*fleetd.json*) echo 'fatal: Unable to create index.lock: File exists' >&2; exit 128;; esac\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+path)
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err == nil {
+		t.Fatal("the index update did not fail")
+	}
+	t.Setenv("PATH", path)
+	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "B" {
+		t.Fatalf("after an init whose index update failed, fleetd.json is %+v (%v, %v); want the journal's salt B", fleet, ok, err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after init ran again:\n%s", out)
+	}
+}
+
+// A plain clone of the journal repository, made while the repository was still
+// empty, has no commit and nothing to follow yet. init starts the journal there,
+// as in a new directory, and publishes what was recorded before it.
+func TestInitOnAPlainCloneOfTheEmptyJournalStartsItThere(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written before init"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "init", "--dir", dir, remote)
+	if err != nil || !strings.Contains(stdout, "started the journal") || !strings.Contains(stdout, "the journal is set up at") {
+		t.Fatalf("init on a plain clone of the empty journal: %v\n%s", err, stdout)
+	}
+	fleet, ok, err := gitsync.ReadFleet(dir)
+	if err != nil || !ok {
+		t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v)", fleet, ok, err)
+	}
+	if _, ok := remoteHostRecords(t, remote, fleet.Salt, "written before init"); !ok {
+		t.Fatalf("the record written before init is on no remote file; init said %q", stdout)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after init:\n%s", out)
+	}
+}
+
+// The same clone, when another machine started the journal before this one ran
+// init: init follows it, and checks out the other machine's records.
+func TestInitOnAPlainCloneOfTheEmptyJournalFollowsAnotherMachinesStart(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	other := filepath.Join(t.TempDir(), "other")
+	if _, _, err := exec(t, "init", "--dir", other, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "host-0123456789abcdef.jsonl"), []byte(`{"id":"hive:1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, other, "add", "host-0123456789abcdef.jsonl")
+	gitIn(t, other, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "another machine")
+	gitIn(t, other, "push", "--quiet")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written before init"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "init", "--json", "--dir", dir, remote)
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, stdout)
+	}
+	var res struct {
+		Cloned   bool     `json:"cloned"`
+		Restored []string `json:"restored"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		t.Fatalf("init --json: %v\n%s", err, stdout)
+	}
+	// init itself checks out the other machine's records, so the clone is whole
+	// even if its own sync fails.
+	if !res.Cloned || !slices.Contains(res.Restored, "host-0123456789abcdef.jsonl") {
+		t.Fatalf("init said %s; want the clone set up, with the other machine's file restored", stdout)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "written before init"); !ok {
+		t.Fatalf("the record written before init is on no remote file; init said %q", stdout)
+	}
+	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("git status after init:\n%s", out)
+	}
+}
+
+// A clone on a branch with no commit yet, made with `git checkout --orphan`, was
+// not cloned from the empty repository: its other branches may hold commits of
+// their own. init refuses it, as any clone without an upstream, and moves none of
+// its branches.
+func TestInitRefusesACloneOnAnOrphanBranch(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "notes.txt")
+	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "not pushed")
+	mine, err := osexec.Command("git", "-C", dir, "rev-parse", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "checkout", "--quiet", "--orphan", "scratch")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrNoUpstream) {
+		t.Fatalf("init on a clone on an orphan branch: %v, want ErrNoUpstream", err)
+	}
+	if now, err := osexec.Command("git", "-C", dir, "rev-parse", "main").Output(); err != nil || string(now) != string(mine) {
+		t.Fatalf("init moved main from %s to %s (%v)", mine, now, err)
+	}
+}
+
+// A repository made with git init and given the journal as its origin has no
+// commit, and no upstream configured either, unlike a plain clone. init sets it
+// up in place all the same, upstream included, so that its syncs publish.
+func TestInitOnAnEmptyRepositoryWithTheJournalAsOriginSetsItUp(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "init", "--quiet", "--initial-branch=main", dir)
+	gitIn(t, dir, "remote", "add", "origin", remote)
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written before init"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := exec(t, "init", "--dir", dir, remote)
+	if err != nil || !strings.Contains(stdout, "started the journal") {
+		t.Fatalf("init: %v\n%s", err, stdout)
+	}
+	fleet, ok, err := gitsync.ReadFleet(dir)
+	if err != nil || !ok {
+		t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v)", fleet, ok, err)
+	}
+	if _, ok := remoteHostRecords(t, remote, fleet.Salt, "written before init"); !ok {
+		t.Fatalf("the record written before init is on no remote file; init said %q", stdout)
+	}
+}

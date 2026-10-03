@@ -712,7 +712,7 @@ func appendHookLog(res *hookResult, now time.Time) error {
 		fmt.Fprintf(&b, "%s %s %s: %s\n", now.UTC().Format(time.RFC3339),
 			oneLine(orDash(res.Tool)), oneLine(orDash(res.Event)), oneLine(p))
 	}
-	f, err := os.OpenFile(res.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := journal.OpenRegular(res.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

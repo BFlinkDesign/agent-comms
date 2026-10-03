@@ -20,3 +20,18 @@ func openAppend(path string) (*os.File, error) {
 // is a POSIX construct; NTFS commits the directory entry as part of the metadata
 // journal, so there is no equivalent call to make here.
 func syncDir(string) error { return nil }
+
+// OpenRegular opens path, a file beside the journal that another account able to
+// write there could have replaced, refusing anything but a regular file. Windows
+// keeps its named pipes outside the file system, so no open of a path there can
+// wait on one; the caller's Lstat check is again the only symlink guard.
+func OpenRegular(path string, flag int, perm os.FileMode) (*os.File, error) {
+	if err := refuseIrregular(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return checkRegular(f)
+}

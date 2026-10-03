@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // A sync that fails leaves no trace in the journal, and one started by a hook
@@ -215,7 +216,7 @@ const hookProblemAge = 7 * 24 * time.Hour
 // output goes nowhere a person looks, so this is where its failures surface.
 func hookProblem(journalDir string) (path, last string, ok bool) {
 	path = filepath.Join(filepath.Dir(journalDir), hookLogName)
-	f, err := os.Open(path)
+	f, err := journal.OpenRegular(path, os.O_RDONLY, 0)
 	if err != nil {
 		return path, "", false
 	}

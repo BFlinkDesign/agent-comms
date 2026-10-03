@@ -34,3 +34,20 @@ func syncDir(dir string) error {
 	}
 	return d.Close()
 }
+
+// OpenRegular opens path, a file beside the journal that another account able to
+// write there could have replaced, refusing anything but a regular file. A
+// symbolic link fails the open (O_NOFOLLOW). A FIFO or a device would make the
+// open wait for a reader or a writer that may never come; O_NONBLOCK makes it
+// return at once, and the file is then refused. On a regular file O_NONBLOCK has
+// no effect.
+func OpenRegular(path string, flag int, perm os.FileMode) (*os.File, error) {
+	if err := refuseIrregular(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
+	if err != nil {
+		return nil, err
+	}
+	return checkRegular(f)
+}

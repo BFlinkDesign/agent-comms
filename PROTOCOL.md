@@ -283,8 +283,9 @@ an `about` line), on the branch it names as its default, else `main`; a reposito
 that already holds records without one needs the salt its machines use (`--salt` or
 `$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
 the ids they had). When the repository's default branch does not exist, the journal is
-on its only branch; with several, init is refused. A `fleetd.json` in the journal
-directory with another salt is replaced by the journal's. A repository whose top level
+on its only branch; with several, init is refused. A plain clone of the repository
+made while it was empty is set up in place, on the branch it is on. A `fleetd.json`
+in the journal directory with another salt is replaced by the journal's. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
 `.gitattributes`, or a directory, is refused; so is a journal directory holding
 anything but journal files and `fleetd.json`, or a clone of another repository.
@@ -346,7 +347,9 @@ for the latest). It moves their file into
 `.git/fleetd-pre-init/`, putting back a file git tracks as published, and files a
 record appended to the moved copy later at the next sync. A `--salt` or
 `$FLEET_SALT` a record was written under for want of `fleetd.json` is noted in
-`<journal directory>.salts`, beside it, so that sync need not have it set.
+`<journal directory>.salts`, beside it, so that sync need not have it set; so is a
+salt the journal's `fleetd.json` held before, when the clone's git directory cannot
+take its note.
 
 DOES NOT EXIST (never use):
 - comms join
