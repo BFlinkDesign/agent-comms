@@ -262,13 +262,36 @@ func cachedSalt(journalDir string) string {
 	if !ok {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(gitDir, saltCacheName))
+	data, err := readNote(filepath.Join(gitDir, saltCacheName))
 	if err != nil {
 		return ""
 	}
 	// Only the newline cacheSalt ends it with: a salt is used exactly as given,
 	// spaces and all, or the same machine gets a second id.
 	return strings.TrimSuffix(string(data), "\n")
+}
+
+// maxNoteBytes bounds the notes fleetd keeps in a clone's git directory: the
+// salt cache, the sync's outcome, the sizes of the moved copies re-filed.
+const maxNoteBytes = 1 << 20
+
+// readNote reads one of fleetd's notes as fleetd reads every file it keeps: a
+// FIFO or a link planted there is refused, never waited on, past a sync's
+// --timeout and holding its lock, and one larger than maxNoteBytes is not read.
+func readNote(path string) ([]byte, error) {
+	f, err := journal.OpenRegular(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxNoteBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxNoteBytes {
+		return nil, fmt.Errorf("refusing to read %s: it is larger than %d bytes", path, maxNoteBytes)
+	}
+	return data, nil
 }
 
 // cacheSalt keeps salt for cachedSalt, in a clone only, and only when it changed.
@@ -577,10 +600,10 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 		// derived before one came in differs.
 		if last := cachedSalt(store.Dir()); !ok && last != "" && last != h.Salt {
 			stale = fmt.Errorf("%w, whose salt this clone used before: its records would go out under %s, another id "+
-				"than the fleet's, so nothing was published. `fleetd init --dir \"%s\" <journal URL>` puts the journal's "+
-				"%s in place, after which a sync files them under the fleet's id; if the journal has none to put back, "+
-				"give init that salt with --salt: %s holds it", gitsync.ErrNoFleetFile, h.ID, store.Dir(),
-				gitsync.FleetFile, filepath.Join(gitDir, saltCacheName))
+				"than the fleet's, so nothing was published. `fleetd init --dir \"%s\" --salt <salt> <journal URL>`, "+
+				"given the salt %s holds, puts the journal's %s in place, or one with that salt where the journal has "+
+				"none to put back, after which a sync files them under the fleet's id", gitsync.ErrNoFleetFile, h.ID,
+				store.Dir(), filepath.Join(gitDir, saltCacheName), gitsync.FleetFile)
 			cancel()
 			return
 		}

@@ -336,7 +336,7 @@ func fileMoved(ctx context.Context, dir, keep string, me hostOut, moved map[stri
 		return 0, err
 	}
 	sizes := map[string]int64{}
-	if data, err := os.ReadFile(filepath.Join(keep, refiledName)); err == nil {
+	if data, err := readNote(filepath.Join(keep, refiledName)); err == nil {
 		_ = json.Unmarshal(data, &sizes)
 	}
 	var grown []string

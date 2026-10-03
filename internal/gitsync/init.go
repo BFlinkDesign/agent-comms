@@ -1026,20 +1026,15 @@ func recordedGone(g git, url, recorded string) error {
 
 // journalElsewhere refuses to start the journal on branch, whose top level is
 // top, when branch holds none, neither FleetFile nor a host journal file, while
-// another of origin's branches holds one, not a copy of branch's: the fleet
-// publishes there, and a journal started here, with a salt of its own, would
-// split it. dir is the journal directory, for the advice.
+// another of origin's branches holds one: the fleet publishes there, and a
+// journal started here, with a salt of its own, would split it. dir is the
+// journal directory, for the advice.
 func journalElsewhere(g git, url, dir, branch string, top map[string]string) error {
 	if holdsJournal(top) {
 		return nil
 	}
 	holding, err := journalsBut(g, branch)
 	if err != nil || len(holding) == 0 {
-		return err
-	}
-	// A copy of the journal branch held, before a push deleted its fleetd.json,
-	// is no journal elsewhere: init puts the file back on branch.
-	if holding, err = notCopies(g, branch, holding); err != nil || len(holding) == 0 {
 		return err
 	}
 	on := holding[0]
@@ -1238,9 +1233,9 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 }
 
 // deletedFleet returns the FleetFile tip's branch held before a commit since
-// deleted it, and its content: ok is false when the branch never held one, or
-// held last one that is not usable, a directory or invalid JSON, say. git's own
-// failures are returned.
+// deleted it, and its content: ok is false when the branch never held one, held
+// last one that is not usable, a directory or invalid JSON, say, or cannot say
+// which it held. git's own failures are returned.
 func deletedFleet(g git, tip string) (f Fleet, content []byte, ok bool, err error) {
 	if tip == "" {
 		return Fleet{}, nil, false, nil
@@ -1254,14 +1249,42 @@ func deletedFleet(g git, tip string) (f Fleet, content []byte, ok bool, err erro
 	}
 	// tip lacks it, so last, the newest commit on that line that changed it,
 	// deleted it, and its first parent held it.
-	entry, err := g.line("ls-tree", last+"^", "--", FleetFile)
+	if f, content, ok, err = fleetAt(g, last+"^"); err != nil || !ok {
+		return Fleet{}, nil, false, err
+	}
+	// Another salt, in a commit tip has and that first parent lacks, on any line,
+	// leaves it unclear which line was the branch's own: a branch fast-forwarded
+	// to a side branch that merged it in, itself or through another branch, has
+	// the side branch's first parents. Nothing is put back then. Plain history
+	// simplification follows a merge down the side it matches only.
+	changed, err := g.line("rev-list", "--full-history", last+"^.."+tip, "--", FleetFile)
+	if err != nil {
+		return Fleet{}, nil, false, err
+	}
+	for _, c := range strings.Fields(changed) {
+		other, _, held, err := fleetAt(g, c)
+		if err != nil {
+			return Fleet{}, nil, false, err
+		}
+		if held && other.Salt != f.Salt {
+			return Fleet{}, nil, false, nil
+		}
+	}
+	return f, content, true, nil
+}
+
+// fleetAt returns the FleetFile commit holds, and its content, if it holds a
+// usable one: not a directory, invalid JSON, or too large. git's own failures
+// are returned.
+func fleetAt(g git, commit string) (f Fleet, content []byte, ok bool, err error) {
+	entry, err := g.line("ls-tree", commit, "--", FleetFile)
 	if err != nil {
 		return Fleet{}, nil, false, err
 	}
 	if fields := strings.Fields(entry); len(fields) < 3 || fields[1] != "blob" {
 		return Fleet{}, nil, false, nil
 	}
-	data, err := fleetBlob(g, last+"^", "the journal's history")
+	data, err := fleetBlob(g, commit, "the journal's history")
 	if errors.Is(err, ErrBadFleetFile) {
 		return Fleet{}, nil, false, nil
 	}
@@ -1291,12 +1314,10 @@ func look(g git, gitDir, branch string) error {
 		return err
 	}
 	if len(holding) > 0 {
-		// A git that cannot say fails the look, which stays due.
+		// A git that cannot say fails the look, which stays due, one the context
+		// ended included: Git reports that as the context's end.
 		others, err := notCopies(g, branch, holding)
 		if err != nil {
-			return err
-		}
-		if err := g.ctx.Err(); err != nil {
 			return err
 		}
 		if len(others) > 0 {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -558,6 +559,47 @@ func TestTheSaltNotesOfAJournalWhoseGitDirectoryIsElsewhereAreKeptThere(t *testi
 	}
 	if got := gitsync.PastSalts(gitDir); !slices.Equal(got, []string{"A"}) {
 		t.Fatalf("the git directory notes %q as past salts, want A", got)
+	}
+}
+
+// A note fleetd keeps in a clone's git directory is read whole up to
+// maxNoteBytes, and refused beyond that without being read: a huge file planted
+// there would otherwise be read into memory by every sync and every where.
+func TestANoteLargerThanItsBoundIsRefusedUnread(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for _, size := range []int{maxNoteBytes, maxNoteBytes + 1} {
+		path := filepath.Join(dir, strconv.Itoa(size))
+		if err := os.WriteFile(path, bytes.Repeat([]byte("x"), size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		data, err := readNote(path)
+		if size <= maxNoteBytes && (err != nil || len(data) != size) {
+			t.Errorf("a note of %d bytes read as %d bytes, %v; want it whole", size, len(data), err)
+		}
+		if size > maxNoteBytes && err == nil {
+			t.Errorf("a note of %d bytes read as %d bytes; want it refused", size, len(data))
+		}
+	}
+	// A terabyte of nothing, which takes no room where the file system leaves
+	// what was never written unallocated; Windows allocates it.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	huge := filepath.Join(dir, "huge")
+	f, err := os.Create(huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.Truncate(1 << 40)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Skipf("cannot make a sparse terabyte here: %v", err)
+	}
+	if data, err := readNote(huge); err == nil {
+		t.Fatalf("a note of a terabyte read as %d bytes; want it refused", len(data))
 	}
 }
 

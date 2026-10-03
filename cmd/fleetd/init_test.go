@@ -2465,7 +2465,7 @@ func TestALostFleetdJsonWithNoneToPutBackPublishesNothingUnderAnotherId(t *testi
 				t.Fatal(err)
 			}
 			_, _, err := exec(t, "sync", "--dir", b)
-			if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "`fleetd init --dir \""+b+"\" <journal URL>`") ||
+			if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "`fleetd init --dir \""+b+"\" --salt <salt> <journal URL>`") ||
 				!strings.Contains(err.Error(), filepath.Join(".git", "fleetd-salt")) {
 				t.Fatalf("sync of a record written without fleetd.json: %v; want ErrNoFleetFile naming init and the salt this clone noted", err)
 			}
@@ -2518,5 +2518,66 @@ func TestAHookThatDerivedItsIdWithoutFleetdJsonPublishesNothingOnceAnUnusableOne
 	}
 	if n, _ := remoteHostRecords(t, remote, "", "claude SessionEnd"); n != 0 {
 		t.Fatalf("%d records under the unsalted id, %s; want none", n, rec.host.ID)
+	}
+}
+
+// A sync stopped because its salt came from a stale FLEET_SALT says to give init
+// the salt the clone noted, with --salt, which init takes over FLEET_SALT: the
+// advice followed in the same environment keeps the fleet's id. Plain, init
+// would have taken FLEET_SALT for the fleet's salt, the journal having no
+// fleetd.json to put back, and every machine would then take another id.
+func TestFollowingTheGuardsAdviceWithAStaleFleetSaltKeepsTheFleetsId(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	b := filepath.Join(t.TempDir(), "b")
+	if _, _, err := exec(t, "init", "--dir", b, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	fleetID := hostID(t, "--dir", b)
+	if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	w := filepath.Join(t.TempDir(), "w")
+	gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	commit := []string{"-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet"}
+	if err := os.WriteFile(filepath.Join(w, gitsync.FleetFile), []byte("not json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, w, append(commit, "-am", "oops")...)
+	gitIn(t, w, "push", "--quiet", "origin", "main")
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, w, "rm", "--quiet", gitsync.FleetFile)
+	gitIn(t, w, append(commit, "-m", "tidy up")...)
+	gitIn(t, w, "push", "--quiet", "origin", "main")
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_SALT", "stale")
+	if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b2"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := exec(t, "sync", "--dir", b)
+	cache := filepath.Join(b, ".git", "fleetd-salt")
+	if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "--salt <salt> <journal URL>") ||
+		!strings.Contains(err.Error(), cache) {
+		t.Fatalf("sync: %v; want the guard, saying to give init the salt %s holds", err, cache)
+	}
+	salt, rerr := os.ReadFile(cache)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if _, _, err := exec(t, "init", "--dir", b, "--salt", strings.TrimSuffix(string(salt), "\n"), remote); err != nil {
+		t.Fatalf("init as the guard says: %v", err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+		t.Fatal(err)
+	}
+	onlyUnderTheFleetsId(t, remote, fleetID)
+	if _, ok := remoteHostRecords(t, remote, "s", "b2"); !ok {
+		t.Fatal("the record written under the stale FLEET_SALT is not under the fleet's id")
 	}
 }

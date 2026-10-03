@@ -291,8 +291,7 @@ keep the ids they had). When the repository's default branch does not exist, the
 on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
 on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
-no host journal file) while another branch holds one, other than a copy of the
-journal it held before a push deleted its `fleetd.json`: it is refused, naming the
+no host journal file) while another branch holds one: it is refused, naming the
 branch the journal is on, with nothing pushed or moved. Two machines that make two
 such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
@@ -434,10 +433,12 @@ push that deletes a usable `fleetd.json` leaves in place the copy each clone's w
 tree holds, so those machines keep their ids, and every sync says so; `fleetd init`
 on any machine puts it back as the journal's branch last held it, along its first
 parents, refusing a `--salt` that contradicts it, so a machine set up meanwhile gets
-the fleet's id too. Where there is none to put back (invalid when deleted, or a
-history rewritten without it), the deletion comes in, and a clone that has used the
-fleet's salt publishes nothing under another until init puts a `fleetd.json` in
-place, given with `--salt` the salt its `.git/fleetd-salt` holds.
+the fleet's id too. Where there is none to put back (invalid when deleted, a
+history rewritten without it, or history merged in since that held another salt,
+leaving it unclear which line was the branch's own), the deletion comes in, and a
+clone that has used the fleet's salt publishes nothing under another until init
+puts a `fleetd.json` in place, given with `--salt` the salt its `.git/fleetd-salt`
+holds.
 Without `fleetd.json` they supply it. It must be identical on every machine in the
 fleet, or one machine will appear as several. It is not a credential. A sync files
 under this machine's fleet id the records it wrote under another salt (none or

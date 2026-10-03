@@ -145,3 +145,53 @@ func TestInitOnACloneWhoseFleetFileLinksToAFIFOReturns(t *testing.T) {
 		t.Fatalf("after init fleetd.json is %v (%v), want a regular file", info.Mode(), err)
 	}
 }
+
+// The notes fleetd reads from the clone's git directory are read as every other
+// file it keeps: the salt cache, which every sync reads under its lock where the
+// journal directory lacks fleetd.json, the sync's outcome, which where and every
+// hook read, and the sizes of the moved copies re-filed. A FIFO there is refused,
+// never waited on.
+func TestAFIFOAtANoteInTheGitDirectoryHoldsNothingUp(t *testing.T) {
+	t.Parallel()
+	for _, note := range []string{"the salt cache, with fleetd.json", "the salt cache, without fleetd.json",
+		"the sync's outcome", "the re-filed sizes"} {
+		t.Run(note, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			path := map[string]string{
+				"the salt cache, with fleetd.json":    filepath.Join(dir, ".git", saltCacheName),
+				"the salt cache, without fleetd.json": filepath.Join(dir, ".git", saltCacheName),
+				"the sync's outcome":                  filepath.Join(dir, ".git", syncStatusFile),
+				"the re-filed sizes":                  filepath.Join(dir, ".git", preInitDir, refiledName),
+			}[note]
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if err := syscall.Mkfifo(path, 0o600); err != nil {
+				t.Skipf("cannot make a FIFO here: %v", err)
+			}
+			if note == "the salt cache, without fleetd.json" {
+				if err := os.Remove(filepath.Join(dir, gitsync.FleetFile)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// where first: a sync replaces the notes it writes.
+			returnsWithin(t, 30*time.Second, "where with a FIFO at "+note, func() {
+				_, _, _ = exec(t, "where", "--dir", dir)
+			})
+			returnsWithin(t, 30*time.Second, "a sync with a FIFO at "+note, func() {
+				_, _, _ = exec(t, "sync", "--dir", dir, "--timeout", "10s")
+			})
+			if _, err := os.Lstat(filepath.Join(dir, ".git", "fleetd-sync.lock")); err == nil {
+				t.Fatal("the sync left its lock behind")
+			}
+		})
+	}
+}

@@ -78,7 +78,7 @@ func readSyncStatus(dir string) (syncStatus, bool) {
 	if !ok {
 		return st, false
 	}
-	data, err := os.ReadFile(filepath.Join(gitDir, syncStatusFile))
+	data, err := readNote(filepath.Join(gitDir, syncStatusFile))
 	if err != nil || json.Unmarshal(data, &st) != nil {
 		return syncStatus{}, false
 	}

@@ -3383,23 +3383,31 @@ func TestInitPutsBackNoUnusableFleetdJson(t *testing.T) {
 func TestInitStopsWhenGitCannotReadTheDeletedFleetdJson(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
-	for _, step := range []string{"rev-list", "ls-tree", "cat-file"} {
+	for _, step := range []string{"rev-list", "ls-tree", "cat-file", "rev-list of what came since", "ls-tree of the deletion"} {
 		t.Run(step, func(t *testing.T) {
 			t.Parallel()
 			remote, _ := deletedFleetJournal(t, "{\"salt\": \"s\"}\n")
 			before := run(t, "", "--git-dir", remote, "rev-parse", "main")
 			a := filepath.Join(t.TempDir(), "a")
 			failing := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-				if slices.Contains(args, step) && slices.ContainsFunc(args, func(arg string) bool {
+				fails := slices.Contains(args, step) && slices.ContainsFunc(args, func(arg string) bool {
 					return strings.HasSuffix(arg, "^") || strings.HasSuffix(arg, "^:"+FleetFile) || (step == "rev-list" && arg == FleetFile)
-				}) {
-					return "", errors.New("git " + step + ": exit status 128: fatal: unable to read tree")
+				})
+				switch step {
+				case "rev-list of what came since":
+					// What changed fleetd.json since the deletion's first parent.
+					fails = slices.Contains(args, "rev-list") && slices.Contains(args, "--full-history")
+				case "ls-tree of the deletion":
+					fails = slices.Contains(args, "ls-tree") && slices.Contains(args, before) && slices.Contains(args, FleetFile)
+				}
+				if fails {
+					return "", errors.New("git: exit status 128: fatal: unable to read tree")
 				}
 				return Git(ctx, dir, stdin, args...)
 			}
 			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "other", Run: failing}); err == nil ||
 				!strings.Contains(err.Error(), "unable to read tree") {
-				t.Fatalf("init: %v, want the %s's error", err, step)
+				t.Fatalf("init: %v, want the error of its %s", err, step)
 			}
 			if after := run(t, "", "--git-dir", remote, "rev-parse", "main"); after != before {
 				t.Fatalf("main went from %s to %s", before, after)
@@ -3557,44 +3565,152 @@ func TestALookWhoseGitCannotSayWhatABranchSharesStaysDue(t *testing.T) {
 	}
 }
 
-// A journal with no records yet, whose fleetd.json a push deleted, beside a copy
-// of it on another branch, gets the file back from init, as the sync's message
-// says: a copy is no journal elsewhere. Beside a journal of another's own, init
-// is refused as before, naming the branch.
-func TestInitPutsBackAFleetdJsonBesideACopyButNotBesideAnotherJournal(t *testing.T) {
+// A journal the fleet moved off the repository's default branch, a branch made
+// from it while it held the journal, where the fleet publishes, and the default
+// cleaned down to a README for people to read, is no copy to ignore: init on a
+// new directory, or on a clone the repair would put on the default, is refused,
+// naming the branch the journal is on, with nothing pushed.
+func TestInitRefusesTheDefaultOfAJournalMovedOffIt(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
-	for _, beside := range []string{"a copy", "another journal"} {
-		t.Run(beside, func(t *testing.T) {
+	setup := func(t *testing.T) (remote, d string) {
+		remote = newEmptyRemote(t)
+		a := filepath.Join(t.TempDir(), "a")
+		mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+		mustSync(t, options(a, "host-a"))
+		// d, a machine set up on main before the move, which init will repair.
+		d = filepath.Join(t.TempDir(), "d")
+		mustInit(t, InitOptions{URL: remote, Dir: d})
+		run(t, a, "push", "--quiet", "origin", "main:journal")
+		if res := mustInit(t, InitOptions{URL: remote, Dir: a, Branch: "journal"}); res.Branch != "journal" {
+			t.Fatalf("init --branch journal = %+v", res)
+		}
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+		mustSync(t, options(a, "host-a"))
+		w := filepath.Join(t.TempDir(), "w")
+		run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+		identify(t, w)
+		run(t, w, "rm", "--quiet", FleetFile, "host-a.jsonl")
+		write(t, filepath.Join(w, "README.md"), "the journal is on branch journal\n")
+		run(t, w, "add", "README.md")
+		run(t, w, "commit", "--quiet", "-m", "main is for people; the journal moved to branch journal")
+		run(t, w, "push", "--quiet", "origin", "main")
+		return remote, d
+	}
+	heads := func(t *testing.T, remote string) string {
+		return run(t, filepath.Dir(remote), "--git-dir", remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
+	}
+	for _, where := range []string{"a new directory", "a clone the repair would put on the default"} {
+		t.Run(where, func(t *testing.T) {
+			t.Parallel()
+			remote, d := setup(t)
+			dir := filepath.Join(t.TempDir(), "c")
+			if where != "a new directory" {
+				dir = d
+				run(t, d, "checkout", "--quiet", "--detach")
+				run(t, d, "branch", "--quiet", "-D", "main")
+				unrecord(t, d)
+			}
+			before := heads(t, remote)
+			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir})
+			if !errors.Is(err, ErrJournalElsewhere) || !strings.Contains(err.Error(), "holds one on journal") {
+				t.Errorf("init = %+v, %v; want ErrJournalElsewhere naming journal", res, err)
+			}
+			if after := heads(t, remote); after != before {
+				t.Errorf("init pushed:\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+// A side branch cut before main changed its fleetd.json takes main in, and the
+// file's deletion, and is pushed to main as a fast forward: main's first parents
+// are then the side branch's, and git cannot say which line was main's own. With
+// the salt changed on main meanwhile, whether the side branch merged main itself,
+// through a branch merged into it, or in the merge that deleted the file, init
+// puts nothing back, needing the salt, and a clone's sync takes the deletion in,
+// its records waiting for init. With only the file's other fields changed, the
+// salt is certain: the file is put back, and the clone keeps its copy meanwhile.
+func TestASideBranchThatMergedMainAndDeletedFleetdJsonPutsBackOnlyAnUnchangedSalt(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, tc := range []struct {
+		name, merged string
+		changed      bool
+	}{
+		{"the salt changed", "itself", true},
+		{"the salt changed, main merged through another branch", "through another branch", true},
+		{"the salt changed, the merge deleting the file", "in the deleting merge", true},
+		{"the salt kept", "itself", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			remote := newEmptyRemote(t)
 			a := filepath.Join(t.TempDir(), "a")
-			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s-old"})
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			mustSync(t, options(a, "host-a"))
 			w := filepath.Join(t.TempDir(), "w")
 			run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
 			identify(t, w)
-			if beside == "a copy" {
-				run(t, w, "push", "--quiet", "origin", "main:backup")
-			} else {
-				run(t, w, "checkout", "--quiet", "--orphan", "backup")
-				write(t, filepath.Join(w, FleetFile), "{\"salt\": \"another\"}\n")
-				run(t, w, "add", FleetFile)
-				run(t, w, "commit", "--quiet", "-m", "another journal")
-				run(t, w, "push", "--quiet", "origin", "backup")
-				run(t, w, "checkout", "--quiet", "main")
+			run(t, w, "branch", "cleanup")
+			edit := "{\"salt\": \"s-old\", \"about\": \"the fleet's salt; keep it\"}\n"
+			if tc.changed {
+				edit = "{\"salt\": \"s-new\"}\n"
 			}
-			run(t, w, "rm", "--quiet", FleetFile)
-			run(t, w, "commit", "--quiet", "-m", "tidy up")
+			write(t, filepath.Join(w, FleetFile), edit)
+			run(t, w, "commit", "--quiet", "-am", "main moves on")
 			run(t, w, "push", "--quiet", "origin", "main")
-			if res := mustSync(t, options(a, "host-a")); !res.FleetFileGone {
-				t.Fatalf("sync = %+v; want this clone's copy kept, and it said", res)
+			mustSync(t, options(a, "host-a"))
+			run(t, w, "checkout", "--quiet", "cleanup")
+			// mergeMain merges main into the branch checked out, settling the
+			// modify/delete conflict over fleetd.json by taking the deletion.
+			mergeMain := func() {
+				merge := exec.Command("git", "merge", "--no-edit", "main")
+				merge.Dir = w
+				_ = merge.Run()
+				run(t, w, "rm", "--quiet", FleetFile)
+				run(t, w, "commit", "--quiet", "--no-edit")
 			}
-			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
-			if beside == "a copy" && (err != nil || !res.PutBackFleetFile || res.Salt != "s" || res.Branch != "main") {
-				t.Fatalf("init = %+v, %v; want fleetd.json put back on main", res, err)
+			switch tc.merged {
+			case "itself":
+				run(t, w, "rm", "--quiet", FleetFile)
+				run(t, w, "commit", "--quiet", "-m", "cleanup: drop fleetd.json")
+				mergeMain()
+			case "through another branch":
+				run(t, w, "rm", "--quiet", FleetFile)
+				run(t, w, "commit", "--quiet", "-m", "cleanup: drop fleetd.json")
+				run(t, w, "checkout", "--quiet", "-b", "topic")
+				mergeMain()
+				run(t, w, "checkout", "--quiet", "cleanup")
+				write(t, filepath.Join(w, "README.md"), "about\n")
+				run(t, w, "add", "README.md")
+				run(t, w, "commit", "--quiet", "-m", "cleanup: a README")
+				run(t, w, "merge", "--quiet", "--no-edit", "topic")
+			case "in the deleting merge":
+				run(t, w, "merge", "--quiet", "--no-ff", "--no-commit", "main")
+				run(t, w, "rm", "--quiet", "-f", FleetFile)
+				run(t, w, "commit", "--quiet", "--no-edit")
 			}
-			if beside == "another journal" && !errors.Is(err, ErrJournalElsewhere) {
-				t.Fatalf("init = %+v, %v; want ErrJournalElsewhere", res, err)
+			run(t, w, "push", "--quiet", "origin", "cleanup:main")
+			res := mustSync(t, options(a, "host-a"))
+			_, statErr := os.Lstat(filepath.Join(a, FleetFile))
+			got, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
+			if tc.changed {
+				if res.FleetFileGone || statErr == nil {
+					t.Errorf("sync = %+v, fleetd.json %v; want the deletion taken in, no salt being certain", res, statErr)
+				}
+				if !errors.Is(err, ErrNeedSalt) || got.PutBackFleetFile {
+					t.Errorf("init = %+v, %v; want ErrNeedSalt, nothing put back", got, err)
+				}
+				return
+			}
+			if !res.FleetFileGone || statErr != nil {
+				t.Errorf("sync = %+v, fleetd.json %v; want this clone's copy kept, and it said", res, statErr)
+			}
+			if err != nil || !got.PutBackFleetFile || got.Salt != "s-old" {
+				t.Errorf("init = %+v, %v; want fleetd.json put back with the salt s-old", got, err)
 			}
 		})
 	}
