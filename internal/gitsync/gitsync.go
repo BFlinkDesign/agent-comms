@@ -10,7 +10,9 @@
 // file with changes that are not on the remote, such as another identity's
 // unpublished records on this machine, is left as it is and reported. Only
 // working-tree changes count: the clone is fleetd's, so an edit staged with
-// `git add` and not changed since is reset to the remote's version.
+// `git add` and not changed since is reset to the remote's version, and a file
+// that holds only the start of git's copy, such as one restored from an older
+// backup, is brought up to date.
 //
 // Because each host owns one file, the only way two hosts can collide is by
 // deriving the same host id. That is detected by content rather than by reading
@@ -31,6 +33,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // MaxAttempts bounds how many times a push rejected by another machine's
@@ -51,8 +55,9 @@ const staleLock = 10 * time.Minute
 var (
 	// ErrNotClone means the journal directory is not the root of a git clone.
 	ErrNotClone = errors.New("gitsync: journal directory is not the root of a git clone")
-	// ErrNoUpstream means the current branch tracks no remote branch.
-	ErrNoUpstream = errors.New("gitsync: current branch has no upstream")
+	// ErrNoUpstream means the clone's HEAD is not on a branch that follows one of
+	// origin's, so a sync has nowhere to publish.
+	ErrNoUpstream = errors.New("gitsync: the clone is not on the journal's branch")
 	// ErrSameFile means the remote copy of this host's file holds records this
 	// machine never wrote: another machine derives the same host id.
 	ErrSameFile = errors.New("gitsync: another machine wrote this host's journal file")
@@ -62,6 +67,18 @@ var (
 	ErrLocalCommits = errors.New("gitsync: the journal clone has commits that are not on the remote")
 	// ErrBusy means another sync of the same clone is running.
 	ErrBusy = errors.New("gitsync: another sync of this journal is running")
+	// ErrRejected means the remote declined this machine's push: a hook, branch
+	// protection or a ruleset. No later push gets past it until a person changes
+	// the remote.
+	ErrRejected = errors.New("gitsync: the remote refused this machine's push")
+	// ErrLookDue means init has yet to finish setting the clone up: a push of its
+	// made a branch the journal's, and it has yet to look whether another machine
+	// made another branch the journal's at the same time.
+	ErrLookDue = errors.New("gitsync: init has yet to finish setting the journal up")
+	// ErrNoFleetFile means the journal directory lacks the journal's FleetFile,
+	// which records take their salt from, while the journal's branch holds one or
+	// the clone has used one: what it would publish would go out under another id.
+	ErrNoFleetFile = errors.New("gitsync: the journal directory lacks the journal's fleetd.json")
 )
 
 // gitConfig is the configuration every git command runs with. core.fsmonitor
@@ -70,8 +87,12 @@ var (
 // value as no fsmonitor at all. Automatic gc and maintenance are off: a fetch
 // would otherwise start them inside the sync's deadline, and one killed partway
 // leaves lock files that fail every later sync until someone deletes them.
+// diff.autoRefreshIndex is on, as by default: with it off, `git diff` lists a file
+// whose content matches git's copy but whose index entry is out of date, and
+// fleetd would take it for one with records git does not have.
 var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
-	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false"}
+	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+	"-c", "diff.autoRefreshIndex=true"}
 
 // repositoryVariables are the variables git reads to find a repository, its
 // index or its objects, and a git command's own -c settings, as
@@ -180,6 +201,12 @@ func isExit(err error) bool {
 	return errors.As(err, &exit)
 }
 
+// exitedWith reports whether err is git exiting with code.
+func exitedWith(err error, code int) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == code
+}
+
 // Options says what to publish.
 type Options struct {
 	// Dir is the journal directory: the root of a clone of the journal repository.
@@ -188,6 +215,11 @@ type Options struct {
 	File string
 	// Message is the commit message for this host's new records.
 	Message string
+	// Prepare, when set, runs once the sync holds its lock and the clone has an
+	// index, before it reads anything else, given the sync's context, which bounds
+	// it, and the clone's git directory. Work on this machine's journal files that
+	// must not interleave with another sync goes there.
+	Prepare func(ctx context.Context, gitDir string)
 	// Run runs git; nil means Git.
 	Run Runner
 }
@@ -205,6 +237,11 @@ type Result struct {
 	// Kept lists files the remote changed that were left as they are, because
 	// this clone has changes to them that are not on the remote.
 	Kept []string `json:"kept,omitempty"`
+	// FleetFileGone is set when the remote deleted the FleetFile it held, which
+	// gives every machine of the fleet its id, and this clone's work tree holds
+	// one: it keeps that copy, so that this machine's records keep their id, till
+	// an init, on any machine, puts the file back.
+	FleetFileGone bool `json:"fleet_file_gone,omitempty"`
 	// Cleared lists git lock files, relative to the git directory, that were
 	// older than staleLock and removed: left by a git command that was killed.
 	Cleared []string `json:"cleared,omitempty"`
@@ -218,14 +255,16 @@ type git struct {
 	run Runner
 }
 
-// raw returns git's output untouched; line returns it with surrounding space trimmed.
+// raw returns git's output untouched; line returns it with the ASCII white space
+// around it trimmed, the newline git ends it with included. Other white space is
+// a name's own: a branch's name can end in a no-break space.
 func (g git) raw(stdin []byte, args ...string) (string, error) {
 	return g.run(g.ctx, g.dir, stdin, args...)
 }
 
 func (g git) line(args ...string) (string, error) {
 	out, err := g.raw(nil, args...)
-	return strings.TrimSpace(out), err
+	return strings.Trim(out, " \t\r\n"), err
 }
 
 // Sync publishes this host's complete records and brings in every other host's.
@@ -238,13 +277,16 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 
 	top, err := g.line("rev-parse", "--show-toplevel")
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		return res, fmt.Errorf("%w: %s (%v)", ErrNotClone, o.Dir, err)
 	}
-	if !sameDir(top, o.Dir) {
+	if !SameDir(top, o.Dir) {
 		return res, fmt.Errorf("%w: %s is inside the repository at %s; clone the journal repository into a directory of its own",
 			ErrNotClone, o.Dir, top)
 	}
-	if !sameDir(filepath.Dir(o.File), o.Dir) {
+	if !SameDir(filepath.Dir(o.File), o.Dir) {
 		return res, fmt.Errorf("gitsync: %s is not directly inside %s", o.File, o.Dir)
 	}
 	own := filepath.Base(o.File)
@@ -255,40 +297,135 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	}
 	defer unlock()
 	res.Cleared = clearStaleLocks(gitDir)
+	// An init stopped between moving its clone's git directory in and filling
+	// the index leaves a clone without one, where every file would look deleted
+	// and untracked. A sync that comes first fills it, as init would. A
+	// repository with no commit has no index either, and nothing to fill it from.
+	if _, err := os.Stat(filepath.Join(gitDir, "index")); errors.Is(err, os.ErrNotExist) {
+		if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
+			if _, err := g.line("read-tree", "HEAD"); err != nil {
+				return res, err
+			}
+		}
+	}
+	if o.Prepare != nil {
+		o.Prepare(ctx, gitDir)
+		if err := ctx.Err(); err != nil {
+			return res, fmt.Errorf("gitsync: preparing the sync: %w", err)
+		}
+	}
 
-	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-	if err != nil {
-		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
-	}
-	remote, branch, ok := strings.Cut(upstream, "/")
-	if !ok {
-		return res, fmt.Errorf("%w: upstream %q is not remote/branch", ErrNoUpstream, upstream)
-	}
-	localRef, err := g.line("symbolic-ref", "--quiet", "HEAD")
-	if err != nil {
-		return res, fmt.Errorf("gitsync: HEAD is detached in %s; check out %s", o.Dir, branch)
-	}
-	local, err := g.line("rev-parse", "--verify", "HEAD")
+	// The journal's branch, as init recorded it, decides what a clone off it is
+	// told, the upstream gone or not.
+	recorded, err := recordedBranch(gitDir)
 	if err != nil {
 		return res, err
 	}
-
+	// Nor while a look init made due is to come: till init has made it, the clone
+	// may lack the journal's fleetd.json, so this machine's records would go out
+	// under another id, or the journal may be on two branches. Records wait, and
+	// the sync after init files them under the fleet's id.
+	if _, err := os.Lstat(filepath.Join(gitDir, lookName)); err == nil {
+		return res, fmt.Errorf("%w: it has yet to look whether another machine made another branch the journal's at "+
+			"the same time; `fleetd init --dir \"%s\" <journal URL>` looks, and finishes", ErrLookDue, g.dir)
+	}
+	// A clone an init kept beside the journal directory, after a push of its that
+	// failed, notes such a look too: a person's own clone made there since waits
+	// for it as well.
+	if kept := keptLook(o.Dir); kept != "" {
+		return res, fmt.Errorf("%w: %s, which an init whose push failed kept beside it, notes that a look is due, "+
+			"whether another machine made another branch the journal's at the same time; `fleetd init --dir \"%s\" "+
+			"<journal URL>` looks", ErrLookDue, kept, g.dir)
+	}
+	// Only a branch of origin's: fleetd's clone follows the journal there, and a
+	// branch of another remote, or of the clone, would take this machine's records
+	// somewhere the fleet never looks. Full names, so that a branch here named
+	// origin/main never passes for origin's.
+	upstream, err := g.line("rev-parse", "--symbolic-full-name", "@{u}")
+	if err != nil && ctx.Err() == nil {
+		// A branch of origin's that an earlier sync found gone may be back, pushed
+		// again after a mistaken deletion, and only a fetch brings it back here.
+		again, ferr := refetchGone(g)
+		if ferr != nil {
+			return res, ferr
+		}
+		if again {
+			upstream, err = g.line("rev-parse", "--symbolic-full-name", "@{u}")
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
+		return res, noUpstream(g, recorded)
+	}
+	branch, ok := strings.CutPrefix(upstream, "refs/remotes/origin/")
+	if !ok {
+		return res, noUpstream(g, recorded)
+	}
+	// Nor another of origin's branches than the one init set the clone up on, as
+	// after a person's git switch, or a repair cut short: init puts it back.
+	if recorded != "" && recorded != branch {
+		return res, offRecord(g, branch, recorded)
+	}
+	remote := "origin"
+	upstream = remote + "/" + branch
+	localRef, err := g.line("symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
+		return res, noUpstream(g, recorded)
+	}
+	// A branch with no commit yet, as a plain clone of the repository made while
+	// it was empty has once it fetches, follows a branch that resolves.
+	local, err := g.line("rev-parse", "--verify", "HEAD")
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
+		return res, noUpstream(g, recorded)
+	}
 	ssh := batchSSH(g)
 	var tip string
 	for res.Attempts = 1; ; res.Attempts++ {
-		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", remote)...); err != nil {
+		if err := fetchOrigin(g); err != nil {
 			return res, err
 		}
 		remoteTip, err := g.line("rev-parse", "--verify", "refs/remotes/"+upstream)
 		if err != nil {
-			return res, err
+			if ctx.Err() != nil {
+				return res, err
+			}
+			return res, goneError(g, localRef, branch)
+		}
+		// Nor while the journal directory lacks the journal's FleetFile: deleted,
+		// not yet written by an init stopped short, or never there, as in a clone
+		// set up before the journal had one. This machine's records then go under
+		// another id, for good once published. They wait for init, which puts the
+		// file in place, after which a sync files them under the fleet's.
+		if _, err := os.Lstat(filepath.Join(o.Dir, FleetFile)); errors.Is(err, os.ErrNotExist) {
+			// A git that cannot say stops the sync too: the records would go out
+			// for good, and the next sync asks again.
+			entry, err := g.line("ls-tree", remoteTip, "--", FleetFile)
+			if err != nil {
+				return res, err
+			}
+			if entry != "" {
+				return res, fmt.Errorf("%w, which origin's %s holds, so this machine's records would go out under "+
+					"another id; they wait, and `fleetd init --dir \"%s\" <journal URL>` puts it in place, after which "+
+					"a sync files them under the fleet's", ErrNoFleetFile, branch, g.dir)
+			}
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
+			if ctx.Err() != nil {
+				return res, err
+			}
 			return res, fmt.Errorf("%w: %s. If they are not wanted, or the remote was rewritten, "+
 				"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
 				"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
 		}
-		commit, published, err := snapshotCommit(g, remoteTip, own, o.File, o.Message)
+		commit, published, err := snapshotCommit(g, remoteTip, branch, own, o.File, o.Message)
 		if err != nil {
 			return res, err
 		}
@@ -296,13 +433,20 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			tip = remoteTip
 			break
 		}
-		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", remote, commit+":refs/heads/"+branch)...)
+		// Onto the tip this sync fetched and nothing else: a branch the remote has
+		// renamed or deleted since, or moved on, refuses it, as a race lost.
+		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "--force-with-lease=refs/heads/"+branch+":"+remoteTip,
+			remote, commit+":refs/heads/"+branch)...)
 		if err == nil {
 			tip, res.Published = commit, published
 			break
 		}
 		// Only a push that lost a race to another machine is retried; anything
 		// else, such as a refused credential, is reported as it is.
+		if refused(out) {
+			return res, fmt.Errorf("%w (it may protect %s from direct pushes; fleetd needs to push to it): %w",
+				ErrRejected, branch, err)
+		}
 		if !lostRace(out) || res.Attempts >= MaxAttempts {
 			return res, err
 		}
@@ -316,7 +460,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	if res.Published > 0 {
 		res.Received-- // this host's own commit
 	}
-	if res.Kept, err = bringIn(g, localRef, local, tip, own); err != nil {
+	if res.Kept, res.FleetFileGone, err = bringIn(g, localRef, local, tip, own); err != nil {
 		return res, err
 	}
 	res.Head = tip
@@ -374,6 +518,21 @@ func lostRace(out string) bool {
 	return false
 }
 
+// refused reports whether the remote declined a push for good: a hook, branch
+// protection or a ruleset said no ("pre-receive hook declined", "protected branch
+// hook declined", "push declined due to ..."). A race, a credential that cannot
+// push, or a failure on the remote's side, such as its storage, is not refused:
+// the next push can get past it.
+func refused(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		_, reason, ok := strings.Cut(line, "\t[remote rejected] (")
+		if ok && strings.HasPrefix(line, "!") && strings.Contains(reason, "declined") {
+			return true
+		}
+	}
+	return false
+}
+
 // batchSSH returns the arguments that keep ssh from waiting for a person, or none
 // when the user has chosen an ssh command of their own (a deploy key, plink): that
 // choice is theirs, and git would otherwise let this one override it.
@@ -388,10 +547,11 @@ func batchSSH(g git) []string {
 }
 
 // snapshotCommit builds, without touching the working tree or the index, a commit
-// on top of remoteTip whose only change is this host's file as of its last
-// complete line. It returns "" when the remote already has every complete record.
-func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, error) {
-	data, err := os.ReadFile(file)
+// on top of remoteTip, origin's branch, whose only change is this host's file as
+// of its last complete line. It returns "" when the remote already has every
+// complete record.
+func snapshotCommit(g git, remoteTip, branch, own, file, message string) (string, int, error) {
+	data, err := journal.ReadRegular(file)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", 0, nil
 	}
@@ -415,18 +575,20 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		published = []byte(out)
 	}
 	if !bytes.HasPrefix(complete, published) {
-		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine never wrote; give each machine a distinct identity (see `fleetd host`)",
-			ErrSameFile, own)
+		dir, err := filepath.Abs(filepath.Dir(file))
+		if err != nil {
+			dir = filepath.Dir(file)
+		}
+		return "", 0, fmt.Errorf("%w: the remote %s holds records this machine's copy lacks. If this machine's journal "+
+			"directory was set up again, or restored from an older copy, `fleetd init --reclaim --dir \"%s\" <journal URL>` "+
+			"puts them back and publishes this machine's newer records after them; otherwise another machine has this "+
+			"machine's id, and each needs a distinct one (see `fleetd host`)", ErrSameFile, own, dir)
 	}
 	fresh := bytes.Count(complete, []byte{'\n'}) - bytes.Count(published, []byte{'\n'})
 	if fresh == 0 {
 		return "", 0, nil
 	}
 
-	blob, err := g.raw(complete, "hash-object", "-w", "--stdin")
-	if err != nil {
-		return "", 0, err
-	}
 	// The new tree is the remote tip's top-level tree with this host's entry
 	// replaced, assembled with ls-tree and mktree, so no index is involved.
 	listing, err := g.raw(nil, "ls-tree", "-z", remoteTip)
@@ -434,10 +596,45 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		return "", 0, err
 	}
 	var entries []string
+	top := map[string]string{}
 	for _, entry := range strings.Split(listing, "\x00") {
-		if _, path, ok := strings.Cut(entry, "\t"); ok && path != own {
+		meta, path, ok := strings.Cut(entry, "\t")
+		if !ok {
+			continue
+		}
+		if fields := strings.Fields(meta); len(fields) == 3 {
+			top[path] = fields[1]
+		}
+		if path != own {
 			entries = append(entries, entry)
 		}
+	}
+	// Nor onto a branch that holds no journal while another of origin's branches
+	// holds one, as a default branch cleaned down to a README once the fleet
+	// moved its journal does: published there, these records would start a
+	// second journal, which the fleetd.json init puts back for them makes whole.
+	// Only such a branch costs a look at the others.
+	if !holdsJournal(top) {
+		holding, err := journalsBut(g, branch)
+		if err != nil {
+			return "", 0, err
+		}
+		if len(holding) > 0 {
+			on := holding[0]
+			if len(holding) > 1 {
+				on = "each of " + strings.Join(holding, ", ")
+			}
+			return "", 0, fmt.Errorf("%w: origin's %s holds no journal, but %s holds one, where the fleet publishes; "+
+				"this machine's records would start a second journal on %s, so they wait. `fleetd init --dir \"%s\" "+
+				"--branch <branch> <journal URL>` puts this clone on the journal's branch", ErrJournalElsewhere,
+				branch, on, branch, g.dir)
+		}
+	}
+	// Only now is the file written into the object store: a sync refused above
+	// leaves no copy of it behind, which nothing would prune while it lasts.
+	blob, err := g.raw(complete, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", 0, err
 	}
 	entries = append(entries, "100644 blob "+strings.TrimSpace(blob)+"\t"+own)
 	tree, err := g.raw([]byte(strings.Join(entries, "\x00")+"\x00"), "mktree", "-z")
@@ -471,22 +668,50 @@ func blobAt(g git, commit, name string) (string, bool, error) {
 // it is returned, left as it is. Only the working tree is compared with the
 // index, so an edit staged with `git add` and not changed since is reset to tip,
 // and such a new file that tip lacks is removed; git keeps their content until it
-// prunes unreachable objects.
-func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
+// prunes unreachable objects. FleetFile, which gives every record here its salt,
+// stays when the remote deleted it outright, as a push made by mistake can, the
+// last it held being one init puts back, and the work tree holds it; gone says
+// so: without it this machine's records would go out under another id until an
+// init put it back. One the remote turned into a directory is brought in, and
+// the salt it last held is used, as for any FleetFile that cannot be read.
+func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool, err error) {
 	if _, err := g.line("update-ref", "-m", "fleetd sync", localRef, tip, local); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Comparing the index, rather than the old commit, with tip also repairs
 	// files a sync interrupted after this point left behind.
 	diff, err := g.raw(nil, "diff-index", "--cached", "-z", "--name-status", "--no-renames", tip)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var update, remove, paths []string
 	fields := strings.Split(diff, "\x00")
 	for i := 0; i+1 < len(fields); i += 2 {
+		if fields[i+1] == FleetFile {
+			gone = fields[i] == "A"
+		}
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
+		if strings.HasPrefix(fields[i+1], FleetFile+"/") {
+			gone = false
+		}
+	}
+	// A copy is kept only of one init puts back, the last the remote held, and
+	// only where the work tree holds it: a new one staged here goes, as any staged
+	// new file does, and so does the index entry of one this work tree no longer
+	// has.
+	if gone {
+		if info, err := os.Lstat(filepath.Join(g.dir, FleetFile)); err != nil || !info.Mode().IsRegular() {
+			gone = false
+		} else if _, _, putBack, err := deletedFleet(g, tip); err != nil {
+			return nil, false, err
+		} else {
+			gone = putBack
+		}
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
 		status, path := fields[i], fields[i+1]
-		if path == own {
+		if path == own || (gone && path == FleetFile) {
 			continue
 		}
 		paths = append(paths, path)
@@ -499,11 +724,17 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			update = append(update, path)
 		}
 	}
-	var kept []string
 	if len(paths) > 0 {
 		changed, err := locallyChanged(g, paths)
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		behind, err := behindIndex(g, mapKeys(changed))
+		if err != nil {
+			return nil, false, err
+		}
+		for path := range behind {
+			delete(changed, path)
 		}
 		keep := func(list []string) []string {
 			var out []string
@@ -536,24 +767,44 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 	// before the file is written.
 	if len(remove) > 0 {
 		if _, err := g.raw(nulList(remove), "checkout", "--no-overlay", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if len(update) > 0 {
 		if _, err := g.raw(nulList(update), "checkout", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-			return nil, err
+			return nil, false, err
+		}
+	}
+	// A file that holds only the start of git's own copy, such as one restored
+	// from an older backup, is brought up to date even when the remote did not
+	// change it: it has no change of its own to keep.
+	modified, err := g.raw(nil, "diff", "--name-only", "-z", "--no-renames")
+	if err != nil {
+		return nil, false, err
+	}
+	var candidates []string
+	for _, path := range strings.Split(modified, "\x00") {
+		if path != "" && path != own {
+			candidates = append(candidates, path)
+		}
+	}
+	if stale, err := behindIndex(g, candidates); err != nil {
+		return nil, false, err
+	} else if len(stale) > 0 {
+		if _, err := g.raw(nulList(mapKeys(stale)), "checkout-index", "-f", "-z", "--stdin"); err != nil {
+			return nil, false, err
 		}
 	}
 	// Keep this host's index entry equal to the remote's, so `git status` shows
 	// exactly the records not yet published.
 	if blob, ok, err := blobAt(g, tip, own); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if ok {
 		if _, err := g.line("update-index", "--add", "--cacheinfo", "100644,"+blob+","+own); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return kept, nil
+	return kept, gone, nil
 }
 
 // locallyChanged reports which paths hold content the index does not: a file
@@ -573,6 +824,267 @@ func locallyChanged(g git, paths []string) (map[string]bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+// behindIndex returns, of paths, the regular files whose content is a strict
+// start of the index's copy, line endings aside: files with nothing of their own
+// that git's copy lacks. A file that cannot be read, or is not a regular file, is
+// not among them. Nor is one more than twice the size of the index's copy: a
+// strict start of it is shorter, and CRLF line endings at most double that, so
+// such a file is never read.
+func behindIndex(g git, paths []string) (map[string]bool, error) {
+	behind := map[string]bool{}
+	for _, path := range paths {
+		size, err := g.line("cat-file", "-s", ":"+path)
+		if err != nil {
+			continue
+		}
+		n, err := strconv.ParseInt(size, 10, 64)
+		if err != nil {
+			continue
+		}
+		data, err := readRegular(filepath.Join(g.dir, path), 2*n)
+		if err != nil {
+			continue
+		}
+		indexed, err := g.raw(nil, "cat-file", "blob", ":"+path)
+		if err != nil {
+			continue
+		}
+		have := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+		if len(have) < len(indexed) && strings.HasPrefix(indexed, string(have)) {
+			behind[path] = true
+		}
+	}
+	return behind, nil
+}
+
+// noUpstream is the error for a clone whose HEAD is not on a branch that follows
+// one of origin's: detached, on a branch with no commit, or on one that follows
+// nothing, a branch of the clone or another remote's. fleetd init puts such a
+// clone back on the journal's branch, moving refs only and never a file, so
+// running it is the advice: the git commands that move a branch would refuse, or
+// would overwrite this machine's records, when the work tree has records the
+// branch's files lack. A current branch that follows one of origin's the clone no
+// longer has is told so instead: the remote may have deleted or renamed it, and
+// init would not know where the journal went.
+func noUpstream(g git, recorded string) error {
+	head, err := g.line("symbolic-ref", "--quiet", "HEAD")
+	if err != nil && g.ctx.Err() != nil {
+		return err
+	}
+	if err == nil {
+		theirs, err := goneUpstream(g, head)
+		if err != nil {
+			return err
+		}
+		// A gone branch the record does not name, a stray a person switched to,
+		// is not the journal's: init puts the clone back on the recorded one.
+		if theirs != "" && recorded != "" && recorded != theirs {
+			return offRecord(g, theirs, recorded)
+		}
+		if theirs != "" {
+			return goneError(g, head, theirs)
+		}
+	}
+	return fmt.Errorf("%w: `fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, "+
+		"or says what stops it", ErrNoUpstream, g.dir)
+}
+
+// offRecord says what to do about a clone that follows origin's branch, while
+// the journal is on recorded, the branch init set the clone up on.
+func offRecord(g git, branch, recorded string) error {
+	return fmt.Errorf("%w: it follows origin/%s, while the journal is on %s, the branch init set it up on: "+
+		"`fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, or says what "+
+		"stops it; if the journal has moved, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` puts it "+
+		"on <branch>", ErrNoUpstream, branch, recorded, g.dir, g.dir)
+}
+
+// goneUpstream names the branch of origin's that the branch head follows when
+// this clone no longer has it, else "". The branch is looked up by its full name,
+// never as a pattern, which would take zz/a for zz.
+func goneUpstream(g git, head string) (string, error) {
+	ups, err := upstreams(g)
+	if err != nil {
+		return "", err
+	}
+	theirs, ok := strings.CutPrefix(ups[strings.TrimPrefix(head, "refs/heads/")], "refs/remotes/origin/")
+	if !ok {
+		return "", nil
+	}
+	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+theirs); err == nil {
+		return "", nil
+	}
+	return theirs, g.ctx.Err()
+}
+
+// goneError says what to do about a branch that follows one of origin's the
+// clone no longer has. Branch names come from the remote, so none is put into a
+// command a person might paste. Only a person knows where the journal went after
+// a rename, or a deletion on purpose, so the way on is init told the branch.
+func goneError(g git, head, theirs string) error {
+	back, err := pushBack(g, theirs)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
+		"it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` "+
+		"puts the clone on <branch>, the one the journal is on now; if it was deleted by mistake, push it back from "+
+		"the machine that synced last, as fleetd sync there says; %s; every machine's next sync then takes it up again",
+		ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs, g.dir, back)
+}
+
+// pushBack says how this clone would push theirs, a branch of origin's the remote
+// no longer has, back, were it the machine that synced last: from its own copy
+// of the branch, never from HEAD, which a person may have moved to a stale copy
+// or off the journal altogether.
+func pushBack(g git, theirs string) (string, error) {
+	local, held, err := copyOf(g, theirs)
+	switch {
+	case err != nil:
+		return "", err
+	case local != "":
+		return fmt.Sprintf("if that is this one, `git -C \"%s\" push origin refs/heads/<local>:refs/heads/<branch>`, "+
+			"with %s for <local> and %s for <branch>, pushes this clone's copy", g.dir, local, theirs), nil
+	case len(held) > 0:
+		return fmt.Sprintf("if that is this one, its branches that follow it, %s, have moved apart: `git -C \"%s\" "+
+			"push origin refs/heads/<local>:refs/heads/<branch>`, with the one holding the journal's latest records "+
+			"for <local> and %s for <branch>, pushes it", strings.Join(held, ", "), g.dir, theirs), nil
+	}
+	return "no branch here follows it, so this clone has no copy of it to push", nil
+}
+
+// copyOf names this clone's copy of theirs, a branch of origin's the clone no
+// longer has: of the branches here that follow it, held, the one whose last
+// commit holds every other's, as the one each sync moved on does; of several
+// at that commit, the one named like it. local is "" when none follows it, and
+// when they have moved apart, none holding all the others' commits.
+func copyOf(g git, theirs string) (local string, held []string, err error) {
+	out, err := g.line("for-each-ref", "--format=%(objectname) %(upstream) %(refname)", "refs/heads/")
+	if err != nil {
+		return "", nil, err
+	}
+	tips, commits := map[string]string{}, map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		commit, rest, _ := strings.Cut(line, " ")
+		upstream, ref, _ := strings.Cut(rest, " ")
+		if name, ok := strings.CutPrefix(ref, "refs/heads/"); ok && upstream == "refs/remotes/origin/"+theirs {
+			tips[name], commits[commit] = commit, true
+			held = append(held, name)
+		}
+	}
+	slices.Sort(held)
+	newest := ""
+	switch {
+	case len(commits) == 1:
+		newest = tips[held[0]]
+	case len(commits) > 1:
+		out, err := g.line(append([]string{"merge-base", "--independent"}, mapKeys(commits)...)...)
+		if err != nil {
+			return "", nil, err
+		}
+		if heads := strings.Fields(out); len(heads) == 1 {
+			newest = heads[0]
+		}
+	}
+	for _, name := range held {
+		if tips[name] == newest && (local == "" || name == theirs) {
+			local = name
+		}
+	}
+	return local, held, nil
+}
+
+// branchName is the file, in a clone's git directory, that records the journal's
+// branch: the one init set the clone up on, which it puts the clone back on, and
+// the one every sync checks the clone follows. It is never committed.
+const branchName = "fleetd-branch"
+
+// RecordedBranch is the journal's branch as init last set up the clone whose git
+// directory is gitDir, or "" when init never recorded one.
+func RecordedBranch(gitDir string) (string, error) {
+	return recordedBranch(gitDir)
+}
+
+// recordedBranch is the journal's branch as init last set up the clone whose git
+// directory is gitDir, or "" when init never recorded one, as for a clone set up
+// before it did, or the record is empty. A record that cannot be read, a
+// directory or a FIFO put there, say, is an error, never taken for none, and so
+// is one that holds anything but a branch name and the white space and byte
+// order mark an editor may add: UTF-16, say, or two lines.
+func recordedBranch(gitDir string) (string, error) {
+	path := filepath.Join(gitDir, branchName)
+	data, err := readRegular(path, 4096)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err == nil {
+		name := strings.Trim(strings.TrimPrefix(string(data), "\ufeff"), " \t\r\n")
+		if name == "" || branchLike(name) {
+			return name, nil
+		}
+		err = errors.New("it holds no branch name")
+	}
+	return "", fmt.Errorf("gitsync: %s, init's record of the journal's branch, cannot be read (%v); delete it, then "+
+		"run fleetd init again", path, err)
+}
+
+// branchLike reports whether git takes name for a branch's, as git
+// check-ref-format does refs/heads/name: no control character, space, ~, ^, :,
+// ?, *, [ or \, no .. or @{, no empty path component, none that starts with a dot
+// or ends with .lock, and no dot at the end.
+func branchLike(name string) bool {
+	if strings.HasSuffix(name, ".") || strings.Contains(name, "..") || strings.Contains(name, "@{") {
+		return false
+	}
+	for _, c := range []byte(name) {
+		if c < 0x20 || c == 0x7f || strings.IndexByte(" ~^:?*[\\", c) >= 0 {
+			return false
+		}
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part[0] == '.' || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+// refetchGone fetches when HEAD's branch follows one of origin's that this clone
+// no longer has, and reports whether it did: a branch pruned once is never
+// looked at again otherwise, even after a person pushes it back.
+func refetchGone(g git) (bool, error) {
+	head, err := g.line("symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return false, g.ctx.Err()
+	}
+	theirs, err := goneUpstream(g, head)
+	if err != nil || theirs == "" {
+		return false, err
+	}
+	return true, fetchOrigin(g)
+}
+
+// fetchOrigin brings in every branch of origin's, as a remote-tracking branch of
+// the same name, whatever the clone's own refspec says: one made with
+// --single-branch names one branch, and a fetch of it fails outright once the
+// remote has deleted or renamed that branch. It prunes, so that a branch the
+// remote deleted or renamed goes from the clone too, never to be pushed back; and
+// since it names its refspec, git leaves the clone's tags alone even where a
+// person's configuration says fetch.pruneTags.
+func fetchOrigin(g git) error {
+	_, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "--prune", "origin",
+		"+refs/heads/*:refs/remotes/origin/*")...)
+	return err
+}
+
+func mapKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // nests reports whether path is a directory above one of others, or inside one.
@@ -659,9 +1171,46 @@ func clearStaleLocks(gitDir string) []string {
 	return cleared
 }
 
-// sameDir reports whether two paths name the same directory, after resolving
+// GitDir is the git directory of the clone whose top is dir, with no git
+// process: dir/.git, or the directory a .git file there names (gitdir: and a
+// path, relative to dir's real path unless absolute, so that a leading .. from
+// a linked journal directory is its real parent, as git takes it), as a clone
+// made with --separate-git-dir has. A path climbing out, with .., of a link it
+// names itself is read as written, where git would follow the link first; git
+// writes no such path. ok is false when there is neither.
+func GitDir(dir string) (gitDir string, ok bool) {
+	path := filepath.Join(dir, ".git")
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if info.IsDir() {
+		return path, true
+	}
+	data, err := readRegular(path, 4096)
+	if err != nil {
+		return "", false
+	}
+	target, ok := strings.CutPrefix(strings.TrimRight(string(data), "\r\n"), "gitdir: ")
+	if !ok || target == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		base := dir
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			base = resolved
+		}
+		target = filepath.Join(base, target)
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() {
+		return "", false
+	}
+	return filepath.Clean(target), true
+}
+
+// SameDir reports whether two paths name the same directory, after resolving
 // symbolic links; on Windows letter case does not matter.
-func sameDir(a, b string) bool {
+func SameDir(a, b string) bool {
 	ra, errA := filepath.EvalSymlinks(a)
 	rb, errB := filepath.EvalSymlinks(b)
 	if errA != nil || errB != nil {

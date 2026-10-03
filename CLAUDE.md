@@ -112,18 +112,29 @@ directly in `tests/test_mcp_server.py` without subprocess overhead. Available to
 | `hive_route` | Score candidate agents for a task (capability × reputation / cost) |
 
 **fleetd** (Go: `cmd/fleetd`, `internal/{cell,hostid,journal,gitsync}`) is a separate static binary
-that records which machine did the work. Its spec is the "fleetd — the native writer" section of
+that records which machine did the work. `fleetd init` sets a machine's journal up once. The fleet's
+salt lives in the journal's committed `fleetd.json`; a `--salt` that contradicts it is an error, a
+`FLEET_SALT` that does is overridden with a warning, and a sync files records written under another
+salt under the fleet's id. Neither init nor re-filing deletes a record: re-filing moves another identity's file into
+`.git/fleetd-pre-init/`, and only `fleetd init --reclaim` moves this machine's own file there, to put the remote's copy
+back in front of it. Its spec is the "fleetd — the native writer" section of
 `AGENTS.md` plus the `internal/gitsync` package comment. Sync rules (read `gitsync_test.go` before
 changing any of them):
 
-- Sync never writes this host's own journal file (`fleetd record` may be appending to it) and never
+- Sync never rewrites this host's own journal file (`fleetd record` may be appending to it) and never
   rebases, merges or stashes: it commits a snapshot cut at the last newline onto the remote tip with
-  plumbing, pushes that commit, and only then brings in the other hosts' files.
+  plumbing, pushes that commit, and only then brings in the other hosts' files. What runs under its
+  lock first (`Options.Prepare`: fleetd's re-filing) only appends to that file, or puts it back as the
+  remote has it when it is missing; only `fleetd init --reclaim` may move it aside, to put the published
+  copy back.
 - git removes and writes the other files, never Go's `os` package, so a remote symlink cannot lead a
   sync outside the clone. Removals go first. A file with unstaged changes, or an untracked or ignored
-  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. The
+  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path; a
+  file holding only the start of git's copy has nothing of its own and is updated. The
   clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
-  staged new file, even one the remote never had. `git fsck --lost-found` recovers such content
+  staged new file, even one the remote never had. The one deletion sync does not bring in is of a
+  `fleetd.json` init can put back, while the work tree holds one (`Result.FleetFileGone`): it gives
+  the machine its id. `git fsck --lost-found` recovers such content
   until the gc a sync runs prunes it, which it may as soon as the content is two weeks old.
 - Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push

@@ -5,9 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
 
 // exec drives the command the way a shell does, and returns what a user would
@@ -21,6 +26,7 @@ func exec(t *testing.T, args ...string) (stdout, stderr string, err error) {
 }
 
 func TestNoArgsPrintsUsageAndFails(t *testing.T) {
+	t.Parallel()
 	_, stderr, err := exec(t)
 	if err == nil {
 		t.Error("invoking with no command succeeded; it should explain itself and fail")
@@ -31,6 +37,7 @@ func TestNoArgsPrintsUsageAndFails(t *testing.T) {
 }
 
 func TestUnknownCommandNamesItAndShowsUsage(t *testing.T) {
+	t.Parallel()
 	_, stderr, err := exec(t, "wat")
 	if err == nil || !strings.Contains(err.Error(), `"wat"`) {
 		t.Errorf("err = %v, want it to quote the unknown command", err)
@@ -41,6 +48,7 @@ func TestUnknownCommandNamesItAndShowsUsage(t *testing.T) {
 }
 
 func TestHostJSONCarriesTheHonestAttributionFields(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "host", "--json", "--salt", "t")
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +99,7 @@ func TestSaltFromEnvironmentIsUsedAndSeparatesIdentity(t *testing.T) {
 }
 
 func TestRecordRequiresAType(t *testing.T) {
+	t.Parallel()
 	_, _, err := exec(t, "record", "--dir", t.TempDir(), "--salt", "t", "--note", "x")
 	if err == nil || !strings.Contains(err.Error(), "--type") {
 		t.Errorf("err = %v, want a complaint that --type is required", err)
@@ -98,6 +107,7 @@ func TestRecordRequiresAType(t *testing.T) {
 }
 
 func TestRecordRejectsABadTimestamp(t *testing.T) {
+	t.Parallel()
 	_, _, err := exec(t, "record", "--dir", t.TempDir(), "--salt", "t",
 		"--type", "note", "--at", "last tuesday")
 	if err == nil || !strings.Contains(err.Error(), "RFC3339") {
@@ -106,6 +116,7 @@ func TestRecordRejectsABadTimestamp(t *testing.T) {
 }
 
 func TestWhereOnAnEmptyStoreSaysSoAndSucceeds(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	stdout, _, err := exec(t, "where", "--dir", dir)
 	if err != nil {
@@ -117,6 +128,7 @@ func TestWhereOnAnEmptyStoreSaysSoAndSucceeds(t *testing.T) {
 }
 
 func TestRecordThenWhereAnswersTheQuestion(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "handoff",
 		"--repo", "ai-workspace", "--branch", "main", "--agent", "claude/cloud",
@@ -153,6 +165,7 @@ func TestRecordThenWhereAnswersTheQuestion(t *testing.T) {
 }
 
 func TestWhereSeparatesMachinesAndOrdersNewestFirst(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Two salts give two distinct host identities, which is how a second machine
 	// appears without needing a second machine.
@@ -185,6 +198,7 @@ func TestWhereSeparatesMachinesAndOrdersNewestFirst(t *testing.T) {
 }
 
 func TestRecordedLineCarriesHostAttribution(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	stdout, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
 		"--at", "2026-09-14T13:00:00Z", "--note", "n", "--json")
@@ -218,6 +232,7 @@ func TestRecordedLineCarriesHostAttribution(t *testing.T) {
 }
 
 func TestMachinesAreOrderedByInstantNotByStringCompare(t *testing.T) {
+	t.Parallel()
 	// The wrong answer this pins: lexical comparison of RFC3339 is only correct
 	// when every timestamp is UTC "Z". Machine A at 10:00+05:00 is 05:00Z, which
 	// is EARLIER than machine B at 06:00Z, but sorts later as a string. That
@@ -252,6 +267,7 @@ func TestMachinesAreOrderedByInstantNotByStringCompare(t *testing.T) {
 }
 
 func TestTwoRecordsInTheSameSecondAreDistinct(t *testing.T) {
+	t.Parallel()
 	// At whole-second resolution two successive records produced byte-identical
 	// cells with the same content-derived id. Since a reader is documented to
 	// collapse colliding ids, one of two genuinely distinct events would simply
@@ -278,6 +294,7 @@ func TestTwoRecordsInTheSameSecondAreDistinct(t *testing.T) {
 }
 
 func TestOSAccountIsNotPublishedUnlessAskedFor(t *testing.T) {
+	t.Parallel()
 	// internal/hostid deliberately publishes only a digest of the machine
 	// identifier. Emitting the OS account in the same record would undo that: on
 	// a domain-joined Windows host user.Current().Username is DOMAIN\account, so
@@ -304,6 +321,7 @@ func TestOSAccountIsNotPublishedUnlessAskedFor(t *testing.T) {
 }
 
 func TestLimitAppliesToJSONAsWellAsTheTerminal(t *testing.T) {
+	t.Parallel()
 	// --limit used to be read only by the human branch, so a program asking for
 	// the last N entries silently received one and could not tell.
 	dir := t.TempDir()
@@ -336,6 +354,7 @@ func TestLimitAppliesToJSONAsWellAsTheTerminal(t *testing.T) {
 }
 
 func TestOutOfOrderTimestampsAreFlaggedNotHidden(t *testing.T) {
+	t.Parallel()
 	// Append order is what gets reported, because it is what actually happened
 	// and does not depend on a clock. When a host's own timestamps disagree with
 	// that order, presenting the file-order-last entry as "last" is still correct
@@ -376,6 +395,7 @@ func TestOutOfOrderTimestampsAreFlaggedNotHidden(t *testing.T) {
 }
 
 func TestMonotonicTimestampsAreNotFlagged(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	for i, ts := range []string{"2026-09-22T05:00:00Z", "2026-09-22T06:00:00Z"} {
 		if _, _, err := exec(t, "record", "--dir", dir, "--salt", "t", "--type", "note",
@@ -397,12 +417,14 @@ func TestMonotonicTimestampsAreNotFlagged(t *testing.T) {
 }
 
 func TestLimitBelowOneIsRejected(t *testing.T) {
+	t.Parallel()
 	if _, _, err := exec(t, "where", "--dir", t.TempDir(), "--limit", "0"); err == nil {
 		t.Error("--limit 0 was accepted")
 	}
 }
 
 func TestMistypedDirIsAnErrorNotAnEmptyAnswer(t *testing.T) {
+	t.Parallel()
 	missing := filepath.Join(t.TempDir(), "channles", "journal")
 	stdout, _, err := exec(t, "where", "--dir", missing)
 	if err == nil {
@@ -437,6 +459,7 @@ func readJournal(t *testing.T, dir string) string {
 }
 
 func TestPluralReadsLikeEnglish(t *testing.T) {
+	t.Parallel()
 	for n, want := range map[int]string{0: "0 records", 1: "1 record", 2: "2 records"} {
 		if got := plural(n, "record"); got != want {
 			t.Errorf("plural(%d) = %q, want %q", n, got, want)
@@ -445,6 +468,7 @@ func TestPluralReadsLikeEnglish(t *testing.T) {
 }
 
 func TestVersionNamesTheBuildAndPlatform(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "version")
 	if err != nil {
 		t.Fatalf("version failed: %v", err)
@@ -489,6 +513,7 @@ func TestTheJournalDefaultsToTheHomeDirectoryNotTheCurrentOne(t *testing.T) {
 // --json is for programs; an empty journal is an empty list to them, not a
 // sentence.
 func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
+	t.Parallel()
 	stdout, _, err := exec(t, "where", "--json", "--dir", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -496,5 +521,138 @@ func TestWhereJSONOnAnEmptyStoreIsAnEmptyList(t *testing.T) {
 	var entries []any
 	if jerr := json.Unmarshal([]byte(stdout), &entries); jerr != nil || entries == nil || len(entries) != 0 {
 		t.Fatalf("stdout = %q, want an empty JSON list (%v)", stdout, jerr)
+	}
+}
+
+// A salt is used exactly as given: one kept with a space trimmed off would give
+// the same machine a second id when fleetd.json is invalid.
+func TestTheCachedSaltIsKeptExactly(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, salt := range []string{" padded ", "tab\t", "plain"} {
+		cacheSalt(dir, salt)
+		if got := cachedSalt(dir); got != salt {
+			t.Errorf("cached %q, read back %q", salt, got)
+		}
+	}
+}
+
+// A journal whose .git is a file naming its git directory elsewhere keeps the
+// salt cache, and the note of a salt the journal no longer uses, in that
+// directory, where sync reads the note.
+func TestTheSaltNotesOfAJournalWhoseGitDirectoryIsElsewhereAreKeptThere(t *testing.T) {
+	t.Parallel()
+	dir, gitDir := t.TempDir(), filepath.Join(t.TempDir(), "journal.git")
+	if err := os.Mkdir(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	keepSalt(dir, "A", &stderr)
+	keepSalt(dir, "B", &stderr)
+	if got := cachedSalt(dir); got != "B" || stderr.Len() != 0 {
+		t.Fatalf("cached %q, stderr %q; want B and nothing", got, stderr.String())
+	}
+	if got := gitsync.PastSalts(gitDir); !slices.Equal(got, []string{"A"}) {
+		t.Fatalf("the git directory notes %q as past salts, want A", got)
+	}
+}
+
+// A note fleetd keeps in a clone's git directory is read whole up to
+// maxNoteBytes, and refused beyond that without being read: a huge file planted
+// there would otherwise be read into memory by every sync and every where.
+func TestANoteLargerThanItsBoundIsRefusedUnread(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for _, size := range []int{maxNoteBytes, maxNoteBytes + 1} {
+		path := filepath.Join(dir, strconv.Itoa(size))
+		if err := os.WriteFile(path, bytes.Repeat([]byte("x"), size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		data, err := readNote(path)
+		if size <= maxNoteBytes && (err != nil || len(data) != size) {
+			t.Errorf("a note of %d bytes read as %d bytes, %v; want it whole", size, len(data), err)
+		}
+		if size > maxNoteBytes && err == nil {
+			t.Errorf("a note of %d bytes read as %d bytes; want it refused", size, len(data))
+		}
+	}
+	// A terabyte of nothing, which takes no room where the file system leaves
+	// what was never written unallocated; Windows allocates it.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	huge := filepath.Join(dir, "huge")
+	f, err := os.Create(huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.Truncate(1 << 40)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Skipf("cannot make a sparse terabyte here: %v", err)
+	}
+	if data, err := readNote(huge); err == nil {
+		t.Fatalf("a note of a terabyte read as %d bytes; want it refused", len(data))
+	}
+}
+
+// A directory where the salt cache or the sync's outcome goes is refused at
+// once, with a warning for the outcome: no rename replaces it, and every
+// command, a hook's included, writes the one, and every sync the other.
+func TestANoteThatIsADirectoryHoldsNothingUp(t *testing.T) {
+	t.Parallel()
+	for _, note := range []string{saltCacheName, syncStatusFile} {
+		t.Run(note, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, ".git", note, "x"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			start := time.Now()
+			if note == saltCacheName {
+				cacheSalt(dir, "s")
+			} else {
+				noteSync(dir, gitsync.Result{}, nil, start, &stderr)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("writing %s onto a directory took %v; want it refused at once", note, elapsed)
+			}
+			if note == syncStatusFile && !strings.Contains(stderr.String(), "could not note") {
+				t.Fatalf("stderr %q; want a warning that the outcome was not noted", stderr.String())
+			}
+		})
+	}
+}
+
+// PROTOCOL.md, the canonical command list, lists fleetd's commands as the usage
+// text does, line for line, so neither can gain or lose a flag alone.
+func TestProtocolListsTheCommandsTheUsageDoes(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile(filepath.Join("..", "..", "PROTOCOL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var documented, used []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "fleetd ") {
+			documented = append(documented, strings.TrimSpace(line))
+		}
+	}
+	for _, line := range strings.Split(usage, "\n") {
+		if strings.HasPrefix(line, "  fleetd ") {
+			used = append(used, strings.TrimSpace(line))
+		}
+	}
+	if len(used) == 0 || !slices.Equal(documented, used) {
+		t.Fatalf("PROTOCOL.md lists\n%s\nthe usage text\n%s", strings.Join(documented, "\n"), strings.Join(used, "\n"))
 	}
 }
