@@ -2563,9 +2563,11 @@ func TestFollowingTheGuardsAdviceWithAStaleFleetSaltKeepsTheFleetsId(t *testing.
 		t.Fatal(err)
 	}
 	_, _, err := exec(t, "sync", "--dir", b)
+	// The message names the cache by the path git gives the git directory, which
+	// on Windows can be the long form of a short name such as RUNNER~1.
 	cache := filepath.Join(b, ".git", "fleetd-salt")
 	if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "--salt <salt> <journal URL>") ||
-		!strings.Contains(err.Error(), cache) {
+		!strings.Contains(err.Error(), filepath.Join(".git", "fleetd-salt")) {
 		t.Fatalf("sync: %v; want the guard, saying to give init the salt %s holds", err, cache)
 	}
 	salt, rerr := os.ReadFile(cache)
