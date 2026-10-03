@@ -1992,6 +1992,19 @@ func TestRecordsWrittenWhileALookIsDueArePublishedUnderTheFleetsId(t *testing.T)
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
 		t.Fatal(err)
 	}
+	fleet, ok, err := gitsync.ReadFleet(dir)
+	if err != nil || !ok {
+		t.Fatalf("fleetd.json after init: %v, %v", ok, err)
+	}
+	files := journalFiles(t, remote)
+	if n, ok := remoteHostRecords(t, remote, fleet.Salt, "while the look was due"); len(files) != 1 || n != 1 || !ok {
+		t.Fatalf("the journal holds %v; want one file, the fleet id's, holding the record (%d records, found %v)", files, n, ok)
+	}
+}
+
+// journalFiles lists the journal files the remote's main holds.
+func journalFiles(t *testing.T, remote string) []string {
+	t.Helper()
 	listing, err := osexec.Command("git", "--git-dir", remote, "ls-tree", "--name-only", "main").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -2002,11 +2015,37 @@ func TestRecordsWrittenWhileALookIsDueArePublishedUnderTheFleetsId(t *testing.T)
 			files = append(files, name)
 		}
 	}
-	fleet, ok, err := gitsync.ReadFleet(dir)
-	if err != nil || !ok {
-		t.Fatalf("fleetd.json after init: %v, %v", ok, err)
+	return files
+}
+
+// A journal directory whose fleetd.json was deleted has records written under
+// another id: no sync publishes them until init has put the file back, and the
+// sync after it files them under the fleet's, so the journal holds one file for
+// this machine.
+func TestRecordsWrittenWhileFleetdJsonIsMissingArePublishedUnderTheFleetsId(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
 	}
-	if n, ok := remoteHostRecords(t, remote, fleet.Salt, "while the look was due"); len(files) != 1 || n != 1 || !ok {
+	if err := os.Remove(filepath.Join(dir, gitsync.FleetFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "while fleetd.json was missing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrNoFleetFile) {
+		t.Fatalf("sync while fleetd.json was missing: %v, want ErrNoFleetFile", err)
+	}
+	if files := journalFiles(t, remote); len(files) != 0 {
+		t.Fatalf("the journal holds %v while fleetd.json was missing", files)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	files := journalFiles(t, remote)
+	if n, ok := remoteHostRecords(t, remote, "s", "while fleetd.json was missing"); len(files) != 1 || n != 1 || !ok {
 		t.Fatalf("the journal holds %v; want one file, the fleet id's, holding the record (%d records, found %v)", files, n, ok)
 	}
 }

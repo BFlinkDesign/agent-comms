@@ -223,15 +223,20 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 		return res, err
 	}
 	// An init killed after its push left the look it made due only in its own
-	// clone, which this one replaces: this one makes it.
+	// clone, which this one replaces: this one makes it, and only then removes
+	// that clone.
 	lookDue := abandonedLookDue(o.Dir)
-	removeAbandonedClones(o.Dir)
 	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
 	if err != nil {
 		return res, err
 	}
 	// Init's own clone. Once its git directory has moved into Dir it is empty.
-	defer os.RemoveAll(tmp)
+	keep := false
+	defer func() {
+		if !keep {
+			os.RemoveAll(tmp)
+		}
+	}()
 
 	g := git{ctx: ctx, dir: parent, run: run}
 	clone := append(batchSSH(g), "-c", "init.defaultBranch="+unnamedDefault, "clone", "--quiet", "--no-checkout", "--no-tags", "--", url, tmp)
@@ -263,13 +268,19 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 		// Once its push has made a branch the journal's, or a look found another
 		// journal, a look is due, which only the clone notes: kept, as it is, in
 		// Dir, it has init run again finish setting it up, and look, and every
-		// sync wait till then.
-		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil &&
-			(res.WroteFleetFile || errors.Is(err, ErrTwoJournals)) && os.MkdirAll(o.Dir, 0o755) == nil {
-			_ = RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git"))
+		// sync wait till then. A push that failed may have gone through all the
+		// same, as when the connection drops after the remote took it: that
+		// clone stays beside Dir, as a killed init's does, for the next init to
+		// make the look, unless the remote declined the push.
+		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil {
+			moved := (res.WroteFleetFile || errors.Is(err, ErrTwoJournals)) && os.MkdirAll(o.Dir, 0o755) == nil &&
+				RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git")) == nil
+			keep = !moved && !errors.Is(err, ErrRejected)
 		}
 		return res, err
 	}
+	// Any look due is made: the clones earlier inits left beside Dir can go.
+	removeAbandonedClones(o.Dir)
 	// There is no work tree, so pointing the branch at the remote's tip is all
 	// following it takes.
 	for _, args := range [][]string{
@@ -350,9 +361,18 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 			return res, err
 		}
 	}
+	// A look that an init in a new directory left due in its clone beside this
+	// one, killed after its push or kept there after a push that failed, is
+	// made here too, and only then are such clones removed.
+	if abandonedLookDue(o.Dir) {
+		if err := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
+			return res, err
+		}
+	}
 	if err := bootstrap(g, gitDir, o, &res); err != nil {
 		return res, err
 	}
+	removeAbandonedClones(o.Dir)
 	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
 		return res, err
 	}
@@ -1109,13 +1129,14 @@ func look(g git, gitDir, branch string) error {
 		return err
 	}
 	if len(holding) > 0 {
-		// A copy of this journal, a branch made from it since, holds the commit
-		// that added FleetFile to it; a journal another machine started does not.
-		start, _ := g.line("log", "-1", "--format=%H", "--diff-filter=A", "refs/remotes/origin/"+branch, "--", FleetFile)
+		// A copy of this journal, a branch made from it since, shares a commit
+		// holding FleetFile with it; a journal another machine started at the
+		// same time shares at most one from before either push, holding none.
 		var others []string
 		for _, h := range holding {
-			if start != "" {
-				if _, err := g.line("merge-base", "--is-ancestor", start, "refs/remotes/origin/"+h); err == nil {
+			base, _ := g.line("merge-base", "refs/remotes/origin/"+branch, "refs/remotes/origin/"+h)
+			if base != "" {
+				if entry, _ := g.line("ls-tree", base, "--", FleetFile); entry != "" {
 					continue
 				}
 			}

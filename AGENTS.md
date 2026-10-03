@@ -219,11 +219,14 @@ network goes for a moment, or that finds one, is made again by every init until
 one finds none. Till then no sync publishes: the clone may lack the journal's
 `fleetd.json`, and this machine's records would go out under another id; they
 wait, and the sync after init files them under the fleet's. A copy of the journal,
-a branch made from it, holds the commit that added `fleetd.json` to it, and is not
-a second journal. A first init in a new directory whose push went through, or
-whose look found another journal, keeps its clone there, even when it fails, so
-that init run again looks; one killed right after its push leaves the look due in
-the clone it left beside the journal directory, and the next init makes it.
+a branch made from it, shares a commit holding `fleetd.json` with it, and is not a
+second journal. A first init in a new directory whose push went through, or whose
+look found another journal, keeps its clone there, even when it fails, so that
+init run again looks. One whose push failed, which may have gone through all the
+same (the connection dropped after the remote took it, or `--timeout` passed while
+the remote finished), leaves its clone beside the journal directory, as one killed
+right after its push does, unless the remote declined the push. The next init
+makes the look, and only then removes the clones left there over ten minutes ago.
 A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the
@@ -383,6 +386,12 @@ was wrong:
   used until a sync brings in a fixed one. init itself refuses a journal whose
   `fleetd.json` is invalid, or larger than 32 KiB in git: checked out with CRLF
   line endings, as Git for Windows does by default, it can be twice that.
+  A missing `fleetd.json`, deleted or not yet written by an init stopped short,
+  stops every sync while the journal's branch, as the clone last fetched it,
+  holds one: the records would go out under another id. They wait, and init
+  puts the file back, after which a sync files them under the fleet's id. A
+  clone set up before the journal had one, as v0.1.0 left it, publishes once
+  more under the id it always had, in the sync that brings the file in.
   Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)

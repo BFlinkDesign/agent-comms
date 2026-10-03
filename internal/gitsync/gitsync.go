@@ -73,6 +73,9 @@ var (
 	// made a branch the journal's, and it has yet to look whether another machine
 	// made another branch the journal's at the same time.
 	ErrLookDue = errors.New("gitsync: init has yet to finish setting the journal up")
+	// ErrNoFleetFile means the journal directory lacks the journal's FleetFile,
+	// which records take their salt from, while the journal's branch holds it.
+	ErrNoFleetFile = errors.New("gitsync: the journal directory lacks the journal's fleetd.json")
 )
 
 // gitConfig is the configuration every git command runs with. core.fsmonitor
@@ -360,6 +363,18 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			return res, err
 		}
 		return res, noUpstream(g, recorded)
+	}
+	// Nor while the journal directory lacks the journal's FleetFile, deleted, or
+	// not yet written by an init stopped short: this machine's records then go
+	// under another id, for good once published. A clone set up before the
+	// journal had one, as fleetd v0.1.0 left it, publishes once more under the
+	// id it always had, in the sync that brings the file in.
+	if _, err := os.Lstat(filepath.Join(o.Dir, FleetFile)); errors.Is(err, os.ErrNotExist) {
+		if entry, _ := g.line("ls-tree", "refs/remotes/origin/"+branch, "--", FleetFile); entry != "" {
+			return res, fmt.Errorf("%w, which origin's %s holds, so this machine's records would go out under "+
+				"another id; they wait, and `fleetd init --dir \"%s\" <journal URL>` puts it back, after which a sync "+
+				"files them under the fleet's", ErrNoFleetFile, branch, g.dir)
+		}
 	}
 
 	ssh := batchSSH(g)
@@ -1070,11 +1085,13 @@ func clearStaleLocks(gitDir string) []string {
 	return cleared
 }
 
-// GitDir is the git directory of the clone whose top is dir, found as git finds
-// it, with no git process: dir/.git, or the directory a .git file there names
-// (gitdir: and a path, relative to dir's real path unless absolute, so that ..
-// through a link is the real parent, as git takes it), as a clone made with
-// --separate-git-dir has. ok is false when there is neither.
+// GitDir is the git directory of the clone whose top is dir, with no git
+// process: dir/.git, or the directory a .git file there names (gitdir: and a
+// path, relative to dir's real path unless absolute, so that a leading .. from
+// a linked journal directory is its real parent, as git takes it), as a clone
+// made with --separate-git-dir has. A path climbing out, with .., of a link it
+// names itself is read as written, where git would follow the link first; git
+// writes no such path. ok is false when there is neither.
 func GitDir(dir string) (gitDir string, ok bool) {
 	path := filepath.Join(dir, ".git")
 	info, err := os.Stat(path)

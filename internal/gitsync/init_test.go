@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // emptyRemote is a bare repository with no commits, as GitHub creates one.
@@ -2179,6 +2180,9 @@ func TestALookAfterThePushThatFailsIsMadeWhenInitRunsAgain(t *testing.T) {
 				"branch the journal's at the same time") || !strings.Contains(errA.Error(), "fleetd init run again looks again") {
 				t.Fatalf("init: %v, want it to say it could not look, and that init run again does", errA)
 			}
+			if left, _ := filepath.Glob(a + ".init-*"); len(left) > 0 {
+				t.Fatalf("init left %v beside %s, which holds its clone", left, a)
+			}
 			for range 2 {
 				_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"})
 				if err == nil || !strings.Contains(err.Error(), "the journal was started on two branches at once, main and docs") {
@@ -2242,15 +2246,12 @@ func TestASyncWaitsForTheLookInitMadeDue(t *testing.T) {
 	}
 }
 
-// A look an init killed right after its push made due is noted only in the
-// clone it left beside the journal directory: the next init, setting the
-// directory up afresh, makes it, and is told of a journal another machine
-// started at the same time; it keeps its own clone for that, so every init
-// after it is told too, once the clone left behind is gone.
-func TestALookAnInitKilledAfterItsPushMadeDueIsMadeByTheNext(t *testing.T) {
-	t.Parallel()
+// journalOnTwoBranches is readmeOnTwoBranches once two machines have made both
+// branches the journal's at once, main with salt a and docs with salt b, as an
+// init killed right after its push and another machine's leave it.
+func journalOnTwoBranches(t *testing.T) string {
+	t.Helper()
 	remote := readmeOnTwoBranches(t)
-	// What the killed init and another machine pushed: a journal on each branch.
 	w := filepath.Join(t.TempDir(), "w")
 	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
 	identify(t, w)
@@ -2261,6 +2262,17 @@ func TestALookAnInitKilledAfterItsPushMadeDueIsMadeByTheNext(t *testing.T) {
 		run(t, w, "commit", "--quiet", "-m", "journal")
 		run(t, w, "push", "--quiet", "origin", b.branch)
 	}
+	return remote
+}
+
+// A look an init killed right after its push made due is noted only in the
+// clone it left beside the journal directory: the next init, setting the
+// directory up afresh, makes it, and is told of a journal another machine
+// started at the same time; it keeps its own clone for that, so every init
+// after it is told too, once the clone left behind is gone.
+func TestALookAnInitKilledAfterItsPushMadeDueIsMadeByTheNext(t *testing.T) {
+	t.Parallel()
+	remote := journalOnTwoBranches(t)
 	a := filepath.Join(t.TempDir(), "a")
 	left := filepath.Join(filepath.Dir(a), "a.init-123", ".git")
 	if err := os.MkdirAll(left, 0o755); err != nil {
@@ -2298,8 +2310,8 @@ func TestACopyOfTheJournalMadeWhileALookIsDueIsNoSecondJournal(t *testing.T) {
 }
 
 // A first init in a new directory whose push the remote declines made nothing
-// the journal's: it keeps no clone there, so init run again with the right URL
-// is not refused as a clone of the wrong one.
+// the journal's: it keeps no clone there, nor beside it, so init run again with
+// the right URL is not refused as a clone of the wrong one.
 func TestAFirstInitWhosePushIsDeclinedKeepsNoClone(t *testing.T) {
 	t.Parallel()
 	remote := emptyRemote(t)
@@ -2314,6 +2326,9 @@ func TestAFirstInitWhosePushIsDeclinedKeepsNoClone(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
 		t.Fatalf("a first init whose push was declined left a clone in %s", dir)
+	}
+	if left, _ := filepath.Glob(dir + ".init-*"); len(left) > 0 {
+		t.Fatalf("a first init whose push was declined left %v beside %s", left, dir)
 	}
 	if res := mustInit(t, InitOptions{URL: newEmptyRemote(t), Dir: dir, Salt: "s"}); !res.Cloned {
 		t.Fatalf("init with another URL = %+v, want the directory set up", res)
@@ -2417,4 +2432,311 @@ func TestALookThatFailedAndFindsNothingWhenMadeAgainIsNotMadeAgain(t *testing.T)
 	if got := run(t, a, "--git-dir", remote, "show", "docs:host-a.jsonl"); got != `{"id":"hive:a1"}` {
 		t.Fatalf("docs holds %q for host-a", got)
 	}
+}
+
+// A push that goes through but reports failure, as when the connection drops
+// after the remote took it, or init's deadline passes while the remote finishes,
+// may have made a branch the journal's: the next init makes the look, and is
+// told of the journal another machine started at the same time.
+func TestAPushThatGoesThroughButReportsFailureLeavesTheLookDue(t *testing.T) {
+	t.Parallel()
+	remote := readmeOnTwoBranches(t)
+	a, b := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+	var errB error
+	pushed := false
+	lost := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if pushed || !slices.Contains(args, "push") {
+			return Git(ctx, dir, stdin, args...)
+		}
+		pushed = true
+		_, errB = Init(ctx, InitOptions{URL: remote, Dir: b, Salt: "b", Branch: "docs"})
+		out, err := Git(ctx, dir, stdin, args...)
+		if err != nil {
+			return out, err
+		}
+		return out, errors.New("git push: exit status 128: fatal: the remote end hung up unexpectedly")
+	}
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: lost}); err == nil ||
+		!strings.Contains(err.Error(), "hung up") {
+		t.Fatalf("init: %v, want the push's error", err)
+	}
+	if errB != nil {
+		t.Fatalf("the other machine's init: %v", errB)
+	}
+	if remoteFile(t, remote, FleetFile) == "" {
+		t.Fatal("main holds no fleetd.json: the push did not go through")
+	}
+	for i := range 2 {
+		if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"}); !errors.Is(err, ErrTwoJournals) {
+			t.Fatalf("init %d after it: %v, want it told the journal was started on two branches at once", i+1, err)
+		}
+	}
+}
+
+// The look an init killed after its push left due, in the clone it left beside
+// the journal directory, outlives the inits after it that fail, however much
+// later they come: that clone stays until an init has made the look.
+func TestALookLeftDueBesideTheJournalDirectoryOutlivesTheInitsThatFail(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, c := range []struct {
+		name string
+		fail func(o InitOptions) InitOptions
+	}{
+		{"its clone fails", func(o InitOptions) InitOptions {
+			o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+				if slices.Contains(args, "clone") {
+					return "", errors.New("git clone: exit status 128: fatal: unable to access the remote")
+				}
+				return Git(ctx, dir, stdin, args...)
+			}
+			return o
+		}},
+		{"its salt is not the journal's", func(o InitOptions) InitOptions {
+			o.Salt, o.Strict = "mistyped", true
+			return o
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote := journalOnTwoBranches(t)
+			a := filepath.Join(t.TempDir(), "a")
+			left := filepath.Join(filepath.Dir(a), "a.init-123")
+			if err := os.MkdirAll(filepath.Join(left, ".git"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			write(t, filepath.Join(left, ".git", lookName), "main\n")
+			old := time.Now().Add(-20 * time.Minute)
+			if err := os.Chtimes(left, old, old); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Init(context.Background(), c.fail(InitOptions{URL: remote, Dir: a, Salt: "a"})); err == nil {
+				t.Fatal("init succeeded")
+			}
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"}); !errors.Is(err, ErrTwoJournals) {
+				t.Fatalf("init after the one that failed: %v, want it told the journal was started on two branches at once", err)
+			}
+		})
+	}
+}
+
+// A copy of a journal started on an empty repository, whose first commit adds
+// fleetd.json, is no second journal, whatever the user's git config says about
+// how git log shows a first commit.
+func TestACopyIsNoSecondJournalWhateverTheUsersLogConfig(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+		t.Fatal("init succeeded although its look failed")
+	}
+	run(t, a, "--git-dir", remote, "branch", "backup", "main")
+	showRootOff := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		return Git(ctx, dir, stdin, append([]string{"-c", "log.showRoot=false"}, args...)...)
+	}
+	if res, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: showRootOff}); err != nil ||
+		res.Branch != "main" {
+		t.Fatalf("init = %+v, %v; want backup taken for a copy of the journal on main", res, err)
+	}
+}
+
+// A copy of the journal made before fleetd.json was taken out of it and put
+// back is still a copy: it shares a commit holding fleetd.json with the journal,
+// which a journal another machine started does not.
+func TestACopyMadeBeforeFleetdJsonWasPutBackIsNoSecondJournal(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+		t.Fatal("init succeeded although its look failed")
+	}
+	run(t, a, "--git-dir", remote, "branch", "backup", "main")
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	run(t, w, "rm", "--quiet", FleetFile)
+	run(t, w, "commit", "--quiet", "-m", "take fleetd.json out")
+	run(t, w, "revert", "--no-edit", "HEAD")
+	run(t, w, "push", "--quiet", "origin", "main")
+	if res, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"}); err != nil || res.Branch != "main" {
+		t.Fatalf("init = %+v, %v; want backup taken for a copy of the journal on main", res, err)
+	}
+}
+
+// A look cut short, by init's deadline or a person's Ctrl-C, says so: a branch
+// it did not finish looking at is not taken for a second journal, and the look
+// stays due.
+func TestALookCutShortSaysSoAndStaysDue(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	a := filepath.Join(t.TempDir(), "a")
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+		t.Fatal("init succeeded although its look failed")
+	}
+	run(t, a, "--git-dir", remote, "branch", "backup", "main")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cut := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "merge-base") && slices.Contains(args, "refs/remotes/origin/backup") {
+			cancel()
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Init(ctx, InitOptions{URL: remote, Dir: a, Salt: "a", Run: cut}); !errors.Is(err, context.Canceled) ||
+		errors.Is(err, ErrTwoJournals) {
+		t.Fatalf("init: %v, want it cut short, not told of a second journal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); err != nil {
+		t.Fatalf("the look is no longer noted as due: %v", err)
+	}
+}
+
+// A plain clone, for which init has yet to record a branch, whose init pushed
+// and then could not look, waits for the look too: its sync publishes nothing.
+func TestASyncOnAPlainCloneWhoseInitCouldNotLookWaits(t *testing.T) {
+	t.Parallel()
+	remote := readmeOnTwoBranches(t)
+	a := filepath.Join(t.TempDir(), "a")
+	run(t, filepath.Dir(a), "clone", "--quiet", remote, a)
+	if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+		t.Fatal("init succeeded although its look failed")
+	}
+	if got, err := recordedBranch(filepath.Join(a, ".git")); err != nil || got != "" {
+		t.Fatalf("the record names %q (%v), want none", got, err)
+	}
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	if _, err := Sync(context.Background(), options(a, "host-a")); !errors.Is(err, ErrLookDue) {
+		t.Fatalf("sync: %v, want ErrLookDue", err)
+	}
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "" {
+		t.Fatalf("main holds %q for host-a while the look was due", got)
+	}
+}
+
+// A journal directory that lacks fleetd.json while the journal's branch holds
+// it would have this machine's records go out under another id, for good: an
+// init stopped after its look and before it wrote the file, into a clone kept
+// for the look, leaves it so, as does a person deleting it. Sync publishes
+// nothing then, and syncs once init has put the file back.
+func TestASyncWaitsWhileTheJournalDirectoryLacksFleetdJson(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, c := range []struct {
+		name  string
+		setUp func(t *testing.T, remote, dir string)
+	}{
+		{"an init stopped before writing it", func(t *testing.T, remote, dir string) {
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir, Salt: "a", Run: failFetchAfterPush(nil)}); err == nil {
+				t.Fatal("init succeeded although its look failed")
+			}
+			stop := func(ctx context.Context, d string, stdin []byte, args ...string) (string, error) {
+				if _, err := os.Lstat(filepath.Join(dir, ".git", lookName)); errors.Is(err, os.ErrNotExist) &&
+					slices.Contains(args, "ls-tree") && slices.Contains(args, FleetFile) {
+					return "", errors.New("init stopped")
+				}
+				return Git(ctx, d, stdin, args...)
+			}
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir, Salt: "a", Run: stop}); err == nil ||
+				!strings.Contains(err.Error(), "init stopped") {
+				t.Fatalf("init: %v, want it stopped after its look", err)
+			}
+		}},
+		{"a person deleting it", func(t *testing.T, remote, dir string) {
+			mustInit(t, InitOptions{URL: remote, Dir: dir, Salt: "a"})
+			if err := os.Remove(filepath.Join(dir, FleetFile)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			remote := readmeOnTwoBranches(t)
+			a := filepath.Join(t.TempDir(), "a")
+			c.setUp(t, remote, a)
+			if _, err := os.Lstat(filepath.Join(a, FleetFile)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fleetd.json: %v, want none", err)
+			}
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			_, err := Sync(context.Background(), options(a, "host-a"))
+			if want := "`fleetd init --dir \"" + a + "\" <journal URL>` puts it back"; !errors.Is(err, ErrNoFleetFile) ||
+				!strings.Contains(err.Error(), want) {
+				t.Fatalf("sync: %v, want ErrNoFleetFile saying %s", err, want)
+			}
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "" {
+				t.Fatalf("main holds %q for host-a while the directory lacked fleetd.json", got)
+			}
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"})
+			mustSync(t, options(a, "host-a"))
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+				t.Fatalf("main holds %q for host-a", got)
+			}
+		})
+	}
+}
+
+// A clone of a journal of fleetd v0.1.0's, set up before the journal had
+// fleetd.json, never lacked one it had: the sync that brings in the file another
+// machine's init added publishes once more under the id the clone always had.
+func TestAClonePredatingTheJournalsFleetdJsonSyncsItIn(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "b"), Salt: "s"})
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+	if f, ok, err := ReadFleet(a); err != nil || !ok || f.Salt != "s" {
+		t.Fatalf("fleetd.json after the sync = %+v, %v, %v; want salt s", f, ok, err)
+	}
+}
+
+// A look an init in a new directory left due in its clone beside it is made by
+// an init on a clone there too, as a person's own clone of the journal, and only
+// then are the clones left there removed.
+func TestAnInitOnACloneMakesALookLeftDueBesideIt(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	leave := func(t *testing.T, dir string) string {
+		left := filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".init-123")
+		if err := os.MkdirAll(filepath.Join(left, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		write(t, filepath.Join(left, ".git", lookName), "main\n")
+		old := time.Now().Add(-20 * time.Minute)
+		if err := os.Chtimes(left, old, old); err != nil {
+			t.Fatal(err)
+		}
+		return left
+	}
+	t.Run("another journal", func(t *testing.T) {
+		t.Parallel()
+		remote := journalOnTwoBranches(t)
+		a := filepath.Join(t.TempDir(), "a")
+		run(t, filepath.Dir(a), "clone", "--quiet", remote, a)
+		left := leave(t, a)
+		if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a"}); !errors.Is(err, ErrTwoJournals) {
+			t.Fatalf("init: %v, want it told the journal was started on two branches at once", err)
+		}
+		if _, err := os.Lstat(left); err != nil {
+			t.Fatalf("the clone left beside the journal directory: %v, want it kept till the look finds nothing", err)
+		}
+	})
+	t.Run("none", func(t *testing.T) {
+		t.Parallel()
+		remote := readmeOnTwoBranches(t)
+		a := filepath.Join(t.TempDir(), "a")
+		mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"})
+		left := leave(t, a)
+		mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"})
+		if _, err := os.Lstat(left); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the clone left beside the journal directory: %v, want it removed once the look found nothing", err)
+		}
+		if _, err := os.Lstat(filepath.Join(a, ".git", lookName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the look is still noted as due: %v", err)
+		}
+	})
 }

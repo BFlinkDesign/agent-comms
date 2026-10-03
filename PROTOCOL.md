@@ -292,10 +292,12 @@ branch the journal is on, with nothing pushed or moved. Two machines that make t
 such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
 makes it until one finds no other journal (a first init in a new directory whose
-push went through, or whose look found one, keeps its clone there for that, and
-one killed right after its push leaves the look to the next init); a copy of the
-journal, a branch holding the commit that added `fleetd.json`, is not a second
-journal. Till the look is made, sync publishes nothing. A clone a person moved off the
+push went through, or whose look found one, keeps its clone there for that; one
+whose push failed, which may have gone through all the same, unless the remote
+declined it, or one killed right after its push, leaves its clone beside the
+directory, and the look to the next init); a copy of the journal, a branch sharing
+a commit that holds `fleetd.json` with it, is not a second journal. Till the look
+is made, sync publishes nothing. A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch init recorded
@@ -359,7 +361,8 @@ journal's branch, as when the remote deleted it meanwhile. Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository whose init is done (no look due in `.git/fleetd-look`; else
+journal repository whose init is done (no look due in `.git/fleetd-look`, and
+`fleetd.json` in place when the journal's branch, as last fetched, holds it; else
 it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
 look, nor, once init has recorded the journal's branch, another of origin's. Any
