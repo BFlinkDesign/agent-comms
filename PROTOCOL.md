@@ -283,15 +283,19 @@ an `about` line), on the branch it names as its default, else `main`; a reposito
 that already holds records without one needs the salt its machines use (`--salt` or
 `$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
 the ids they had). When the repository's default branch does not exist, the journal is
-on its only branch; with several, init is refused. A clone a person moved off the
+on its only branch; with several, init is refused, unless `--branch` names the
+journal's (which, on an empty repository, names the branch the journal starts
+on). A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch it follows, of
 the same name on origin, if origin still has it; else the remote's default, the
-branch its HEAD names; else its only branch. Following several of origin's
-branches, none of them the default, a clone is left as it is, and init says to
-unset the upstream of each the journal is not on. A `--single-branch` clone put
-on another branch is set to fetch every branch of origin's. Only refs and the index
+branch its HEAD names; else its only branch. `--branch` names the journal's
+branch instead, where a person knows better; origin must have it. Following
+several of origin's branches, none of them the default, a clone is left as it is,
+and init says to name the journal's with `--branch`. A `--single-branch` clone put on
+another branch has its refspec's branch lines replaced by one for every branch
+of origin's, its other lines kept. Only refs and the index
 change, never a file, and HEAD last; the journal's branch here starts at origin's
 tip and moves only forward to it, so one with commits of its own stays, and
 init's sync reports them. The repair is refused, with nothing moved, in a
@@ -345,8 +349,9 @@ leaves the clone's tags alone, and prunes, so a branch the remote deleted or
 renamed goes from the clone too: a sync on a branch that followed it fetches once
 more, in case it was pushed back, then stops, pushing nothing, which would bring
 the branch back, and says what a person does: after a rename, or a deletion on
-purpose, `git branch --unset-upstream`, then init; push one deleted by mistake
-back from the machine that synced last (`git push origin HEAD`). Its push goes
+purpose, `fleetd init --branch <branch>` naming the branch the journal is on now;
+push one deleted by mistake back from the machine that synced last (`git push
+origin HEAD:<branch>`, naming origin's branch). Its push goes
 onto the tip it fetched and nowhere else (`--force-with-lease` naming that tip),
 so a branch renamed or deleted in between refuses it, as a race lost. It notes
 each outcome in the clone's `.git/fleetd-sync.json`, which `fleetd where`

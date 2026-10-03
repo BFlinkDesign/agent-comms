@@ -49,7 +49,7 @@ import (
 const usage = `fleetd — record and answer what happened on which machine
 
 usage:
-  fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--timeout 2m] URL
+  fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--branch B] [--timeout 2m] URL
   fleetd host   [--json] [--dir D] [--salt S]
   fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]

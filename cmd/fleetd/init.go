@@ -26,6 +26,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	reclaim := fs.Bool("reclaim", false, "put this machine's published records back at the start of its journal file, "+
 		"after its journal directory was set up again or restored from an older copy")
 	timeout := fs.Duration("timeout", 2*time.Minute, "give up after this long")
+	branch := fs.String("branch", "", "the journal's branch, where init cannot tell which it is (else the branch the "+
+		"clone follows, else the remote's default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,7 +54,7 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	res, err := gitsync.Init(ctx, gitsync.InitOptions{
-		URL: url, Dir: journalDir, Salt: given, Strict: from == "--salt" && given != "",
+		URL: url, Dir: journalDir, Salt: given, Strict: from == "--salt" && given != "", Branch: *branch,
 	})
 	switch {
 	case errors.Is(err, gitsync.ErrSaltMismatch) && from == "--salt":

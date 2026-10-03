@@ -1768,3 +1768,18 @@ func TestAnOlderCommitCheckedOutByHandEndsWithEveryRecordPublished(t *testing.T)
 		}
 	}
 }
+
+// --branch names the journal's branch where init cannot tell which it is: a
+// machine set up with it follows that branch, not the remote's default.
+func TestInitFollowsTheBranchItIsTold(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	first := filepath.Join(t.TempDir(), "first")
+	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, first, "push", "--quiet", "origin", "main:refs/heads/journal")
+	dir := filepath.Join(t.TempDir(), "journal")
+	if stdout, _, err := exec(t, "init", "--dir", dir, "--branch", "journal", remote); err != nil || !strings.Contains(stdout, "following journal") {
+		t.Fatalf("init --branch journal: %v, output %q", err, stdout)
+	}
+}

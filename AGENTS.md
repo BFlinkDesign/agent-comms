@@ -114,7 +114,8 @@ repository's default branch does not exist but it has exactly one branch, the
 journal is on that branch; a server that does not advertise an empty repository's
 default leaves the first machine starting `main` whatever the repository's HEAD
 names. With several branches and no default among them, init is refused before
-anything is pushed. A repository
+anything is pushed, unless `--branch` names the one the journal is on; on an
+empty repository, `--branch` names the one the journal starts on. A repository
 with anything but host journal files, `fleetd.json`, a README, a LICENSE,
 `.gitignore` or `.gitattributes`, or with a directory, is refused, and so is a
 journal directory holding anything but journal files and `fleetd.json`. A
@@ -131,10 +132,11 @@ name on origin, if origin still has it, since a remote's default can change whil
 its machines go on publishing where they did; else the remote's default, the
 branch its HEAD names; else its only branch. A clone that follows several of
 origin's branches, none of them the default, could be meant for any: init moves
-nothing, and says to unset the upstream of each the journal is not on (`git -C
-"<dir>" branch --unset-upstream <branch>`), then run it again. A clone made with
-`--single-branch` is set to fetch every branch of origin's, as a clone does, when
-it is put back on another. Only refs and git's index change, never a file, so
+nothing, and says to name the journal's with `fleetd init --branch <branch>`,
+which puts the clone there, wherever init would otherwise look. A clone made
+with `--single-branch` that is put back on another branch has its refspec's
+branch lines give way to one for every branch of origin's, as a clone has; its
+other lines stay. Only refs and git's index change, never a file, so
 this machine's records stay as they are, which git's own ways back (`git
 switch`, `git checkout`) refuse to promise; HEAD moves last, so init run again
 finishes a repair cut short. A branch with commits of its own is not moved, and
@@ -161,12 +163,14 @@ branch the remote deleted or renamed goes from the clone too, a `--single-branch
 clone included: a sync or init on a branch that followed it stops and says so,
 pushing nothing, since a push would bring the branch back and split the journal.
 Their pushes go onto the tip they fetched and nowhere else, so a branch renamed
-or deleted in between refuses them, as a race lost. After a rename, or a deletion
-on purpose, `git branch --unset-upstream` and then fleetd init put the clone on
-the journal's branch; a branch deleted by mistake is pushed back from the machine
-that synced last (`git push origin HEAD` in its journal directory), and every
-machine's next sync takes it up again, since a sync whose branch is gone fetches
-once more before it says so. When the repository has no branch yet, a
+or deleted in between refuses them, as a race lost. Only a person knows where the
+journal went: after a rename, or a deletion on purpose, `fleetd init --branch
+<branch>` puts the clone on the branch it is on now; a branch deleted by mistake
+is pushed back from the machine that synced last (`git push origin
+HEAD:<branch>` in its journal directory, naming origin's branch, which the
+machine's own may not be named after), and every machine's next sync takes it up
+again, since a sync whose branch is gone fetches once more before it says so.
+When the repository has no branch yet, a
 clone with no commit and no ref of any kind (a branch, a tag, a stash) is told to
 delete its `.git` directory, which holds nothing, after which init sets the
 directory up as a new one, keeping its files; one with commits of its own, to
@@ -178,9 +182,9 @@ disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the
-directory's syncs stop once the branch is gone, until `git branch
---unset-upstream` and init are run there, which keep its records too. Running
-init again finishes
+directory's syncs stop once the branch is gone, until `fleetd init --branch
+<branch>` names the branch kept, which keeps its records too. Running init again
+finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
 which init and every sync wait out for ten minutes. When this machine's journal
 directory was set up again, or restored from an older copy, its file no longer

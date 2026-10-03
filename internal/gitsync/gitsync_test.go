@@ -22,19 +22,31 @@ import (
 // case below was a failure an independent review reproduced against the first
 // version of this package.
 
+// TestMain gives every test one clean global git configuration, so that the
+// machine running the tests cannot change what is tested. It is set once, for the
+// whole package, so that tests can run in parallel; one that cares about hostile
+// settings sets them itself, and so runs on its own.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "gitsync-test")
+	if err != nil {
+		panic(err)
+	}
+	cfg := filepath.Join(dir, "gitconfig")
+	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
+		panic(err)
+	}
+	os.Setenv("GIT_CONFIG_GLOBAL", cfg)
+	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
-	// A clean global configuration, so the machine running the tests cannot
-	// change what is tested. Tests that care about hostile settings add them.
-	cfg := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", cfg)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 }
 
 func run(t *testing.T, dir string, args ...string) string {
@@ -56,8 +68,7 @@ func fleet(t *testing.T, n int) (remote string, machines []string) {
 	return newFleet(t, n)
 }
 
-// newFleet is fleet for a parallel test, which cannot set the environment
-// requireGit sets: its parent calls requireGit instead.
+// newFleet is fleet for a subtest, whose parent has called requireGit.
 func newFleet(t *testing.T, n int) (remote string, machines []string) {
 	t.Helper()
 	root := t.TempDir()
@@ -139,6 +150,7 @@ func remoteFile(t *testing.T, remote, name string) string {
 }
 
 func TestEachMachinePublishesItsOwnFileAndReceivesTheOthers(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, b := m[0], m[1]
 
@@ -167,6 +179,7 @@ func TestEachMachinePublishesItsOwnFileAndReceivesTheOthers(t *testing.T) {
 }
 
 func TestOnlyThisHostsFileIsEverPublished(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	a := m[0]
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
@@ -185,6 +198,7 @@ func TestOnlyThisHostsFileIsEverPublished(t *testing.T) {
 }
 
 func TestLocalCommitsAreNeverPushedAndNeverDiscarded(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	a := m[0]
 	write(t, filepath.Join(a, "WIP.txt"), "unfinished\n")
@@ -205,6 +219,7 @@ func TestLocalCommitsAreNeverPushedAndNeverDiscarded(t *testing.T) {
 }
 
 func TestAJournalDirectoryInsideAnotherRepositoryIsRefused(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 1)
 	sub := filepath.Join(m[0], "channels", "journal")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
@@ -218,8 +233,13 @@ func TestAJournalDirectoryInsideAnotherRepositoryIsRefused(t *testing.T) {
 }
 
 func TestAPushRejectedByAnotherMachineIsRetriedAndSucceeds(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, b := m[0], m[1]
+	// The push names the tip it fetched, so a person's push.useForceIfIncludes,
+	// which holds a push that names none to what the clone's reflog has seen,
+	// cannot refuse the retry.
+	run(t, a, "config", "push.useForceIfIncludes", "true")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
 	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
 
@@ -244,6 +264,7 @@ func TestAPushRejectedByAnotherMachineIsRetriedAndSucceeds(t *testing.T) {
 }
 
 func TestTwoMachinesWithTheSameHostIDAreReportedAndNothingIsTouched(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	appendLines(t, filepath.Join(a, "host-x.jsonl"), `{"id":"hive:from-a"}`)
@@ -264,6 +285,7 @@ func TestTwoMachinesWithTheSameHostIDAreReportedAndNothingIsTouched(t *testing.T
 }
 
 func TestARecordStillBeingWrittenWaitsForTheNextSync(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	path := filepath.Join(m[0], "host-a.jsonl")
 	write(t, path, "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"")
@@ -280,6 +302,7 @@ func TestARecordStillBeingWrittenWaitsForTheNextSync(t *testing.T) {
 }
 
 func TestRecordsWrittenDuringSyncsAreNeverLostAndTheCloneNeverSticks(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	path := filepath.Join(a, "host-a.jsonl")
@@ -345,9 +368,11 @@ func TestRecordsWrittenDuringSyncsAreNeverLostAndTheCloneNeverSticks(t *testing.
 func TestHooksAndSigningCannotStopOrStallASync(t *testing.T) {
 	remote, m := fleet(t, 1)
 	a := m[0]
-	// A signer that always fails, and a pre-push hook that always refuses.
-	cfg := os.Getenv("GIT_CONFIG_GLOBAL")
+	// A signer that always fails, in this machine's own git configuration, and a
+	// pre-push hook that always refuses.
+	cfg := filepath.Join(t.TempDir(), "gitconfig")
 	write(t, cfg, "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", cfg)
 	hook := filepath.Join(a, ".git", "hooks", "pre-push")
 	write(t, hook, "#!/bin/sh\nexit 1\n")
 	if err := os.Chmod(hook, 0o755); err != nil {
@@ -363,6 +388,7 @@ func TestHooksAndSigningCannotStopOrStallASync(t *testing.T) {
 }
 
 func TestAFileGitCallsBinaryIsStillPublished(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	a := m[0]
 	write(t, filepath.Join(a, ".gitattributes"), "*.jsonl binary\n")
@@ -411,6 +437,7 @@ func TestAHungRemoteIsCutOffNearTheDeadline(t *testing.T) {
 }
 
 func TestASecondSyncOfTheSameCloneWaitsItsTurn(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 1)
 	a := m[0]
 	lockPath := filepath.Join(a, ".git", "fleetd-sync.lock")
@@ -455,6 +482,7 @@ func offBranch(t *testing.T) (remote, a, b string) {
 // branch's files lack them. Each state ends with every record published to main,
 // from a work tree that holds every machine's file.
 func TestAClonePutOffTheJournalsBranchIsPutBackByInit(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	for _, c := range []struct {
 		name  string
@@ -538,6 +566,7 @@ func TestAClonePutOffTheJournalsBranchIsPutBackByInit(t *testing.T) {
 // where the fleet never looks: sync stops, and says to run init, which puts the
 // clone back on origin's.
 func TestABranchFollowingAnotherRemotesIsPutBackOnOrigins(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	remote, a, _ := offBranch(t)
 	backup := filepath.Join(t.TempDir(), "backup.git")
@@ -566,6 +595,7 @@ func TestABranchFollowingAnotherRemotesIsPutBackOnOrigins(t *testing.T) {
 // passes for origin's main, and an orphan zz is not taken for a branch zz/a that
 // follows one of origin's. Neither reads as a branch the clone no longer has.
 func TestABranchIsLookedUpByItsFullName(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	for _, c := range []struct {
 		name  string
@@ -604,6 +634,7 @@ func TestABranchIsLookedUpByItsFullName(t *testing.T) {
 // back all the same, and leaves the file as it is: the sync then says the remote
 // holds records this copy lacks, which init --reclaim puts back.
 func TestAnOlderCommitCheckedOutIsPutBackAndLeftForReclaim(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	remote, a, _ := offBranch(t)
 	run(t, a, "checkout", "--quiet", "HEAD~1")
@@ -627,36 +658,58 @@ func TestAnOlderCommitCheckedOutIsPutBackAndLeftForReclaim(t *testing.T) {
 // sync and by init, and nothing is pushed: a push would recreate the branch the
 // fleet left. Their own fetches prune the clone's copy of the branch, so this
 // holds whether a person pruned it or not, in a clone made with --single-branch
-// too, and a tag named like the branch changes nothing. The way on the message
-// gives puts the clone on the journal's branch, which the next sync publishes to.
+// too, and a tag named like the branch changes nothing. Only a person knows where
+// the journal went, so the way on the message gives is init told the branch,
+// which puts the clone there, and not on another the clone follows or on the
+// remote's default; the next sync publishes there.
 func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
-	renamed := func(t *testing.T, remote string) {
-		run(t, filepath.Dir(remote), "--git-dir", remote, "branch", "-m", "main", "trunk")
+	renamed := func(to string) func(t *testing.T, remote string) {
+		return func(t *testing.T, remote string) {
+			run(t, filepath.Dir(remote), "--git-dir", remote, "branch", "-m", "main", to)
+		}
+	}
+	// startedApart is a branch of the remote's that another machine started the
+	// journal on, with a history of its own.
+	startedApart := func(t *testing.T, remote, branch string) {
+		other := filepath.Join(t.TempDir(), "other")
+		run(t, filepath.Dir(other), "init", "--quiet", "--initial-branch="+branch, other)
+		identify(t, other)
+		write(t, filepath.Join(other, "README.md"), "started apart\n")
+		run(t, other, "add", ".")
+		run(t, other, "commit", "--quiet", "-m", "started apart")
+		run(t, other, "push", "--quiet", remote, branch)
 	}
 	for _, c := range []struct {
 		name   string
 		single bool
+		before [][]string
 		change func(t *testing.T, remote string)
 		leave  [][]string
+		to     string
 	}{
-		{"renamed on the remote", false, renamed, nil},
-		{"renamed on the remote, and pruned by hand", false, renamed, [][]string{{"fetch", "--quiet", "--prune"}}},
-		{"renamed on the remote, beside a tag named like it", false, renamed, [][]string{{"tag", "main"}}},
-		{"renamed on the remote, in a clone made with --single-branch", true, renamed, nil},
-		{"deleted on purpose, beside a default of its own", false, func(t *testing.T, remote string) {
+		{"renamed on the remote", false, nil, renamed("trunk"), nil, "trunk"},
+		{"renamed on the remote, and pruned by hand", false, nil, renamed("trunk"), [][]string{{"fetch", "--quiet", "--prune"}}, "trunk"},
+		{"renamed on the remote, beside a tag named like it", false, nil, renamed("trunk"),
+			[][]string{{"tag", "main"}, {"fetch", "--quiet", "--prune"}}, "trunk"},
+		{"renamed on the remote, in a clone made with --single-branch", true, nil, renamed("trunk"), nil, "trunk"},
+		{"renamed on the remote, beside another branch the clone follows", false, [][]string{
+			{"push", "--quiet", "origin", "main:refs/heads/stray"}, {"fetch", "--quiet"},
+			{"branch", "--quiet", "--track", "stray", "origin/stray"},
+		}, renamed("trunk"), nil, "trunk"},
+		{"renamed on the remote to a branch that is not its default", false, nil, func(t *testing.T, remote string) {
+			startedApart(t, remote, "docs")
+			run(t, filepath.Dir(remote), "--git-dir", remote, "branch", "-m", "main", "journal")
+			run(t, filepath.Dir(remote), "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/docs")
+		}, nil, "journal"},
+		{"deleted on purpose, beside a default of its own", false, nil, func(t *testing.T, remote string) {
 			// Another machine started the journal on trunk at the same time, and the
 			// fleet kept trunk.
-			other := filepath.Join(t.TempDir(), "other")
-			run(t, filepath.Dir(other), "init", "--quiet", "--initial-branch=trunk", other)
-			identify(t, other)
-			write(t, filepath.Join(other, "README.md"), "started at the same time\n")
-			run(t, other, "add", ".")
-			run(t, other, "commit", "--quiet", "-m", "the other start")
-			run(t, other, "push", "--quiet", remote, "trunk")
-			run(t, other, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
-			run(t, other, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
-		}, nil},
+			startedApart(t, remote, "trunk")
+			run(t, filepath.Dir(remote), "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			run(t, filepath.Dir(remote), "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+		}, nil, "trunk"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -665,6 +718,9 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 			if c.single {
 				a = filepath.Join(t.TempDir(), "a")
 				run(t, filepath.Dir(a), "clone", "--quiet", "--single-branch", "--branch", "main", remote, a)
+			}
+			for _, args := range c.before {
+				run(t, a, args...)
 			}
 			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
 			mustSync(t, options(a, "host-a"))
@@ -681,19 +737,18 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
 				t.Fatalf("init: %v, want ErrNoUpstream saying the branch is gone", err)
 			}
-			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); heads != "refs/heads/trunk" {
-				t.Fatalf("the remote has %q, want trunk alone", heads)
+			if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/main").Output(); err == nil {
+				t.Fatalf("main came back, at %s", out)
 			}
-			if want := "`git -C \"" + a + "\" branch --unset-upstream`"; !strings.Contains(err.Error(), want) {
+			if want := "`fleetd init --dir \"" + a + "\" --branch <branch> <journal URL>`"; !strings.Contains(err.Error(), want) {
 				t.Fatalf("init: %v, want it to name %s", err, want)
 			}
-			run(t, a, "branch", "--unset-upstream")
-			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached || res.Branch != "trunk" {
-				t.Fatalf("init = %+v, want the clone put on trunk", res)
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s", Branch: c.to}); !res.Reattached || res.Branch != c.to {
+				t.Fatalf("init = %+v, want the clone put on %s", res, c.to)
 			}
 			mustSync(t, options(a, "host-a"))
-			if got := run(t, a, "--git-dir", remote, "show", "trunk:host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}" {
-				t.Fatalf("trunk holds %q for host-a", got)
+			if got := run(t, a, "--git-dir", remote, "show", c.to+":host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}" {
+				t.Fatalf("%s holds %q for host-a", c.to, got)
 			}
 		})
 	}
@@ -701,19 +756,23 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 
 // A branch deleted by mistake, and pushed back from the machine that synced
 // last as the message says, is taken up again by every other machine's next
-// sync, though each had pruned its copy of the branch.
+// sync, though each had pruned its copy of the branch. The push names origin's
+// branch, which the machine's own may not be named after.
 func TestABranchPushedBackAfterAMistakenDeletionIsTakenUpAgain(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, b := m[0], m[1]
+	run(t, b, "branch", "--quiet", "-m", "main", "work")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
 	mustSync(t, options(a, "host-a"))
 	mustSync(t, options(b, "host-b"))
 	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
-	if _, err := Sync(context.Background(), options(a, "host-a")); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "`git push origin HEAD`") {
-		t.Fatalf("sync: %v, want ErrNoUpstream saying how to push the branch back", err)
+	_, err := Sync(context.Background(), options(a, "host-a"))
+	if advice := "`git push origin HEAD:<branch>` in its journal directory and main for <branch>"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), advice) {
+		t.Fatalf("sync: %v, want ErrNoUpstream saying %s", err, advice)
 	}
-	run(t, b, "push", "--quiet", "origin", "HEAD")
+	run(t, b, "push", "--quiet", "origin", "HEAD:main")
 	mustSync(t, options(a, "host-a"))
 	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
 		t.Fatalf("main holds %q for host-a", got)
@@ -724,6 +783,7 @@ func TestABranchPushedBackAfterAMistakenDeletionIsTakenUpAgain(t *testing.T) {
 // back by the push, nor by init's: each pushes onto the tip it fetched and
 // nothing else, and then says the branch is gone.
 func TestARenameBetweenTheFetchAndThePushRecreatesNothing(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	for _, by := range []string{"sync", "init"} {
 		t.Run(by, func(t *testing.T) {
@@ -760,6 +820,7 @@ func TestARenameBetweenTheFetchAndThePushRecreatesNothing(t *testing.T) {
 // fleetd's fetches name their refspec, so a person's fetch.pruneTags does not
 // delete the clone's tags, which may be all that holds a commit of theirs.
 func TestAPruningFetchLeavesTheClonesTagsAlone(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	a := m[0]
 	run(t, a, "config", "fetch.prune", "true")
@@ -781,10 +842,11 @@ func TestAPruningFetchLeavesTheClonesTagsAlone(t *testing.T) {
 // upstream, a branch gone from the remote, a detached HEAD, or commits fleetd did
 // not make.
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "merge-base", "prepare",
 		"detached symbolic-ref", "by hand for-each-ref", "gone symbolic-ref", "gone for-each-ref",
-		"gone refs/remotes/origin/main", "gone fetch"} {
+		"gone refs/remotes/origin/main", "gone fetch", "other symbolic-ref"} {
 		t.Run(at, func(t *testing.T) {
 			t.Parallel()
 			remote, m := newFleet(t, 1)
@@ -798,6 +860,12 @@ func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 			case "gone":
 				run(t, m[0], "--git-dir", remote, "branch", "-m", "main", "trunk")
 				run(t, m[0], "fetch", "--quiet", "--prune")
+				at = call
+			case "other":
+				// main follows another remote's branch, which sync does not take.
+				run(t, m[0], "remote", "add", "backup", remote)
+				run(t, m[0], "fetch", "--quiet", "backup")
+				run(t, m[0], "branch", "--quiet", "-u", "backup/main")
 				at = call
 			case "by":
 				run(t, m[0], "switch", "--quiet", "-c", "local-only")
@@ -837,6 +905,7 @@ func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 // branch protection, is reported as refused and not tried again: no later push
 // gets past it until a person changes the remote.
 func TestAPushTheRemoteRefusesIsReportedAsRefused(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	hook := filepath.Join(remote, "hooks", "pre-receive")
 	write(t, hook, "#!/bin/sh\necho 'protected branch' >&2\nexit 1\n")
@@ -874,6 +943,7 @@ func TestARenameRetryStopsWhenTheContextEnds(t *testing.T) {
 // A repository with no commit yet has no index either; a sync there still says
 // what to do rather than failing to fill the index: run init.
 func TestARepositoryWithNoCommitIsToldToRunInit(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	dir := t.TempDir()
 	run(t, dir, "init", "--quiet", "--initial-branch=main")
@@ -888,6 +958,7 @@ func TestARepositoryWithNoCommitIsToldToRunInit(t *testing.T) {
 // whether it has fetched since or not, and init puts it on the journal's branch,
 // keeping its git directory and the records written meanwhile.
 func TestAPlainCloneOfTheEmptyJournalIsPutOnItsBranchByInit(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	for _, fetched := range []bool{false, true} {
 		t.Run(map[bool]string{false: "not fetched since", true: "fetched since"}[fetched], func(t *testing.T) {
@@ -918,6 +989,7 @@ func TestAPlainCloneOfTheEmptyJournalIsPutOnItsBranchByInit(t *testing.T) {
 }
 
 func TestADirectoryThatIsNotACloneIsNamedAsSuch(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	dir := t.TempDir()
 	if _, err := Sync(context.Background(), options(dir, "host-a")); !errors.Is(err, ErrNotClone) {
@@ -926,6 +998,7 @@ func TestADirectoryThatIsNotACloneIsNamedAsSuch(t *testing.T) {
 }
 
 func TestNothingToPublishStillReceives(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
 	mustSync(t, options(m[0], "host-a"))
@@ -950,6 +1023,7 @@ func commitByHand(t *testing.T, clone string, change func(dir string)) {
 }
 
 func TestAnotherIdentitysUnpublishedRecordsAreNeverOverwritten(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	a := m[0]
 	// One machine, two identities: a missing FLEET_SALT is only a warning, so
@@ -975,6 +1049,7 @@ func TestAnotherIdentitysUnpublishedRecordsAreNeverOverwritten(t *testing.T) {
 }
 
 func TestAFileChangedHereAndOnTheRemoteIsKeptAndReported(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	a, admin := m[0], m[1]
 	write(t, filepath.Join(a, "README.md"), "edited on this machine\n")
@@ -991,6 +1066,7 @@ func TestAFileChangedHereAndOnTheRemoteIsKeptAndReported(t *testing.T) {
 }
 
 func TestAFileDeletedOnTheRemoteIsRemovedHere(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 3)
 	a, b, admin := m[0], m[1], m[2]
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
@@ -1012,6 +1088,7 @@ func TestAFileDeletedOnTheRemoteIsRemovedHere(t *testing.T) {
 }
 
 func TestACRLFCheckoutOfThisHostsFileStillPublishes(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
 	mustSync(t, options(m[0], "host-a"))
@@ -1099,6 +1176,7 @@ func unsetenv(t *testing.T, key string) {
 }
 
 func TestARewrittenRemoteNamesTheWayBackAndKeepsUnpublishedRecords(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 2)
 	a, admin := m[0], m[1]
 	path := filepath.Join(a, "host-a.jsonl")
@@ -1126,6 +1204,7 @@ func TestARewrittenRemoteNamesTheWayBackAndKeepsUnpublishedRecords(t *testing.T)
 }
 
 func TestASyncInterruptedWhileBringingFilesInIsRepairedByTheNext(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
@@ -1148,6 +1227,7 @@ func TestASyncInterruptedWhileBringingFilesInIsRepairedByTheNext(t *testing.T) {
 }
 
 func TestARemoteLinkCannotMakeASyncDeleteOutsideTheClone(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symbolic links needs extra privileges on Windows")
 	}
@@ -1179,6 +1259,7 @@ func TestARemoteLinkCannotMakeASyncDeleteOutsideTheClone(t *testing.T) {
 }
 
 func TestALinkMadeInTheCloneCannotRedirectARemoval(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("creating symbolic links needs extra privileges on Windows")
 	}
@@ -1209,6 +1290,7 @@ func TestALinkMadeInTheCloneCannotRedirectARemoval(t *testing.T) {
 }
 
 func TestARemovalAnInterruptedSyncMissedIsDoneByTheNext(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 3)
 	a, b, admin := m[0], m[1], m[2]
 	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a"}`)
@@ -1237,6 +1319,7 @@ func TestARemovalAnInterruptedSyncMissedIsDoneByTheNext(t *testing.T) {
 }
 
 func TestAKeptFileSurvivesTheRemoteSwappingADirectoryAndAFile(t *testing.T) {
+	t.Parallel()
 	cases := map[string]struct {
 		before func(t *testing.T, dir string) // what the remote starts with
 		edit   string                         // the file edited on this machine
@@ -1292,6 +1375,7 @@ func TestAKeptFileSurvivesTheRemoteSwappingADirectoryAndAFile(t *testing.T) {
 // fsmonitor daemon, since on Windows everything git leaves running is ended
 // with it. A hook stands in for the daemon: it records that git consulted it.
 func TestASyncNeverConsultsAnFsmonitor(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 1)
 	a := m[0]
 	marker := filepath.Join(t.TempDir(), "fsmonitor-ran")
@@ -1313,6 +1397,7 @@ func TestASyncNeverConsultsAnFsmonitor(t *testing.T) {
 // (config.c at v2.35.0, fsmonitor-settings.c at v2.43.0). The test above shows
 // the empty value turns fsmonitor off on the git installed here.
 func TestFsmonitorIsTurnedOffInAWayOldGitUnderstands(t *testing.T) {
+	t.Parallel()
 	for i := 0; i+1 < len(gitConfig); i += 2 {
 		if gitConfig[i] == "-c" && strings.HasPrefix(gitConfig[i+1], "core.fsmonitor=") {
 			if v := strings.TrimPrefix(gitConfig[i+1], "core.fsmonitor="); v != "" {
@@ -1353,6 +1438,7 @@ func TestTheCallersGitEnvironmentCannotRedirectASync(t *testing.T) {
 // Every variable git itself counts as local to a repository is cleared, so a
 // newer git that adds one fails here rather than in the field.
 func TestEveryRepositoryVariableGitKnowsIsCleared(t *testing.T) {
+	t.Parallel()
 	requireGit(t)
 	out, err := exec.Command("git", "rev-parse", "--local-env-vars").Output()
 	if err != nil {
@@ -1528,6 +1614,7 @@ func TestASyncNeverStartsGitsAutomaticMaintenance(t *testing.T) {
 // longer than staleLock is a leftover, and is removed. A newer one is left
 // alone, since a git command may still be using it.
 func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b"}`)
@@ -1569,6 +1656,7 @@ func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
 // for any other reason, a declined hook or a protected branch, is not a race,
 // and retrying it would only repeat it.
 func TestOnlyARaceIsRetried(t *testing.T) {
+	t.Parallel()
 	for out, want := range map[string]bool{
 		"To github.com:o/journal.git\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n":                                                            true,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (cannot lock ref 'refs/heads/main': is at 3f1c but expected 1a2b)\n":                                    true,
@@ -1588,6 +1676,7 @@ func TestOnlyARaceIsRetried(t *testing.T) {
 // is refused for good. A race and a failure on the remote's side, such as its
 // storage, are not: a later push can get past them.
 func TestOnlyADeclinedPushIsRefused(t *testing.T) {
+	t.Parallel()
 	for out, want := range map[string]bool{
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n":                                                                          true,
 		"!\trefs/heads/main:refs/heads/main\t[remote rejected] (protected branch hook declined)\n":                                                                     true,
@@ -1610,6 +1699,7 @@ func TestOnlyADeclinedPushIsRefused(t *testing.T) {
 // the start of git's copy in that form has nothing of its own either, and a sync
 // brings it up to date.
 func TestASyncUpdatesACRLFCopyThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	run(t, a, "config", "core.autocrlf", "true")
@@ -1632,6 +1722,7 @@ func TestASyncUpdatesACRLFCopyThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
 // A CRLF copy of short lines that holds only the start of git's copy can be
 // larger than git's LF copy, by up to twice: it is still read, and updated.
 func TestACRLFCopyLargerThanGitsCopyCanStillHoldOnlyItsStart(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 2)
 	a, b := m[0], m[1]
 	run(t, a, "config", "core.autocrlf", "true")
@@ -1664,6 +1755,7 @@ func TestACRLFCopyLargerThanGitsCopyCanStillHoldOnlyItsStart(t *testing.T) {
 // is reported by the remote as [remote rejected], not by git as [rejected]. It is
 // a race like any other: the sync tries again and publishes.
 func TestARaceTheRemoteReportsIsRetried(t *testing.T) {
+	t.Parallel()
 	remote, m := fleet(t, 1)
 	hook := filepath.Join(remote, "hooks", "pre-receive")
 	write(t, hook, `#!/bin/sh
@@ -1689,6 +1781,7 @@ fi
 // an older backup, has no change of its own. A sync brings it up to date, both
 // when the remote changed it since and when it did not.
 func TestASyncUpdatesAFileThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
+	t.Parallel()
 	_, m := fleet(t, 3)
 	a, b, c := m[0], m[1], m[2]
 	for _, host := range []struct{ dir, name string }{{b, "host-b"}, {c, "host-c"}} {
@@ -1716,5 +1809,26 @@ func TestASyncUpdatesAFileThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
 	}
 	if status := run(t, a, "status", "--porcelain"); status != "" {
 		t.Fatalf("git status after the sync:\n%s", status)
+	}
+}
+
+// A sync whose second look for a gone branch cannot fetch says why, rather than
+// that the branch is gone: the network may be down while the branch is back.
+func TestASecondLookThatCannotFetchSaysWhy(t *testing.T) {
+	t.Parallel()
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "--git-dir", remote, "branch", "-m", "main", "trunk")
+	run(t, a, "fetch", "--quiet", "--prune")
+	down := errors.New("network down")
+	o := options(a, "host-a")
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "fetch") {
+			return "", down
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if _, err := Sync(context.Background(), o); !errors.Is(err, down) || errors.Is(err, ErrNoUpstream) {
+		t.Fatalf("sync: %v, want the fetch's own error", err)
 	}
 }

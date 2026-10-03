@@ -780,15 +780,15 @@ func goneUpstream(g git, head string) (string, error) {
 
 // goneError says what to do about a branch that follows one of origin's the
 // clone no longer has. Branch names come from the remote, so none is put into a
-// command a person might paste. The way past a rename, or a deletion on purpose,
-// works in a clone made with --single-branch too, where git refuses to have a
-// branch follow one of origin's that the clone's own refspec leaves out.
+// command a person might paste. Only a person knows where the journal went after
+// a rename, or a deletion on purpose, so the way on is init told the branch.
 func goneError(g git, head, theirs string) error {
 	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
-		"it. If it was renamed, or deleted on purpose, `git -C \"%s\" branch --unset-upstream` and then `fleetd init "+
-		"--dir \"%s\" <journal URL>` put the clone on the journal's branch; if it was deleted by mistake, push it back "+
-		"from the machine that synced last, in its journal directory with `git push origin HEAD`, and every machine's "+
-		"next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs, g.dir, g.dir)
+		"it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` "+
+		"puts the clone on <branch>, the one the journal is on now; if it was deleted by mistake, push it back from "+
+		"the machine that synced last, with `git push origin HEAD:<branch>` in its journal directory and %s for "+
+		"<branch>, and every machine's next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"),
+		theirs, g.dir, theirs)
 }
 
 // refetchGone fetches when HEAD's branch follows one of origin's that this clone
