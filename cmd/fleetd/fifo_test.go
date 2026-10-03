@@ -406,7 +406,9 @@ func TestAFIFOWhereANoteIsWrittenHoldsNothingUp(t *testing.T) {
 // A clone that has used the fleet's salt, and lost fleetd.json with none to put
 // back, publishes nothing under another id even when its note of that salt is
 // one readNote refuses: a link, a FIFO, a directory or a note past its bound
-// still says the clone used a salt. Only a missing note means none.
+// still says the clone used a salt. Only a missing note means none. Its advice,
+// followed on a machine without FLEET_SALT, files the record that waited under
+// the fleet's id.
 func TestAnUnreadableSaltNoteStillHoldsTheRecords(t *testing.T) {
 	t.Parallel()
 	for _, note := range []string{"a link to the salt", "a FIFO", "a directory", "the salt past 1 MiB"} {
@@ -468,10 +470,28 @@ func TestAnUnreadableSaltNoteStillHoldsTheRecords(t *testing.T) {
 			}
 			_, _, err = exec(t, "sync", "--dir", b, "--timeout", "10s")
 			if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "cannot be read or holds none") ||
-				!strings.Contains(err.Error(), "--salt <salt> <journal URL>") {
+				!strings.Contains(err.Error(), "--salt <salt> <journal URL>") ||
+				!strings.Contains(err.Error(), "another machine's .git/fleetd-salt holds") {
 				t.Errorf("sync: %v; want ErrNoFleetFile, saying the note cannot be read, nothing published", err)
 			}
+			// It names init only: the salt put back in the note leaves the clone
+			// without fleetd.json, which, on a machine without FLEET_SALT, the guard
+			// for a salt the clone used refuses all the same.
+			if err != nil && strings.Contains(err.Error(), "in that file") {
+				t.Errorf("sync: %v; want no advice to put the salt back in the note, which ends no refusal", err)
+			}
 			onlyUnderTheFleetsId(t, remote, fleetID)
+			if _, _, err := exec(t, "init", "--dir", b, "--salt", "s", remote); err != nil {
+				t.Fatalf("init as the refusal says: %v", err)
+			}
+			fleetFileAged(t, b)
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatalf("sync after init: %v", err)
+			}
+			onlyUnderTheFleetsId(t, remote, fleetID)
+			if _, ok := remoteHostRecords(t, remote, "s", "b2"); !ok {
+				t.Fatal("the record that waited is not under the fleet's id")
+			}
 		})
 	}
 }

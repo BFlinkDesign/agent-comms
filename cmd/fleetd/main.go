@@ -301,7 +301,18 @@ func cacheSalt(journalDir, salt string) {
 	if !ok || cachedSalt(journalDir) == salt {
 		return
 	}
-	_ = gitsync.WriteNote(context.Background(), filepath.Join(gitDir, saltCacheName), []byte(salt+"\n"))
+	_ = writeNote(filepath.Join(gitDir, saltCacheName), []byte(salt+"\n"))
+}
+
+// writeNote writes a note every command, or every sync, keeps, refusing at once
+// a directory where it goes: no rename replaces one, and gitsync.WriteNote's
+// retrying, for a file Windows holds open, would hold up every command for
+// seconds, a hook's included.
+func writeNote(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	return gitsync.WriteNote(context.Background(), path, data)
 }
 
 // resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,
@@ -602,8 +613,10 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 		if _, err := os.Lstat(note); !ok && err == nil && last == "" {
 			stale = fmt.Errorf("%w, and %s, which notes the salt this clone used, cannot be read or holds none: its "+
 				"records would go out under %s, which may be another id than the fleet's, so nothing was published. "+
-				"Put the fleet's salt in that file, as another machine's .git/fleetd-salt holds it, or give it to "+
-				"`fleetd init --dir \"%s\" --salt <salt> <journal URL>`", gitsync.ErrNoFleetFile, note, h.ID, store.Dir())
+				"`fleetd init --dir \"%s\" --salt <salt> <journal URL>`, given the fleet's salt, which another "+
+				"machine's .git/fleetd-salt holds, puts the journal's %s in place, or one with that salt where the "+
+				"journal has none to put back, after which a sync files them under the fleet's id",
+				gitsync.ErrNoFleetFile, note, h.ID, store.Dir(), gitsync.FleetFile)
 			cancel()
 			return
 		}

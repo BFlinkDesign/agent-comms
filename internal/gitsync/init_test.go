@@ -3674,6 +3674,15 @@ func TestAHookBeforeTheRepointDoesNotReopenTheMovedJournalsDefault(t *testing.T)
 		t.Errorf("D's sync before it is put on journal = %+v, %v; want ErrJournalElsewhere naming journal, nothing published",
 			res, err)
 	}
+	// Neither refused sync left a copy of D's file in its object store, which no
+	// sync would prune while the refusals last.
+	blob, err := Git(context.Background(), d, []byte(readFile(t, filepath.Join(d, "host-d.jsonl"))), "hash-object", "--stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Git(context.Background(), d, nil, "cat-file", "-e", strings.TrimSpace(blob)); err == nil {
+		t.Errorf("a refused sync left D's whole file, %s, in the clone's object store", strings.TrimSpace(blob))
+	}
 	heads := func() string {
 		return run(t, filepath.Dir(remote), "--git-dir", remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
 	}

@@ -589,10 +589,6 @@ func snapshotCommit(g git, remoteTip, branch, own, file, message string) (string
 		return "", 0, nil
 	}
 
-	blob, err := g.raw(complete, "hash-object", "-w", "--stdin")
-	if err != nil {
-		return "", 0, err
-	}
 	// The new tree is the remote tip's top-level tree with this host's entry
 	// replaced, assembled with ls-tree and mktree, so no index is involved.
 	listing, err := g.raw(nil, "ls-tree", "-z", remoteTip)
@@ -633,6 +629,12 @@ func snapshotCommit(g git, remoteTip, branch, own, file, message string) (string
 				"--branch <branch> <journal URL>` puts this clone on the journal's branch", ErrJournalElsewhere,
 				branch, on, branch, g.dir)
 		}
+	}
+	// Only now is the file written into the object store: a sync refused above
+	// leaves no copy of it behind, which nothing would prune while it lasts.
+	blob, err := g.raw(complete, "hash-object", "-w", "--stdin")
+	if err != nil {
+		return "", 0, err
 	}
 	entries = append(entries, "100644 blob "+strings.TrimSpace(blob)+"\t"+own)
 	tree, err := g.raw([]byte(strings.Join(entries, "\x00")+"\x00"), "mktree", "-z")

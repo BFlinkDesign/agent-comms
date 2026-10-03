@@ -377,7 +377,10 @@ clone init kept beside the directory, and `fleetd.json` in place whenever the
 journal's branch holds it, or the clone has used the fleet's salt and this machine's
 would differ; else it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
-look, nor, once init has recorded the journal's branch, another of origin's. Any
+look, nor, once init has recorded the journal's branch, another of origin's; and it
+publishes nothing onto a branch holding no journal while another of origin's branches
+holds one, as a default cleaned once the fleet moved its journal (it says to run
+`fleetd init --branch`). Any
 other clone (detached, an orphan branch, a branch that follows nothing, a branch
 of the clone or another remote's, another of origin's than the one recorded, or
 no commit yet) is told to run

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
@@ -600,6 +601,35 @@ func TestANoteLargerThanItsBoundIsRefusedUnread(t *testing.T) {
 	}
 	if data, err := readNote(huge); err == nil {
 		t.Fatalf("a note of a terabyte read as %d bytes; want it refused", len(data))
+	}
+}
+
+// A directory where the salt cache or the sync's outcome goes is refused at
+// once, with a warning for the outcome: no rename replaces it, and every
+// command, a hook's included, writes the one, and every sync the other.
+func TestANoteThatIsADirectoryHoldsNothingUp(t *testing.T) {
+	t.Parallel()
+	for _, note := range []string{saltCacheName, syncStatusFile} {
+		t.Run(note, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dir, ".git", note, "x"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			start := time.Now()
+			if note == saltCacheName {
+				cacheSalt(dir, "s")
+			} else {
+				noteSync(dir, gitsync.Result{}, nil, start, &stderr)
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("writing %s onto a directory took %v; want it refused at once", note, elapsed)
+			}
+			if note == syncStatusFile && !strings.Contains(stderr.String(), "could not note") {
+				t.Fatalf("stderr %q; want a warning that the outcome was not noted", stderr.String())
+			}
+		})
 	}
 }
 

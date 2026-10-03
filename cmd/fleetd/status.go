@@ -62,7 +62,7 @@ func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, 
 	st.LastAttempt = &now
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err == nil {
-		err = gitsync.WriteNote(context.Background(), path, append(data, '\n'))
+		err = writeNote(path, append(data, '\n'))
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "fleetd: warning: could not note the sync's outcome in %s: %v\n", path, err)
