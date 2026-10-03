@@ -301,10 +301,7 @@ func cacheSalt(journalDir, salt string) {
 	if !ok || cachedSalt(journalDir) == salt {
 		return
 	}
-	path := filepath.Join(gitDir, saltCacheName)
-	if err := os.WriteFile(path+".tmp", []byte(salt+"\n"), 0o600); err == nil {
-		_ = gitsync.RenameRetry(context.Background(), path+".tmp", path)
-	}
+	_ = gitsync.WriteNote(context.Background(), filepath.Join(gitDir, saltCacheName), []byte(salt+"\n"))
 }
 
 // resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,

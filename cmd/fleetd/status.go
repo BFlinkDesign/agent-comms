@@ -62,10 +62,7 @@ func noteSync(dir string, res gitsync.Result, syncErr error, started time.Time, 
 	st.LastAttempt = &now
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err == nil {
-		tmp := path + ".tmp"
-		if err = os.WriteFile(tmp, append(data, '\n'), 0o644); err == nil {
-			err = gitsync.RenameRetry(context.Background(), tmp, path)
-		}
+		err = gitsync.WriteNote(context.Background(), path, append(data, '\n'))
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "fleetd: warning: could not note the sync's outcome in %s: %v\n", path, err)
@@ -144,7 +141,8 @@ func publications(dir string, stems []string) (map[string]publication, bool) {
 			remote = []byte(blob)
 		}
 		p := publication{Known: true, At: newestTS(remote)}
-		if local, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
+		// A regular file only: a push can make a host file a link.
+		if local, err := journal.ReadRegular(filepath.Join(dir, name)); err == nil {
 			// Only complete records: one still being written waits for the next sync.
 			local = bytes.ReplaceAll(local[:bytes.LastIndexByte(local, '\n')+1], []byte("\r\n"), []byte("\n"))
 			p.Unpublished = unpublished(local, remote)

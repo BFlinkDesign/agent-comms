@@ -33,6 +33,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // MaxAttempts bounds how many times a push rejected by another machine's
@@ -548,7 +550,7 @@ func batchSSH(g git) []string {
 // on top of remoteTip whose only change is this host's file as of its last
 // complete line. It returns "" when the remote already has every complete record.
 func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, error) {
-	data, err := os.ReadFile(file)
+	data, err := journal.ReadRegular(file)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", 0, nil
 	}

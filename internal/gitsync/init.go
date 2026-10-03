@@ -269,7 +269,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 		return res, err
 	}
 	if len(due) > 0 {
-		if err := os.WriteFile(filepath.Join(tmpGit, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
+		if err := WriteNote(ctx, filepath.Join(tmpGit, lookName), []byte(res.Branch+"\n")); err != nil {
 			return res, err
 		}
 	}
@@ -286,7 +286,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 			moved := (res.WroteFleetFile || errors.Is(err, ErrTwoJournals)) && os.MkdirAll(o.Dir, 0o755) == nil &&
 				RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git")) == nil
 			if keep = !moved && res.pushed && !errors.Is(err, ErrRejected); keep {
-				_ = os.WriteFile(filepath.Join(tmpGit, keptName), nil, 0o600)
+				_ = WriteNote(context.WithoutCancel(ctx), filepath.Join(tmpGit, keptName), nil)
 			}
 		}
 		return res, err
@@ -307,7 +307,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	// A sync must not start in Dir while Init is still filling its index: the
 	// lock moves into Dir with the git directory, and a hook's sync skips it.
 	lockPath := filepath.Join(tmpGit, syncLockName)
-	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+	if err := WriteNote(ctx, lockPath, []byte(fmt.Sprintf("%d\n", os.Getpid()))); err != nil {
 		return res, err
 	}
 	if err := placeFleetFile(g, o.Dir, tmpGit, res.Head); err != nil {
@@ -384,7 +384,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	}
 	if len(due) > 0 {
 		if err := look(g, gitDir, res.Branch); err != nil {
-			if werr := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); werr != nil {
+			if werr := WriteNote(ctx, filepath.Join(gitDir, lookName), []byte(res.Branch+"\n")); werr != nil {
 				return res, werr
 			}
 			return res, err
@@ -1204,7 +1204,7 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 		}
 		// Starting the journal, the branch has no top level, and holds none.
 		if !holdsJournal(top) {
-			if err := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
+			if err := WriteNote(g.ctx, filepath.Join(gitDir, lookName), []byte(res.Branch+"\n")); err != nil {
 				return err
 			}
 		}
@@ -1655,6 +1655,29 @@ func randomSalt() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// WriteNote replaces the file at path, one of fleetd's notes, with data, through
+// a file of its own made beside it, readable by its owner only, and renamed into
+// place: a FIFO or a link another account planted at path is replaced, never
+// written through or waited on, and no fixed temporary name can be planted ahead
+// of it.
+func WriteNote(ctx context.Context, path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = RenameRetry(ctx, f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
 
 // RenameRetry renames, retrying for a few seconds while Windows refuses because

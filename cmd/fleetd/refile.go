@@ -381,11 +381,7 @@ func fileMoved(ctx context.Context, dir, keep string, me hostOut, moved map[stri
 	if err != nil {
 		return total, err
 	}
-	path := filepath.Join(keep, refiledName)
-	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o600); err != nil {
-		return total, err
-	}
-	return total, gitsync.RenameRetry(ctx, path+".tmp", path)
+	return total, gitsync.WriteNote(ctx, filepath.Join(keep, refiledName), append(data, '\n'))
 }
 
 // publishedIDs returns the ids of the records name holds in this clone's HEAD
@@ -414,7 +410,7 @@ func publishedIDs(ctx context.Context, dir, name string) (ids map[string]bool, k
 // still be being written, and is read again once the file grows. Once ctx ends it
 // stops, reporting nothing read.
 func refileOne(ctx context.Context, store *journal.Store, path, from string, me hostOut, have, published map[string]bool) (added int, read int64, skipped int, err error) {
-	data, err := os.ReadFile(path)
+	data, err := journal.ReadRegular(path)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -532,7 +528,7 @@ func reconcileOwn(ctx context.Context, dir, gitDir string, me hostOut) error {
 	if err != nil || !ok {
 		return err
 	}
-	data, err := os.ReadFile(filepath.Join(dir, name))
+	data, err := journal.ReadRegular(filepath.Join(dir, name))
 	if err != nil {
 		return nil // a missing file is put back by refile
 	}

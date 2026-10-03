@@ -592,3 +592,80 @@ func TestAnAppendAfterATornRecordIsNotJoinedToIt(t *testing.T) {
 		t.Fatalf("err = %v, want the fragment reported as a malformed line of its own", err)
 	}
 }
+
+// A line longer than any record, which a person or a broken writer can leave in
+// a host file, is reported and skipped without being held: reading past one of
+// 64 MiB costs memory of the order of the bound, not of the line, and the
+// records around it are read, with their line numbers.
+func TestAnOverlongLineIsSkippedWithoutBeingHeld(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "first", 1, "")); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, testStem+".jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := []byte(strings.Repeat("x", 1<<20))
+	for range 64 {
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "third", 3, "")); err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	got, err := s.Read(testHost)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrMalformed) || !strings.Contains(err.Error(), "line 2:") {
+		t.Fatalf("err = %v, want line 2 reported as malformed", err)
+	}
+	if len(got) != 2 || got[1].From != "fleet/third" || got[1].Line != 3 {
+		t.Fatalf("read %+v, want the records on lines 1 and 3", got)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 16<<20 {
+		t.Fatalf("the read allocated %d bytes; want the long line skipped, not held", alloc)
+	}
+}
+
+// A host file that is a symbolic link, as a push can make one, is not read
+// through: the link could lead to a device that never ends, or a FIFO that never
+// answers. ReadAll names it, and still returns every other host's records.
+func TestReadAllRefusesAHostFileThatIsALink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(testHost, mustCell(t, "a", 0, "")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "elsewhere.jsonl")
+	if err := os.WriteFile(target, []byte(mustCell(t, "b", 0, "").Marshal()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "host-0000000000000000.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	got, err := s.ReadAll()
+	if err == nil || !strings.Contains(err.Error(), "host-0000000000000000.jsonl") {
+		t.Fatalf("err = %v, want the link named", err)
+	}
+	if len(got) != 1 || got[0].From != "fleet/a" {
+		t.Fatalf("read %+v, want only the record of the host file that is no link", got)
+	}
+}

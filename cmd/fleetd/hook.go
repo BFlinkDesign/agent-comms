@@ -352,7 +352,7 @@ func unsynced(journalDir, file string) bool {
 // session, reading only the end of its journal file: records are appended in
 // time order, so the session's last turn, if it was recent, is near the end.
 func lastTurn(file, tool, session string) (time.Time, bool) {
-	f, err := os.Open(file)
+	f, err := journal.OpenRegular(file, os.O_RDONLY, 0)
 	if err != nil {
 		return time.Time{}, false
 	}

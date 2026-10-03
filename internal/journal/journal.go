@@ -40,6 +40,11 @@ import (
 // than written and later found interleaved.
 const MaxRecordBytes = 4096
 
+// maxLineBytes bounds a line a read holds: one longer, far past any record a
+// build writes, is skipped to its end and reported, never held whole, so a file
+// of one endless line costs a read its time but not its memory.
+const maxLineBytes = 64 << 10
+
 // nameRe constrains the host-file stem. It matches the channel-name rule the rest
 // of this bus enforces, so a journal file can never be named in a way that
 // escapes its directory or collides with a channel.
@@ -126,10 +131,11 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 		return fmt.Errorf("journal: record contains an embedded newline: %q", line)
 	}
 
-	// Refuse a symlinked target. On unix openAppend additionally passes O_NOFOLLOW,
-	// which closes the window between this check and the open; on Windows the
-	// check alone is what is available, so the residual race is documented rather
-	// than hidden.
+	// Refuse a symlinked target. On unix OpenRegular additionally passes
+	// O_NOFOLLOW, which closes the window between this check and the open; on
+	// Windows the check alone is what is available, so the residual race is
+	// documented rather than hidden. Anything else but a regular file, a FIFO
+	// that would hold the append up say, is refused too.
 	if fi, lerr := os.Lstat(p); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("%w: %s", ErrSymlink, p)
 	}
@@ -153,7 +159,7 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 		line = "\n" + line
 	}
 
-	f, err := openAppend(p)
+	f, err := OpenRegular(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("journal: opening %s: %w", p, err)
 	}
@@ -188,7 +194,7 @@ func (s *Store) Append(hostID string, c cell.Cell) error {
 // that cannot be read is taken to be whole: the append that follows fails on it
 // anyway, or succeeds as before.
 func endsWithNewline(p string) bool {
-	f, err := os.Open(p)
+	f, err := OpenRegular(p, os.O_RDONLY, 0)
 	if err != nil {
 		return true
 	}
@@ -280,6 +286,18 @@ func (s *Store) ReadAll() ([]Record, error) {
 	return all, errors.Join(errs...)
 }
 
+// ReadRegular reads the whole of path, a file in or beside the journal, as a
+// regular file only: a link, which a push can put in the journal directory, is
+// not followed, to a device that never ends say, and a FIFO is not waited on.
+func ReadRegular(path string) ([]byte, error) {
+	f, err := OpenRegular(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
 // ErrMalformed reports a line that is present and terminated but not a usable
 // record. It is distinct from ErrTornRecord: a torn record is an interrupted
 // write, a malformed one is a write that completed and was wrong.
@@ -322,7 +340,9 @@ func parseRecord(line string) (Record, error) {
 }
 
 func (s *Store) readFile(p, stem string) ([]Record, error) {
-	f, err := os.Open(p)
+	// A regular file only: a push can make a host file a link, to a device that
+	// never ends or a FIFO that never answers.
+	f, err := OpenRegular(p, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -341,9 +361,24 @@ func (s *Store) readFile(p, stem string) ([]Record, error) {
 	// signal beyond a warning -- the exact "silently guesses" failure this package
 	// is written to avoid.
 	var defects []error
-	r := bufio.NewReaderSize(f, MaxRecordBytes)
+	r := bufio.NewReaderSize(f, maxLineBytes)
 	for n := 1; ; n++ {
-		line, rerr := r.ReadString('\n')
+		chunk, rerr := r.ReadSlice('\n')
+		if errors.Is(rerr, bufio.ErrBufferFull) {
+			for errors.Is(rerr, bufio.ErrBufferFull) {
+				_, rerr = r.ReadSlice('\n')
+			}
+			defects = append(defects, fmt.Errorf("journal: %s line %d: %w: longer than %d bytes", p, n, ErrMalformed,
+				maxLineBytes))
+			if rerr == nil {
+				continue
+			}
+			if !errors.Is(rerr, io.EOF) {
+				defects = append(defects, fmt.Errorf("journal: reading %s line %d: %w", p, n, rerr))
+			}
+			return out, errors.Join(defects...)
+		}
+		line := string(chunk)
 		complete := strings.HasSuffix(line, "\n")
 		trimmed := strings.TrimRight(line, "\r\n")
 

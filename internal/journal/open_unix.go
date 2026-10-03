@@ -8,19 +8,6 @@ import (
 	"syscall"
 )
 
-// openAppend opens the journal for appending, refusing to follow a symlink.
-//
-// O_NOFOLLOW closes the window that the caller's Lstat check alone leaves open:
-// between the check and the open, the path could be replaced with a link pointing
-// somewhere else. With the flag set the open itself fails instead, so there is no
-// window to exploit. This mirrors the guard hive/shell_write.py already applies to
-// channel files.
-func openAppend(path string) (*os.File, error) {
-	return os.OpenFile(path,
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW,
-		0o600)
-}
-
 // syncDir flushes the directory entry for a newly created journal file. POSIX
 // requires this separately from fsyncing the file: the file's own sync persists
 // its contents and inode, but not the name that points at them.
@@ -36,12 +23,13 @@ func syncDir(dir string) error {
 	return d.Close()
 }
 
-// OpenRegular opens path, a file beside the journal that another account able to
-// write there could have replaced, refusing anything but a regular file. A
-// symbolic link fails the open (O_NOFOLLOW). A FIFO or a device would make the
-// open wait for a reader or a writer that may never come; O_NONBLOCK makes it
-// return at once, and the file is then refused. On a regular file O_NONBLOCK has
-// no effect.
+// OpenRegular opens path, a journal file or one beside it that another account
+// able to write there could have replaced, refusing anything but a regular file.
+// A symbolic link fails the open (O_NOFOLLOW), which closes the window a
+// caller's Lstat check alone leaves open, as hive/shell_write.py does for
+// channel files. A FIFO or a device would make the open wait for a reader or a
+// writer that may never come; O_NONBLOCK makes it return at once, and the file
+// is then refused. On a regular file O_NONBLOCK has no effect.
 func OpenRegular(path string, flag int, perm os.FileMode) (*os.File, error) {
 	if err := refuseIrregular(path); err != nil {
 		return nil, err

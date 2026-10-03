@@ -437,7 +437,11 @@ was wrong:
   a regular file, such as a FIFO, is refused rather than written through or
   waited on; so is the hook log, and so are the notes fleetd reads from the
   clone's git directory (the salt it last held, the sync's outcome, and what it
-  re-filed). A note larger than 1 MiB is not read, and a
+  re-filed), which it writes through a file of its own renamed into place. So,
+  too, are the journal files: this machine's own, which a record appends to,
+  and every machine's, which `where` reads, and which a push can make a link;
+  `where` names such a file and reports the rest, and reports a line longer
+  than 64 KiB without holding it. A note larger than 1 MiB is not read, and a
   sync considers at most 64 distinct salts, those noted first. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as

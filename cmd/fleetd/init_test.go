@@ -1011,16 +1011,18 @@ func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
 			}
 			dir := filepath.Join(t.TempDir(), "journal")
 			gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
-			if !cached {
-				if err := os.Mkdir(filepath.Join(dir, ".git", saltCacheName+".tmp"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
 			if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
 				t.Fatal(err)
+			}
+			if !cached {
+				// The cache's write failed, as one Windows refuses while a virus
+				// scanner holds the file can.
+				if err := os.Remove(filepath.Join(dir, ".git", saltCacheName)); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if got := cachedSalt(dir); cached != (got == "another") {
 				t.Fatalf("the salt cache holds %q", got)

@@ -5,11 +5,13 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
+	"github.com/BFlinkDesign/agent-comms/internal/journal"
 )
 
 // returnsWithin runs f and fails the test if it has not returned within d: a
@@ -191,6 +193,203 @@ func TestAFIFOAtANoteInTheGitDirectoryHoldsNothingUp(t *testing.T) {
 			})
 			if _, err := os.Lstat(filepath.Join(dir, ".git", "fleetd-sync.lock")); err == nil {
 				t.Fatal("the sync left its lock behind")
+			}
+		})
+	}
+}
+
+// A push can make any host file in the journal a symbolic link, which every
+// clone's sync checks out as one: to a device that never ends, or to a FIFO that
+// never answers. where reads every host file: it refuses the link, naming it,
+// and still reports the other machines' records.
+func TestAHostFileTheRemoteMadeALinkHoldsUpNothing(t *testing.T) {
+	t.Parallel()
+	for _, target := range []string{"a device that never ends", "a FIFO"} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "this machine's own record"); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+				t.Fatal(err)
+			}
+			to := "/dev/zero"
+			if target == "a FIFO" {
+				to = filepath.Join(t.TempDir(), "fifo")
+				if err := syscall.Mkfifo(to, 0o600); err != nil {
+					t.Skipf("cannot make a FIFO here: %v", err)
+				}
+			}
+			w := filepath.Join(t.TempDir(), "w")
+			gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			const linked = "host-0000000000000000.jsonl"
+			if err := os.Symlink(to, filepath.Join(w, linked)); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, w, "add", linked)
+			gitIn(t, w, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "a link")
+			gitIn(t, w, "push", "--quiet", "origin", "main")
+			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+				t.Fatal(err)
+			}
+			if info, err := os.Lstat(filepath.Join(dir, linked)); err != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("the sync checked out %v (%v); want the link, as git does", info, err)
+			}
+			var stdout, stderr string
+			returnsWithin(t, 30*time.Second, "where with a host file linked to "+target, func() {
+				stdout, stderr, _ = exec(t, "where", "--dir", dir)
+			})
+			if !strings.Contains(stdout, "this machine's own record") || !strings.Contains(stderr, "symbolic link") ||
+				!strings.Contains(stderr, linked) {
+				t.Fatalf("where said:\n%s\n%s\nwant this machine's record, and the link named", stdout, stderr)
+			}
+		})
+	}
+}
+
+// This machine's own journal file, which every record appends to, every sync
+// publishes from, init --reclaim compares with the remote's and a hook reads the
+// end of, is refused when another account has made it a FIFO, never waited on:
+// a record fails, saying so, and a sync, where, init --reclaim and a hook return.
+func TestAFIFOAtThisMachinesJournalFileHoldsNothingUp(t *testing.T) {
+	hookEnv(t)
+	remote := emptyJournalRemote(t)
+	root := t.TempDir()
+	t.Setenv("COMMS_CHANNELS", root)
+	dir := filepath.Join(root, "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "a note the remote holds"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	own := filepath.Join(dir, journal.FileName(hostID(t, "--dir", dir))+".jsonl")
+	if err := os.Remove(own); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(own, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	var err error
+	returnsWithin(t, 30*time.Second, "a record into a FIFO", func() {
+		_, _, err = exec(t, "record", "--dir", dir, "--type", "note", "--note", "a note into a FIFO")
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("record: %v; want it refused, the file being no regular file", err)
+	}
+	returnsWithin(t, 30*time.Second, "a sync with a FIFO for this machine's journal file", func() {
+		_, _, _ = exec(t, "sync", "--dir", dir, "--timeout", "10s")
+	})
+	returnsWithin(t, 30*time.Second, "where with a FIFO for this machine's journal file", func() {
+		_, _, _ = exec(t, "where", "--dir", dir)
+	})
+	returnsWithin(t, 30*time.Second, "init --reclaim with a FIFO for this machine's journal file", func() {
+		_, _, _ = exec(t, "init", "--reclaim", "--dir", dir, remote)
+	})
+	feedStdin(t, docClaudeStop)
+	returnsWithin(t, 30*time.Second, "a hook with a FIFO for this machine's journal file", func() {
+		_, _, err = exec(t, "hook", "claude", "--dir", dir)
+	})
+	if err != nil {
+		t.Fatalf("the hook returned %v; a hook must exit 0 whatever happens", err)
+	}
+}
+
+// fleetd writes its notes in the clone's git directory through a file of its own
+// renamed into place: a FIFO another account planted at the name a note's
+// temporary file once had, or at the look's note, holds nothing up.
+func TestAFIFOWhereANoteIsWrittenHoldsNothingUp(t *testing.T) {
+	t.Parallel()
+	for _, note := range []string{"the salt cache's", "the sync's outcome's", "the re-filed sizes'", "the look's"} {
+		t.Run(note, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if note == "the look's" {
+				// A clone of a repository that holds no journal yet: init starts it,
+				// noting the look that follows its push.
+				w := filepath.Join(t.TempDir(), "w")
+				gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+				if err := os.WriteFile(filepath.Join(w, "README.md"), []byte("about\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, w, "add", "README.md")
+				gitIn(t, w, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "about")
+				gitIn(t, w, "push", "--quiet", "origin", "main")
+				gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+				if err := syscall.Mkfifo(filepath.Join(dir, ".git", "fleetd-look"), 0o600); err != nil {
+					t.Skipf("cannot make a FIFO here: %v", err)
+				}
+				var err error
+				returnsWithin(t, 30*time.Second, "init with a FIFO at the look's note", func() {
+					_, _, err = exec(t, "init", "--dir", dir, "--salt", "s", remote)
+				})
+				if err != nil {
+					t.Fatalf("init: %v", err)
+				}
+				return
+			}
+			if note == "the re-filed sizes'" {
+				// A record written before init, under another id, which init moves aside
+				// and files under the fleet's.
+				if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "before the salt was known"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			git := filepath.Join(dir, ".git")
+			var fifo string
+			switch note {
+			case "the salt cache's":
+				if err := os.Remove(filepath.Join(git, saltCacheName)); err != nil {
+					t.Fatal(err)
+				}
+				fifo = filepath.Join(git, saltCacheName+".tmp")
+			case "the sync's outcome's":
+				fifo = filepath.Join(git, syncStatusFile+".tmp")
+			case "the re-filed sizes'":
+				// The moved copy grows, as when a process appended to it after it
+				// moved, so the next sync reads it again and notes its size.
+				moved, _ := filepath.Glob(filepath.Join(git, preInitDir, "host-*.jsonl.*"))
+				if len(moved) != 1 {
+					t.Fatalf("moved copies: %v, want one", moved)
+				}
+				f, err := os.OpenFile(moved[0], os.O_APPEND|os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = f.WriteString("\n")
+				if cerr := f.Close(); err == nil {
+					err = cerr
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				fleetFileAged(t, dir)
+				fifo = filepath.Join(git, preInitDir, refiledName+".tmp")
+			}
+			if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+				t.Skipf("cannot make a FIFO here: %v", err)
+			}
+			var err error
+			returnsWithin(t, 30*time.Second, "a sync with a FIFO at "+note+" temporary file", func() {
+				_, _, err = exec(t, "sync", "--dir", dir, "--timeout", "10s")
+			})
+			if err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+			if note == "the salt cache's" && cachedSalt(dir) != "s" {
+				t.Fatalf("the salt cache holds %q, want s", cachedSalt(dir))
 			}
 		})
 	}
