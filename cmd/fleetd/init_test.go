@@ -1251,8 +1251,8 @@ func TestInitRefusesACloneOnAnOrphanBranch(t *testing.T) {
 	// pushing a branch that has no commit; main is the branch to go back to.
 	_, _, err = exec(t, "init", "--dir", dir, remote)
 	if !errors.Is(err, gitsync.ErrNoUpstream) || strings.Contains(err.Error(), "delete its .git") ||
-		strings.Contains(err.Error(), "push -u") || !strings.Contains(err.Error(), "checkout main") {
-		t.Fatalf("init on a clone on an orphan branch: %v, want ErrNoUpstream saying to check out main", err)
+		strings.Contains(err.Error(), "push -u") || !strings.Contains(err.Error(), "switch main`") {
+		t.Fatalf("init on a clone on an orphan branch: %v, want ErrNoUpstream saying to switch to main", err)
 	}
 	if now, err := osexec.Command("git", "-C", dir, "rev-parse", "main").Output(); err != nil || string(now) != string(mine) {
 		t.Fatalf("init moved main from %s to %s (%v)", mine, now, err)
@@ -1447,11 +1447,11 @@ func TestInitOnADetachedCloneSaysToCheckOutItsBranch(t *testing.T) {
 	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
 	gitIn(t, dir, "checkout", "--quiet", "--detach")
 	for _, cmd := range [][]string{{"init", "--dir", dir, remote}, {"sync", "--dir", dir}} {
-		if _, _, err := exec(t, cmd...); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "checkout main") {
-			t.Fatalf("%s on a clone with a detached HEAD: %v; want ErrNoUpstream saying to check out main", cmd[0], err)
+		if _, _, err := exec(t, cmd...); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "switch main`") {
+			t.Fatalf("%s on a clone with a detached HEAD: %v; want ErrNoUpstream saying to switch to main", cmd[0], err)
 		}
 	}
-	gitIn(t, dir, "checkout", "--quiet", "main")
+	gitIn(t, dir, "switch", "--quiet", "main")
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
 		t.Fatalf("init once main was checked out: %v", err)
 	}
@@ -1630,5 +1630,65 @@ func TestInitOnANewDirectoryReplacesAFleetFileTooLargeToRead(t *testing.T) {
 	}
 	if past := gitsync.PastSalts(filepath.Join(dir, ".git")); slices.Contains(past, "other") {
 		t.Fatalf("init noted the salt of a fleetd.json no command would read: %q", past)
+	}
+}
+
+// A clone with no commit on HEAD and no branch of its own can still hold
+// origin's branches, the commits they name, and fleetd's own notes in its git
+// directory: init does not tell anyone to delete that. It says to switch to the
+// journal's branch, which works.
+func TestInitOnAnUnbornCloneWithOriginsBranchesKeepsItsGitDirectory(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "checkout", "--quiet", "--orphan", "scratch")
+	gitIn(t, dir, "branch", "--quiet", "-D", "main")
+	_, _, err := exec(t, "init", "--dir", dir, remote)
+	want := "`git -C \"" + dir + "\" switch --track origin/main`"
+	if !errors.Is(err, gitsync.ErrNoUpstream) || strings.Contains(err.Error(), "delete its .git") || !strings.Contains(err.Error(), want) {
+		t.Fatalf("init on an unborn clone with origin's branches: %v; want ErrNoUpstream saying %s", err, want)
+	}
+	gitIn(t, dir, "switch", "--quiet", "--track", "origin/main")
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatalf("init once the advice was followed: %v", err)
+	}
+}
+
+// A .gitattributes in the journal can have git convert fleetd.json as it checks it
+// out, as ident does, in ways git undoes when it hashes the file. init counts the
+// file as the journal's only if fleetd reads the journal's salt from it, so a clone
+// whose checkout no command could read gets git's copy written in its place.
+func TestInitReadsBackAFleetFileGitConvertedOnCheckout(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	editor := filepath.Join(t.TempDir(), "editor")
+	gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
+	if err := os.WriteFile(filepath.Join(editor, ".gitattributes"), []byte("fleetd.json ident\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	padded := `{"salt": "s", "pad": "` + strings.Repeat("$Id$ ", 1500) + `"}` + "\n"
+	if err := os.WriteFile(filepath.Join(editor, gitsync.FleetFile), []byte(padded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, editor, "add", ".gitattributes", gitsync.FleetFile)
+	gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "ident on fleetd.json")
+	gitIn(t, editor, "push", "--quiet")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := gitsync.ReadFleet(dir); !errors.Is(err, gitsync.ErrBadFleetFile) {
+		t.Fatalf("the checkout of a %d-byte fleetd.json with ident reads as %v; the test needs one fleetd refuses", len(padded), err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s" {
+		t.Fatalf("after init fleetd.json reads as %+v (%v, %v), want the journal's salt", fleet, ok, err)
 	}
 }

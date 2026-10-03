@@ -1317,3 +1317,39 @@ func TestASaltsNoteFullOfSaltsDoesNotHoldUpSyncs(t *testing.T) {
 		t.Fatal("the record written with a full salts note was not published")
 	}
 }
+
+// With more salts noted than a sync considers, the past salts in the clone's git
+// directory come first, then the salts noted beside the journal in the order they
+// were noted, up to 64 in all with none counted. Records under those are filed
+// under the fleet's id; the rest wait for a person to look.
+func TestASyncFilesTheSaltsNotedFirstWhenThereAreTooMany(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "fleet", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	for i := 0; i < 70; i++ {
+		t.Setenv("FLEET_SALT", fmt.Sprintf("n%d", i))
+		if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", fmt.Sprintf("under n%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("FLEET_SALT", "")
+	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "past"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "under past"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	for note, filed := range map[string]bool{
+		"under past": true, "under n0": true, "under n30": true, "under n61": true,
+		"under n62": false, "under n69": false,
+	} {
+		if _, ok := remoteHostRecords(t, remote, "fleet", note); ok != filed {
+			t.Errorf("the record %q is filed under the fleet's id: %v, want %v", note, ok, filed)
+		}
+	}
+}

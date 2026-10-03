@@ -276,17 +276,18 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if !sameURL(origin, url) {
 		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
 	}
-	// A clone with no commit and no branch, such as a plain clone of the journal
-	// repository made while it was still empty, has nothing to follow. Its git
-	// directory holds no commit: without it, init sets the directory up as a new
-	// one, keeping every file in it. A clone with branches, on one with no commit
-	// yet (git checkout --orphan), is refused below for want of an upstream, so
-	// that none of its branches is moved.
+	// A clone with no commit, no branch and nothing of origin's, such as a plain
+	// clone of the journal repository made while it was still empty, has nothing
+	// to follow. Its git directory holds no commit: without it, init sets the
+	// directory up as a new one, keeping every file in it. A clone with branches,
+	// or with origin's, on a branch with no commit yet (git checkout --orphan), is
+	// refused below for want of an upstream, so that none of its branches is moved
+	// and nothing in its git directory is lost.
 	if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err != nil {
 		if ctx.Err() != nil {
 			return res, err
 		}
-		branches, err := g.line("for-each-ref", "--format=%(refname)", "refs/heads/")
+		branches, err := g.line("for-each-ref", "--format=%(refname)", "refs/heads/", "refs/remotes/origin/")
 		if err != nil {
 			return res, err
 		}
@@ -348,6 +349,10 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	if err != nil {
 		return err
 	}
+	w, err := parseFleet([]byte(want), FleetFile)
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(dir, FleetFile)
 	if info, err := os.Lstat(path); err == nil && info.IsDir() {
 		return fmt.Errorf("%w: %s is a directory; remove it, then run fleetd init again", ErrBadFleetFile, path)
@@ -355,9 +360,7 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	// One that is not a regular file to trust, a link say, has no salt to note,
 	// and is replaced below.
 	if have, err := readFleetFile(path); err == nil {
-		f, perr := parseFleet(have, path)
-		w, _ := parseFleet([]byte(want), FleetFile)
-		if perr == nil && f.Salt != w.Salt {
+		if f, perr := parseFleet(have, path); perr == nil && f.Salt != w.Salt {
 			if err := NotePastSalt(gitDir, f.Salt); err != nil {
 				return err
 			}
@@ -370,13 +373,18 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	}
 	mode, rest, _ := strings.Cut(entry, " ")
 	id, _, _ := strings.Cut(strings.TrimPrefix(rest, "blob "), "\t")
+	// git undoes its own conversions when it hashes the file: CRLF line endings,
+	// and whatever a .gitattributes asks for, such as ident or another encoding.
+	// The file is the journal's only if fleetd also reads the journal's salt from
+	// it as it stands; a conversion that hides it is undone by writing git's copy.
 	same := false
 	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
 		got, err := g.line("hash-object", "--", FleetFile)
 		if err != nil {
 			return err
 		}
-		same = got == id
+		f, ok, rerr := ReadFleet(dir)
+		same = got == id && rerr == nil && ok && f.Salt == w.Salt
 	}
 	if !same {
 		if err := writeFleetFile(g.ctx, gitDir, path, want); err != nil {
