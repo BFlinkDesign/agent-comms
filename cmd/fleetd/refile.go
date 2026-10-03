@@ -28,10 +28,14 @@ import (
 // A file git tracks was published under its identity up to some point; it is put
 // back as published, and only the records after that are filed.
 
-// refileSettle is how long the journal's fleetd.json must have been in place
+// settleTime is how long the journal's fleetd.json must have been in place
 // before records are re-filed, so that a hook which resolved its salt just
 // before it appeared has finished appending.
-const refileSettle = 2 * time.Second
+const settleTime = 2 * time.Second
+
+// refileSettle is settleTime. It is a variable only so that tests, which set a
+// journal up and file its records at once, need not wait it out every time.
+var refileSettle = settleTime
 
 // preInitDir is where, inside the clone's git directory, each moved file is
 // kept. It is never committed.

@@ -1002,6 +1002,8 @@ func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
 // Re-filing waits until fleetd.json has been in place for a moment, so that a
 // hook that resolved its salt just before it appeared has finished appending.
 func TestRefilingWaitsForTheFleetFileToSettle(t *testing.T) {
+	defer func(d time.Duration) { refileSettle = d }(refileSettle)
+	refileSettle = settleTime
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
 	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {

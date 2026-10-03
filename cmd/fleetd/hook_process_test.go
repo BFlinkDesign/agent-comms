@@ -22,6 +22,10 @@ func TestMain(m *testing.M) {
 		main()
 		os.Exit(0)
 	}
+	// The tests set journals up and file at once, a hundred times over: waiting
+	// out settleTime each time was most of their run. The test of the wait itself
+	// puts it back.
+	refileSettle = 100 * time.Millisecond
 	os.Exit(m.Run())
 }
 
