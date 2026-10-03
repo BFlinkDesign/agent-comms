@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -2107,5 +2109,107 @@ func TestTheHookRecordsNamesThatEndInANoBreakSpace(t *testing.T) {
 	repo, branch, err := lookupRepo(work, 10*time.Second)
 	if err != nil || repo != "work\u00a0" || branch != "weg\u00a0" {
 		t.Fatalf("lookupRepo = %q, %q, %v; want %q and %q", repo, branch, err, "work\u00a0", "weg\u00a0")
+	}
+}
+
+// A push that deletes the journal's fleetd.json by mistake leaves this
+// machine's copy in place, so its records keep the fleet's id, and the sync and
+// the hook's log say to put it back. One that turns it into a directory leaves
+// this machine on the salt it last held, as before.
+func TestAFleetdJsonDeletedByAPushLeavesTheMachineOnTheFleetsId(t *testing.T) {
+	t.Parallel()
+	for _, mistake := range []string{"deleted", "made a directory"} {
+		t.Run(mistake, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			dir := filepath.Join(t.TempDir(), "journal")
+			if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			w := filepath.Join(t.TempDir(), "w")
+			gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			gitIn(t, w, "rm", "--quiet", gitsync.FleetFile)
+			if mistake == "made a directory" {
+				if err := os.MkdirAll(filepath.Join(w, gitsync.FleetFile), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(w, gitsync.FleetFile, "x"), []byte("x\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, w, "add", "-A")
+			}
+			gitIn(t, w, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "tidy up")
+			gitIn(t, w, "push", "--quiet", "origin", "main")
+			stdout, _, err := exec(t, "sync", "--dir", dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if said := strings.Contains(stdout, "no longer holds fleetd.json"); said != (mistake == "deleted") {
+				t.Fatalf("sync said %q; want it to say the repository no longer holds fleetd.json: %v", stdout, !said)
+			}
+			if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "after the push"); err != nil {
+				t.Fatal(err)
+			}
+			var res hookResult
+			syncHook(&res, dir, identity("s"), time.Minute)
+			if logged := slices.ContainsFunc(res.Problems, func(p string) bool {
+				return strings.Contains(p, "no longer holds fleetd.json")
+			}); !res.Synced || logged != (mistake == "deleted") {
+				t.Fatalf("the hook's sync: %+v; want it synced, saying the repository no longer holds fleetd.json: %v",
+					res, mistake == "deleted")
+			}
+			if n, _ := remoteHostRecords(t, remote, "", "after the push"); n != 0 {
+				t.Fatalf("the unsalted id's file holds %d records; want none", n)
+			}
+			if _, ok := remoteHostRecords(t, remote, "s", "after the push"); !ok {
+				t.Fatal("the fleet id's file lacks the record written after the push")
+			}
+		})
+	}
+}
+
+// A hook derives this machine's id when it records, and syncs under it after.
+// When init puts the journal's fleetd.json in place between the two, and
+// releases its lock before the hook's sync takes it, the hook's sync publishes
+// nothing under the old id: init's own sync files that record under the
+// fleet's.
+func TestAHookThatDerivedItsIdBeforeInitPublishesNothingUnderTheOldId(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "init", "--quiet", "--initial-branch=main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("one file per machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "start the journal")
+	gitIn(t, seed, "push", "--quiet", remote, "main")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "other"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	var warn bytes.Buffer
+	rec, err := appendRecord(recordRequest{dir: dir, typ: "session", note: "claude SessionEnd"}, &warn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitsync.Init(context.Background(), gitsync.InitOptions{URL: remote, Dir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := syncJournal(dir, rec.host, time.Minute, false, io.Discard); err == nil ||
+		!strings.Contains(err.Error(), "nothing was published") {
+		t.Fatalf("the hook's sync: %v, want it to publish nothing, saying why", err)
+	}
+	keepSalt(dir, "s", io.Discard)
+	fleetFileAged(t, dir)
+	if _, _, err := syncJournal(dir, identity("s"), time.Minute, false, io.Discard); err != nil {
+		t.Fatalf("init's own sync: %v", err)
+	}
+	if n, _ := remoteHostRecords(t, remote, "", "claude SessionEnd"); n != 0 {
+		t.Fatalf("%d records under the old id, %s; want none", n, rec.host.ID)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "claude SessionEnd"); !ok {
+		t.Fatal("the fleet id's file lacks the hook's record")
 	}
 }

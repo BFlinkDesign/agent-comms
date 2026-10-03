@@ -297,7 +297,7 @@ whose push failed, which may have gone through all the same, keeps it beside the
 directory, marked `.git/fleetd-kept`, unless the remote declined the push, and one
 killed right after its push leaves it there unmarked; every init makes the look
 such a clone notes, then removes the kept ones it made it for and any over ten
-minutes old); a copy of the journal, a branch holding the `fleetd.json` of the
+minutes old, but for one holding anything else, whose look it notes as made); a copy of the journal, a branch holding the `fleetd.json` of the
 last commit it shares with the journal's branch, is not a second journal. Till the
 look is made, sync publishes nothing, nor while a kept clone beside the directory
 notes one. A clone a person moved off the
@@ -422,7 +422,9 @@ host's complete records here that the remote lacks), when the journal directory 
 the top of a clone and git could say.
 
 The salt is the one in the journal's `fleetd.json`. `--salt` may repeat it but not
-contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning.
+contradict it; a `$FLEET_SALT` that contradicts it is overridden with a warning. A
+push that deletes `fleetd.json` leaves each clone's copy in place, and every sync
+says to put it back, so no machine's id changes.
 Without `fleetd.json` they supply it. It must be identical on every machine in the
 fleet, or one machine will appear as several. It is not a credential. A sync files
 under this machine's fleet id the records it wrote under another salt (none or

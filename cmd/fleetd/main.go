@@ -310,11 +310,13 @@ type hostOut struct {
 	User   string `json:"user"`
 	Source string `json:"source"`
 	Stable bool   `json:"stable"`
+	// Salt is the salt the id was derived with.
+	Salt string `json:"-"`
 }
 
 func identity(salt string) hostOut {
 	id := hostid.Derive(hostid.Options{Salt: salt})
-	return hostOut{id.ID, id.Name, id.OS, id.Arch, id.User, id.Source, id.Stable}
+	return hostOut{id.ID, id.Name, id.OS, id.Arch, id.User, id.Source, id.Stable, salt}
 }
 
 func cmdHost(args []string, stdout, stderr io.Writer) error {
@@ -530,6 +532,9 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 			"  To take the remote's copy:  git -C %s checkout '@{upstream}' -- <file>\n",
 			strings.Join(res.Kept, ", "), storeDir)
 	}
+	if res.FleetFileGone {
+		fmt.Fprintln(stdout, fleetFileGone(storeDir))
+	}
 	if len(res.Cleared) > 0 {
 		fmt.Fprintf(stdout, "removed %s older than ten minutes from the clone: %s\n",
 			plural(len(res.Cleared), "git lock file"), strings.Join(res.Cleared, ", "))
@@ -549,7 +554,20 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 	if err != nil {
 		return gitsync.Result{}, "", err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var stale error
 	prepare := func(ctx context.Context, gitDir string) {
+		// h was derived before this sync took its lock: an init that has put the
+		// journal's fleetd.json in place since gives this machine another id, and
+		// files h's records under it. This sync publishes none of them.
+		if fleet, ok, err := gitsync.ReadFleet(store.Dir()); err == nil && ok && fleet.Salt != h.Salt {
+			stale = fmt.Errorf("the journal's %s now gives this machine another id than %s, which this command "+
+				"derived before the file was in place; nothing was published, and the next sync files this "+
+				"machine's records under the fleet's id", gitsync.FleetFile, h.ID)
+			cancel()
+			return
+		}
 		if reclaim {
 			if err := reconcileOwn(ctx, store.Dir(), gitDir, h); err != nil {
 				fmt.Fprintf(stderr, "fleetd: warning: putting this machine's published records back in its journal file: %v\n", err)
@@ -559,8 +577,6 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 			fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 	started := time.Now()
 	res, err := gitsync.Sync(ctx, gitsync.Options{
 		Dir:     store.Dir(),
@@ -568,8 +584,20 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
 		Prepare: prepare,
 	})
+	if stale != nil {
+		err = stale
+	}
 	noteSync(store.Dir(), res, err, started, stderr)
 	return res, store.Dir(), err
+}
+
+// fleetFileGone says what a person does when the remote no longer holds the
+// journal's fleetd.json, which the clone in dir keeps.
+func fleetFileGone(dir string) string {
+	return fmt.Sprintf("the journal repository no longer holds %s, which gives every machine of the fleet its id: "+
+		"this machine keeps its copy in %s, so its records keep their id. Put it back in the repository, as by "+
+		"reverting the commit that removed it, or with `fleetd init --dir \"%s\" --salt <the salt in that copy> "+
+		"<journal URL>`; a machine set up without it gets another id", gitsync.FleetFile, dir, dir)
 }
 
 // printSyncStatus says how fresh the answer is: a clone holds the other machines'

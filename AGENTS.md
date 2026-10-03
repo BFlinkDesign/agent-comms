@@ -229,7 +229,9 @@ the journal directory instead, marked as kept (`.git/fleetd-kept`), unless the
 remote declined the push; one killed right after its push leaves its clone there
 unmarked. Every init, in a new directory or on a clone, makes the look such a
 clone notes, and only then removes the kept clones it made it for, and any left
-there over ten minutes ago. Every sync waits for the look a kept clone notes, so a
+there over ten minutes ago; one something else has written into, as Finder's
+`.DS_Store`, stays for a person to remove, its look noted as made. Every sync
+waits for the look a kept clone notes, so a
 clone made there by hand publishes nothing until init has made it; the look a
 killed init left is the next init's to make.
 A machine whose journal
@@ -393,7 +395,9 @@ was wrong:
   larger than 64 KiB, or is a link or a directory, as one pushed by mistake
   would be (on unix, anything but a regular file). The salt it last held, which
   init and every command that reads it keep in the clone's git directory, is
-  used until a sync brings in a fixed one. init itself refuses a journal whose
+  used until a sync brings in a fixed one. A push that deletes it outright
+  leaves every clone's copy in place, so no machine's id changes, and every
+  `fleetd sync`, and the hook's log, says to put it back. init itself refuses a journal whose
   `fleetd.json` is invalid, or larger than 32 KiB in git: checked out with CRLF
   line endings, as Git for Windows does by default, it can be twice that.
   A missing `fleetd.json` stops every sync while the journal's branch holds

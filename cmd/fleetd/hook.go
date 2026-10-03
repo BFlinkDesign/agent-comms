@@ -323,6 +323,9 @@ func syncHook(res *hookResult, journalDir string, h hostOut, timeout time.Durati
 		res.problem("sync: %v", err)
 	default:
 		res.Synced, res.Sync = true, &synced
+		if synced.FleetFileGone {
+			res.problem("%s", fleetFileGone(journalDir))
+		}
 	}
 }
 

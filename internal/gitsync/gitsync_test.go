@@ -1962,3 +1962,62 @@ func TestASecondLookThatCannotFetchSaysWhy(t *testing.T) {
 		t.Fatalf("sync: %v, want the fetch's own error", err)
 	}
 }
+
+// A push that deletes the journal's fleetd.json, as one made by mistake can,
+// leaves this clone's copy in place, so that this machine's records keep their
+// id, and the sync says so; it still brings in the other machines' files. Once
+// the remote holds the file again, the sync is as before. One the remote turns
+// into a directory is brought in, as before: the salt it last held is used.
+func TestAFleetdJsonTheRemoteDeletedStaysAndIsReported(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, mistake := range []string{"deleted", "made a directory"} {
+		t.Run(mistake, func(t *testing.T) {
+			t.Parallel()
+			remote := newEmptyRemote(t)
+			a := filepath.Join(t.TempDir(), "a")
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+			before := readFile(t, filepath.Join(a, FleetFile))
+			w := filepath.Join(t.TempDir(), "w")
+			run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			identify(t, w)
+			run(t, w, "rm", "--quiet", FleetFile)
+			if mistake == "made a directory" {
+				if err := os.MkdirAll(filepath.Join(w, FleetFile), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(w, FleetFile, "x"), "x\n")
+			}
+			write(t, filepath.Join(w, "host-b.jsonl"), "{\"id\":\"hive:b1\"}\n")
+			run(t, w, "add", "-A")
+			run(t, w, "commit", "--quiet", "-m", "tidy up")
+			run(t, w, "push", "--quiet", "origin", "main")
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			res := mustSync(t, options(a, "host-a"))
+			if got := readFile(t, filepath.Join(a, "host-b.jsonl")); got != "{\"id\":\"hive:b1\"}\n" {
+				t.Fatalf("the work tree holds %q for host-b", got)
+			}
+			info, err := os.Lstat(filepath.Join(a, FleetFile))
+			if mistake == "made a directory" {
+				if res.FleetFileGone || err != nil || !info.IsDir() {
+					t.Fatalf("sync = %+v, fleetd.json %v; want the remote's directory brought in, and nothing said gone", res, err)
+				}
+				return
+			}
+			if !res.FleetFileGone || err != nil || readFile(t, filepath.Join(a, FleetFile)) != before {
+				t.Fatalf("sync = %+v, fleetd.json %v; want this clone's copy kept, and it said", res, err)
+			}
+			run(t, w, "pull", "--quiet", "--ff-only", "origin", "main")
+			write(t, filepath.Join(w, FleetFile), before)
+			run(t, w, "add", FleetFile)
+			run(t, w, "commit", "--quiet", "-m", "put fleetd.json back")
+			run(t, w, "push", "--quiet", "origin", "main")
+			if res := mustSync(t, options(a, "host-a")); res.FleetFileGone || len(res.Kept) > 0 {
+				t.Fatalf("sync once the remote holds fleetd.json again = %+v, want nothing kept or gone", res)
+			}
+			if got := run(t, a, "status", "--porcelain", "--", FleetFile); got != "" {
+				t.Fatalf("git status for fleetd.json: %q, want it clean", got)
+			}
+		})
+	}
+}

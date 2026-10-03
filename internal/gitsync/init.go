@@ -833,6 +833,11 @@ func removeAbandonedClones(dir string, made []string) {
 		}
 		entries, err := os.ReadDir(m)
 		if err != nil || len(entries) > 1 || (len(entries) == 1 && entries[0].Name() != ".git") {
+			// Something else wrote into it, as Finder's .DS_Store: it stays, for a
+			// person to remove, but the look it notes is made, and stops no sync.
+			if slices.Contains(made, m) {
+				os.Remove(filepath.Join(m, ".git", lookName))
+			}
 			continue
 		}
 		os.RemoveAll(m)

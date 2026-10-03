@@ -228,6 +228,10 @@ type Result struct {
 	// Kept lists files the remote changed that were left as they are, because
 	// this clone has changes to them that are not on the remote.
 	Kept []string `json:"kept,omitempty"`
+	// FleetFileGone is set when the remote no longer holds FleetFile, which gives
+	// every machine of the fleet its id: this clone keeps its copy, so that this
+	// machine's records keep their id, till a person puts the file back.
+	FleetFileGone bool `json:"fleet_file_gone,omitempty"`
 	// Cleared lists git lock files, relative to the git directory, that were
 	// older than staleLock and removed: left by a git command that was killed.
 	Cleared []string `json:"cleared,omitempty"`
@@ -446,7 +450,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	if res.Published > 0 {
 		res.Received-- // this host's own commit
 	}
-	if res.Kept, err = bringIn(g, localRef, local, tip, own); err != nil {
+	if res.Kept, res.FleetFileGone, err = bringIn(g, localRef, local, tip, own); err != nil {
 		return res, err
 	}
 	res.Head = tip
@@ -622,22 +626,36 @@ func blobAt(g git, commit, name string) (string, bool, error) {
 // it is returned, left as it is. Only the working tree is compared with the
 // index, so an edit staged with `git add` and not changed since is reset to tip,
 // and such a new file that tip lacks is removed; git keeps their content until it
-// prunes unreachable objects.
-func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
+// prunes unreachable objects. FleetFile, which gives every record here its salt,
+// stays when the remote deleted it outright, as a push made by mistake can, and
+// gone says so: without it this machine's records would go out under another
+// id, for good. One the remote turned into a directory is brought in, and the
+// salt it last held is used, as for any FleetFile that cannot be read.
+func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool, err error) {
 	if _, err := g.line("update-ref", "-m", "fleetd sync", localRef, tip, local); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Comparing the index, rather than the old commit, with tip also repairs
 	// files a sync interrupted after this point left behind.
 	diff, err := g.raw(nil, "diff-index", "--cached", "-z", "--name-status", "--no-renames", tip)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var update, remove, paths []string
 	fields := strings.Split(diff, "\x00")
 	for i := 0; i+1 < len(fields); i += 2 {
+		if fields[i+1] == FleetFile {
+			gone = fields[i] == "A"
+		}
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
+		if strings.HasPrefix(fields[i+1], FleetFile+"/") {
+			gone = false
+		}
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
 		status, path := fields[i], fields[i+1]
-		if path == own {
+		if path == own || (gone && path == FleetFile) {
 			continue
 		}
 		paths = append(paths, path)
@@ -650,15 +668,14 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 			update = append(update, path)
 		}
 	}
-	var kept []string
 	if len(paths) > 0 {
 		changed, err := locallyChanged(g, paths)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		behind, err := behindIndex(g, mapKeys(changed))
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for path := range behind {
 			delete(changed, path)
@@ -694,12 +711,12 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 	// before the file is written.
 	if len(remove) > 0 {
 		if _, err := g.raw(nulList(remove), "checkout", "--no-overlay", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if len(update) > 0 {
 		if _, err := g.raw(nulList(update), "checkout", tip, "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	// A file that holds only the start of git's own copy, such as one restored
@@ -707,7 +724,7 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 	// change it: it has no change of its own to keep.
 	modified, err := g.raw(nil, "diff", "--name-only", "-z", "--no-renames")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var candidates []string
 	for _, path := range strings.Split(modified, "\x00") {
@@ -716,22 +733,22 @@ func bringIn(g git, localRef, local, tip, own string) ([]string, error) {
 		}
 	}
 	if stale, err := behindIndex(g, candidates); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if len(stale) > 0 {
 		if _, err := g.raw(nulList(mapKeys(stale)), "checkout-index", "-f", "-z", "--stdin"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	// Keep this host's index entry equal to the remote's, so `git status` shows
 	// exactly the records not yet published.
 	if blob, ok, err := blobAt(g, tip, own); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if ok {
 		if _, err := g.line("update-index", "--add", "--cacheinfo", "100644,"+blob+","+own); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	return kept, nil
+	return kept, gone, nil
 }
 
 // locallyChanged reports which paths hold content the index does not: a file

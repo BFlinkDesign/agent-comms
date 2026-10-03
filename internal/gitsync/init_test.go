@@ -3200,3 +3200,54 @@ func TestAJournalStartedWithoutFleetdJsonOnAnotherBranchIsNoCopy(t *testing.T) {
 		t.Fatalf("init: %v, want it told the journal was started on two branches at once", err)
 	}
 }
+
+// pushLandsReplyLost is a Runner whose first push goes through but reports
+// failure, as when the connection drops after the remote took it. No other
+// machine does anything, so the look, once made, finds no other journal.
+func pushLandsReplyLost() Runner {
+	pushed := false
+	return func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		out, err := Git(ctx, dir, stdin, args...)
+		if err != nil || pushed || !slices.Contains(args, "push") {
+			return out, err
+		}
+		pushed = true
+		return out, errors.New("git push: exit status 128: fatal: the remote end hung up unexpectedly")
+	}
+}
+
+// A clone kept beside the journal directory that something else has written
+// into since, as the .DS_Store macOS Finder leaves in a folder a person opened,
+// stays for a person to remove, but once an init has made its look it stops no
+// sync.
+func TestAKeptCloneSomethingElseWroteIntoStopsNoSyncOnceItsLookIsMade(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, extra := range []string{"", ".DS_Store"} {
+		t.Run("holding "+map[string]string{"": "its git directory alone", ".DS_Store": extra}[extra], func(t *testing.T) {
+			t.Parallel()
+			remote := readmeOnTwoBranches(t)
+			a := filepath.Join(t.TempDir(), "a")
+			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "a", Run: pushLandsReplyLost()}); err == nil {
+				t.Fatal("init succeeded although its push reported failure")
+			}
+			beside := besideClones(a)
+			if len(beside) != 1 || !kept(beside[0]) {
+				t.Fatalf("beside a: %v, want one kept clone", beside)
+			}
+			if extra != "" {
+				write(t, filepath.Join(beside[0], extra), "")
+			}
+			mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "a"})
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			mustSync(t, options(a, "host-a"))
+			if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n" {
+				t.Fatalf("main holds %q for host-a", got)
+			}
+			_, err := os.Lstat(beside[0])
+			if left := err == nil; left != (extra != "") {
+				t.Fatalf("the kept clone is still there: %v, want %v", left, extra != "")
+			}
+		})
+	}
+}
