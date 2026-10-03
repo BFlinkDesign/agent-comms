@@ -282,8 +282,8 @@ once per machine, without moving or deleting anything in it, and then syncs. An
 empty repository gets a first commit holding `fleetd.json` (`{"salt": ...}`, plus
 an `about` line), on the branch it names as its default, else `main`; a repository
 that already holds records without one needs the salt its machines use (`--salt` or
-`$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
-the ids they had). When the repository's default branch does not exist, the journal is
+`$FLEET_SALT`), or a new one if they ran without a salt (the records they published
+keep the ids they had). When the repository's default branch does not exist, the journal is
 on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
 on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
@@ -293,11 +293,14 @@ such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
 makes it until one finds no other journal (a first init in a new directory whose
 push went through, or whose look found one, keeps its clone there for that; one
-whose push failed, which may have gone through all the same, unless the remote
-declined it, or one killed right after its push, leaves its clone beside the
-directory, and the look to the next init); a copy of the journal, a branch sharing
-a commit that holds `fleetd.json` with it, is not a second journal. Till the look
-is made, sync publishes nothing. A clone a person moved off the
+whose push failed, which may have gone through all the same, keeps it beside the
+directory, marked `.git/fleetd-kept`, unless the remote declined the push, and one
+killed right after its push leaves it there unmarked; every init makes the look
+such a clone notes, then removes the kept ones it made it for and any over ten
+minutes old); a copy of the journal, a branch holding the `fleetd.json` of the
+last commit it shares with the journal's branch, is not a second journal. Till the
+look is made, sync publishes nothing, nor while a kept clone beside the directory
+notes one. A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch init recorded
@@ -361,9 +364,9 @@ journal's branch, as when the remote deleted it meanwhile. Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository whose init is done (no look due in `.git/fleetd-look`, and
-`fleetd.json` in place when the journal's branch, as last fetched, holds it; else
-it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
+journal repository whose init is done (no look due in `.git/fleetd-look`, or in a
+clone init kept beside the directory, and `fleetd.json` in place whenever the
+journal's branch holds it; else it says to run init, and publishes nothing), on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
 look, nor, once init has recorded the journal's branch, another of origin's. Any
 other clone (detached, an orphan branch, a branch that follows nothing, a branch

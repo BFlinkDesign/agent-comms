@@ -315,6 +315,14 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		return res, fmt.Errorf("%w: it has yet to look whether another machine made another branch the journal's at "+
 			"the same time; `fleetd init --dir \"%s\" <journal URL>` looks, and finishes", ErrLookDue, g.dir)
 	}
+	// A clone an init kept beside the journal directory, after a push of its that
+	// failed, notes such a look too: a person's own clone made there since waits
+	// for it as well.
+	if kept := keptLook(o.Dir); kept != "" {
+		return res, fmt.Errorf("%w: %s, which an init whose push failed kept beside it, notes that a look is due, "+
+			"whether another machine made another branch the journal's at the same time; `fleetd init --dir \"%s\" "+
+			"<journal URL>` looks", ErrLookDue, kept, g.dir)
+	}
 	// Only a branch of origin's: fleetd's clone follows the journal there, and a
 	// branch of another remote, or of the clone, would take this machine's records
 	// somewhere the fleet never looks. Full names, so that a branch here named
@@ -364,19 +372,6 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 		return res, noUpstream(g, recorded)
 	}
-	// Nor while the journal directory lacks the journal's FleetFile, deleted, or
-	// not yet written by an init stopped short: this machine's records then go
-	// under another id, for good once published. A clone set up before the
-	// journal had one, as fleetd v0.1.0 left it, publishes once more under the
-	// id it always had, in the sync that brings the file in.
-	if _, err := os.Lstat(filepath.Join(o.Dir, FleetFile)); errors.Is(err, os.ErrNotExist) {
-		if entry, _ := g.line("ls-tree", "refs/remotes/origin/"+branch, "--", FleetFile); entry != "" {
-			return res, fmt.Errorf("%w, which origin's %s holds, so this machine's records would go out under "+
-				"another id; they wait, and `fleetd init --dir \"%s\" <journal URL>` puts it back, after which a sync "+
-				"files them under the fleet's", ErrNoFleetFile, branch, g.dir)
-		}
-	}
-
 	ssh := batchSSH(g)
 	var tip string
 	for res.Attempts = 1; ; res.Attempts++ {
@@ -389,6 +384,18 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 				return res, err
 			}
 			return res, goneError(g, localRef, branch)
+		}
+		// Nor while the journal directory lacks the journal's FleetFile: deleted,
+		// not yet written by an init stopped short, or never there, as in a clone
+		// set up before the journal had one. This machine's records then go under
+		// another id, for good once published. They wait for init, which puts the
+		// file in place, after which a sync files them under the fleet's.
+		if _, err := os.Lstat(filepath.Join(o.Dir, FleetFile)); errors.Is(err, os.ErrNotExist) {
+			if entry, _ := g.line("ls-tree", remoteTip, "--", FleetFile); entry != "" {
+				return res, fmt.Errorf("%w, which origin's %s holds, so this machine's records would go out under "+
+					"another id; they wait, and `fleetd init --dir \"%s\" <journal URL>` puts it in place, after which "+
+					"a sync files them under the fleet's", ErrNoFleetFile, branch, g.dir)
+			}
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
 			if ctx.Err() != nil {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -166,6 +167,9 @@ type InitResult struct {
 	// SaltDiffers is set when a Salt was given, Strict was not, and the
 	// journal's differs from it.
 	SaltDiffers bool `json:"-"`
+	// pushed is set once Init has tried a push, which may have gone through
+	// whatever git said.
+	pushed bool
 }
 
 // Init makes Dir a clone of the journal repository that holds FleetFile.
@@ -222,10 +226,10 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return res, err
 	}
-	// An init killed after its push left the look it made due only in its own
-	// clone, which this one replaces: this one makes it, and only then removes
-	// that clone.
-	lookDue := abandonedLookDue(o.Dir)
+	// An init killed after its push, or kept beside Dir after one that failed,
+	// left the look it made due only in its own clone, which this one replaces:
+	// this one makes it, and only then removes that clone.
+	due := abandonedLooks(o.Dir)
 	tmp, err := os.MkdirTemp(parent, filepath.Base(o.Dir)+".init-")
 	if err != nil {
 		return res, err
@@ -259,7 +263,7 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	if err := recordBranch(ctx, tmpGit, res.Branch); err != nil {
 		return res, err
 	}
-	if lookDue {
+	if len(due) > 0 {
 		if err := os.WriteFile(filepath.Join(tmpGit, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
 			return res, err
 		}
@@ -268,19 +272,22 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 		// Once its push has made a branch the journal's, or a look found another
 		// journal, a look is due, which only the clone notes: kept, as it is, in
 		// Dir, it has init run again finish setting it up, and look, and every
-		// sync wait till then. A push that failed may have gone through all the
-		// same, as when the connection drops after the remote took it: that
-		// clone stays beside Dir, as a killed init's does, for the next init to
-		// make the look, unless the remote declined the push.
+		// sync wait till then. A push of this init's that failed may have gone
+		// through all the same, as when the connection drops after the remote
+		// took it: that clone stays beside Dir, marked as kept, for the next init
+		// to make the look, unless the remote declined the push. A look carried
+		// over, with no push, stays noted where it was.
 		if _, statErr := os.Lstat(filepath.Join(tmpGit, lookName)); statErr == nil {
 			moved := (res.WroteFleetFile || errors.Is(err, ErrTwoJournals)) && os.MkdirAll(o.Dir, 0o755) == nil &&
 				RenameRetry(context.WithoutCancel(ctx), tmpGit, filepath.Join(o.Dir, ".git")) == nil
-			keep = !moved && !errors.Is(err, ErrRejected)
+			if keep = !moved && res.pushed && !errors.Is(err, ErrRejected); keep {
+				_ = os.WriteFile(filepath.Join(tmpGit, keptName), nil, 0o600)
+			}
 		}
 		return res, err
 	}
 	// Any look due is made: the clones earlier inits left beside Dir can go.
-	removeAbandonedClones(o.Dir)
+	removeAbandonedClones(o.Dir, due)
 	// There is no work tree, so pointing the branch at the remote's tip is all
 	// following it takes.
 	for _, args := range [][]string{
@@ -363,16 +370,22 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	}
 	// A look that an init in a new directory left due in its clone beside this
 	// one, killed after its push or kept there after a push that failed, is
-	// made here too, and only then are such clones removed.
-	if abandonedLookDue(o.Dir) {
-		if err := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); err != nil {
-			return res, err
-		}
-	}
+	// made here too, once the clone is set up, and only then are such clones
+	// removed. One that finds another journal is noted here as well, so that
+	// every sync waits, as for a look this clone's own push made due.
+	due := abandonedLooks(o.Dir)
 	if err := bootstrap(g, gitDir, o, &res); err != nil {
 		return res, err
 	}
-	removeAbandonedClones(o.Dir)
+	if len(due) > 0 {
+		if err := look(g, gitDir, res.Branch); err != nil {
+			if werr := os.WriteFile(filepath.Join(gitDir, lookName), []byte(res.Branch+"\n"), 0o600); werr != nil {
+				return res, werr
+			}
+			return res, err
+		}
+	}
+	removeAbandonedClones(o.Dir, due)
 	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
 		return res, err
 	}
@@ -802,19 +815,18 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	return err
 }
 
-// removeAbandonedClones removes the temporary clones beside dir that an init
-// killed before it finished left behind: directories named as MkdirTemp names
-// them, holding nothing but a git directory, if that. One younger than staleLock
-// may belong to an init still running, and is left alone.
-func removeAbandonedClones(dir string) {
-	base := filepath.Base(dir) + ".init-"
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), base+"*"))
-	for _, m := range matches {
+// removeAbandonedClones removes the temporary clones beside dir that inits
+// left behind, killed before they finished, or kept there for a look: those
+// holding nothing but a git directory, if that. One younger than staleLock may
+// belong to an init still running, and is left alone, unless an init marked it
+// as kept and its look is one made, named in made.
+func removeAbandonedClones(dir string, made []string) {
+	for _, m := range besideClones(dir) {
 		info, err := os.Lstat(m)
-		if err != nil || !info.IsDir() || time.Since(info.ModTime()) <= staleLock {
+		if err != nil || !info.IsDir() {
 			continue
 		}
-		if suffix := strings.TrimPrefix(filepath.Base(m), base); suffix == "" || strings.Trim(suffix, "0123456789") != "" {
+		if time.Since(info.ModTime()) <= staleLock && !(slices.Contains(made, m) && kept(m)) {
 			continue
 		}
 		entries, err := os.ReadDir(m)
@@ -825,12 +837,64 @@ func removeAbandonedClones(dir string) {
 	}
 }
 
-// abandonedLookDue reports whether a clone an init left beside dir, as one
-// killed after its push does, notes a look as due.
-func abandonedLookDue(dir string) bool {
-	due, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), filepath.Base(dir)+".init-*", ".git", lookName))
-	return len(due) > 0
+// abandonedLooks lists the clones inits left beside dir, killed after a push,
+// or kept there after one that failed, that note a look as due.
+func abandonedLooks(dir string) []string {
+	var due []string
+	for _, m := range besideClones(dir) {
+		if _, err := os.Lstat(filepath.Join(m, ".git", lookName)); err == nil {
+			due = append(due, m)
+		}
+	}
+	return due
 }
+
+// keptLook names a clone an init kept beside dir, after a push that failed,
+// that notes a look as due, or is empty.
+func keptLook(dir string) string {
+	for _, m := range abandonedLooks(dir) {
+		if kept(m) {
+			return m
+		}
+	}
+	return ""
+}
+
+// kept reports whether the clone at m is one an init kept for its look.
+func kept(m string) bool {
+	_, err := os.Lstat(filepath.Join(m, ".git", keptName))
+	return err == nil
+}
+
+// keptName is the file, in the git directory of a clone an init kept beside the
+// journal directory for its look, that says no init uses it any longer.
+const keptName = "fleetd-kept"
+
+// besideClones lists the clones inits made beside dir, named as MkdirTemp
+// names them, <base>.init-<digits>. They are read from the directory: a glob
+// pattern would take a [, * or ? in dir's path for a wildcard. Where file names
+// ignore letter case, as on Windows and macOS by default, so does the base.
+func besideClones(dir string) []string {
+	parent, base := filepath.Dir(dir), filepath.Base(dir)+".init-"
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if len(name) <= len(base) || strings.Trim(name[len(base):], "0123456789") != "" {
+			continue
+		}
+		if name[:len(base)] == base || (foldsCase && strings.EqualFold(name[:len(base)], base)) {
+			out = append(out, filepath.Join(parent, name))
+		}
+	}
+	return out
+}
+
+// foldsCase is set where file names ignore letter case by default.
+var foldsCase = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
 
 // startBranch names the branch the journal is on: the remote's default branch.
 // When that does not exist but the remote has exactly one branch, the journal is
@@ -1091,6 +1155,7 @@ func bootstrap(g git, gitDir string, o InitOptions, res *InitResult) error {
 		}
 		// Onto the tip looked at, or, starting the journal, onto no branch at all:
 		// a branch renamed or deleted meanwhile refuses it, as a race lost.
+		res.pushed = true
 		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "--force-with-lease=refs/heads/"+res.Branch+":"+tip,
 			"origin", commit+":refs/heads/"+res.Branch)...)
 		switch {
@@ -1129,14 +1194,16 @@ func look(g git, gitDir, branch string) error {
 		return err
 	}
 	if len(holding) > 0 {
-		// A copy of this journal, a branch made from it since, shares a commit
-		// holding FleetFile with it; a journal another machine started at the
-		// same time shares at most one from before either push, holding none.
+		// A copy of this journal, a branch made from it since, holds the
+		// FleetFile of the last commit it shares with the journal's branch; a
+		// journal another machine started at the same time holds its own.
 		var others []string
 		for _, h := range holding {
 			base, _ := g.line("merge-base", "refs/remotes/origin/"+branch, "refs/remotes/origin/"+h)
 			if base != "" {
-				if entry, _ := g.line("ls-tree", base, "--", FleetFile); entry != "" {
+				shared, _ := g.line("rev-parse", "--verify", "--quiet", base+":"+FleetFile)
+				theirs, _ := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+h+":"+FleetFile)
+				if shared != "" && shared == theirs {
 					continue
 				}
 			}

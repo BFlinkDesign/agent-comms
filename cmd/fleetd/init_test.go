@@ -2002,6 +2002,52 @@ func TestRecordsWrittenWhileALookIsDueArePublishedUnderTheFleetsId(t *testing.T)
 	}
 }
 
+// A clone of a journal of fleetd v0.1.0's, which ran without a salt, keeps the
+// records it published under the id it had. Once another machine's init has
+// given the journal fleetd.json, its syncs wait for init, and its records not
+// yet published go under the fleet's id with its new ones.
+func TestAV010ClonesUnpublishedRecordsGoUnderTheFleetsIdOnceItRunsInit(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "init", "--quiet", "--initial-branch=main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("one file per machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "start the journal")
+	gitIn(t, seed, "push", "--quiet", remote, "main")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published under v0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "other"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written before init"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrNoFleetFile) {
+		t.Fatalf("sync after the journal gained fleetd.json: %v, want ErrNoFleetFile", err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := remoteHostRecords(t, remote, "", "published under v0.1.0"); n != 1 || !ok {
+		t.Fatalf("the old id's file holds %d records (the v0.1.0 one: %v), want that one alone", n, ok)
+	}
+	if n, ok := remoteHostRecords(t, remote, "s", "written before init"); n != 1 || !ok {
+		t.Fatalf("the fleet id's file holds %d records (the one written before init: %v), want that one", n, ok)
+	}
+	if files := journalFiles(t, remote); len(files) != 2 {
+		t.Fatalf("the journal holds %v, want the old id's file and the fleet id's", files)
+	}
+}
+
 // journalFiles lists the journal files the remote's main holds.
 func journalFiles(t *testing.T, remote string) []string {
 	t.Helper()

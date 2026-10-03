@@ -107,9 +107,9 @@ files the directory lacks. When the repository is empty, its first commit holds
 `fleetd.json` with a new salt for the fleet, on the branch the repository names as
 its default, else `main`. One that already holds records needs the salt its
 machines use (`--salt` or `FLEET_SALT`); init never invents one for it. A fleet
-that ran without a salt, as v0.1.0 allowed, gives a new one: its machines'
-records so far stay under the ids they had, and their new records go under new
-ones. When the
+that ran without a salt, as v0.1.0 allowed, gives a new one: the records its
+machines published stay under the ids they had, and the rest, with every new
+one, go under new ones once each machine has run init. When the
 repository's default branch does not exist but it has exactly one branch, the
 journal is on that branch; a server that does not advertise an empty repository's
 default leaves the first machine starting `main` whatever the repository's HEAD
@@ -219,14 +219,19 @@ network goes for a moment, or that finds one, is made again by every init until
 one finds none. Till then no sync publishes: the clone may lack the journal's
 `fleetd.json`, and this machine's records would go out under another id; they
 wait, and the sync after init files them under the fleet's. A copy of the journal,
-a branch made from it, shares a commit holding `fleetd.json` with it, and is not a
-second journal. A first init in a new directory whose push went through, or whose
-look found another journal, keeps its clone there, even when it fails, so that
-init run again looks. One whose push failed, which may have gone through all the
-same (the connection dropped after the remote took it, or `--timeout` passed while
-the remote finished), leaves its clone beside the journal directory, as one killed
-right after its push does, unless the remote declined the push. The next init
-makes the look, and only then removes the clones left there over ten minutes ago.
+a branch made from it, holds the `fleetd.json` of the last commit it shares with
+the journal's branch, and is not a second journal. A first init in a new directory
+whose push went through, or whose look found another journal, keeps its clone
+there, even when it fails, so that init run again looks. One whose push failed,
+which may have gone through all the same (the connection dropped after the remote
+took it, or `--timeout` passed while the remote finished), keeps its clone beside
+the journal directory instead, marked as kept (`.git/fleetd-kept`), unless the
+remote declined the push; one killed right after its push leaves its clone there
+unmarked. Every init, in a new directory or on a clone, makes the look such a
+clone notes, and only then removes the kept clones it made it for, and any left
+there over ten minutes ago. Every sync waits for the look a kept clone notes, so a
+clone made there by hand publishes nothing until init has made it; the look a
+killed init left is the next init's to make.
 A machine whose journal
 follows the other branch has its journal's `.git` directory deleted before that
 branch is, and init run there again keeps its records; left in place, the
@@ -343,6 +348,11 @@ project's `./channels/journal`, which lies inside that project's repository, or
 records filed under the hostname id on an earlier run when `reg.exe` failed and this
 run's does not. Those stay where they are.
 
+Then run `fleetd init <journal URL>` on every machine. Once one machine's init has
+given the journal `fleetd.json`, a clone without it publishes nothing, saying to run
+init: its records would go under another id. Init puts the file in place, and the
+records it has not published yet go under the fleet's id.
+
 Two defaults are deliberate and worth knowing before you use it:
 
 - **The OS account is not recorded unless you pass `--include-user`.** These
@@ -386,12 +396,11 @@ was wrong:
   used until a sync brings in a fixed one. init itself refuses a journal whose
   `fleetd.json` is invalid, or larger than 32 KiB in git: checked out with CRLF
   line endings, as Git for Windows does by default, it can be twice that.
-  A missing `fleetd.json`, deleted or not yet written by an init stopped short,
-  stops every sync while the journal's branch, as the clone last fetched it,
-  holds one: the records would go out under another id. They wait, and init
-  puts the file back, after which a sync files them under the fleet's id. A
-  clone set up before the journal had one, as v0.1.0 left it, publishes once
-  more under the id it always had, in the sync that brings the file in.
+  A missing `fleetd.json` stops every sync while the journal's branch holds
+  one: deleted, not yet written by an init stopped short, or never there, as
+  in a clone set up before the journal had one, as v0.1.0 left it. The records
+  would go out under another id; they wait, and init puts the file in place,
+  after which a sync files them under the fleet's id.
   Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
