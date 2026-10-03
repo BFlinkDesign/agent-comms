@@ -10,8 +10,8 @@ Usage (called by agent-runner.sh):
     echo "run pytest and report results" | python C:/tools/agent-comms/codex-wrap.py
 
 Exit codes:
-    0 -- codex completed (output always produced, even on codex errors)
-    Non-zero -- wrapper itself failed (e.g. codex not found, stdin unreadable)
+    0 -- codex exited successfully
+    Non-zero -- codex exit status, 124 for timeout, or a wrapper failure
 """
 
 import re
@@ -176,7 +176,8 @@ def main() -> int:
     # Format and print clean result
     result = format_result(prompt, raw, returncode)
     print(result)
-    return 0
+    # Formatting output must not turn a failed invocation into success.
+    return returncode if returncode >= 0 else 128 - returncode
 
 
 if __name__ == "__main__":

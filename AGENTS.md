@@ -62,6 +62,12 @@ convenience.
   named by go.mod's `toolchain` line; where that download is blocked, `GOTOOLCHAIN=local` uses
   the installed Go, and only CI then shows the pinned toolchain passing.
 - `comms.sh` is the CLI entry point — source it, don't execute directly
+- Runner failure propagation is covered by `tests/test_runner_outcomes.py`, which
+  runs local stand-in CLIs against temporary channels, never paid agents or the live bus.
+  Use `RUNNER_ONCE=1` and `RUNNER_STATE_DIR` for bounded isolated runner checks.
+  Nonzero exits produce errors; human handoffs and insufficient output stay blocked.
+  A runner result is not independent verification. See PROTOCOL.md for remaining
+  attempt-ownership and recovery limitations.
 
 ### Task Protocol (A2A-Aligned — 7 States)
 
