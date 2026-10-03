@@ -3,7 +3,6 @@ package gitsync
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,7 +27,6 @@ import (
 // whole package, so that tests can run in parallel; one that cares about hostile
 // settings sets them itself, and so runs on its own.
 func TestMain(m *testing.M) {
-	moreParallel()
 	dir, err := os.MkdirTemp("", "gitsync-test")
 	if err != nil {
 		panic(err)
@@ -48,21 +46,6 @@ func TestMain(m *testing.M) {
 	}
 	os.RemoveAll(dir)
 	os.Exit(code)
-}
-
-// moreParallel runs four tests to a processor, at most 32 at once, unless the
-// run sets -test.parallel itself: they wait on the git processes they start far
-// more than they use a processor, and on Windows, which starts processes slowly,
-// one test to a processor took most of the CI job's time.
-func moreParallel() {
-	flag.Parse()
-	set := false
-	flag.Visit(func(f *flag.Flag) { set = set || f.Name == "test.parallel" })
-	if !set {
-		if err := flag.Set("test.parallel", strconv.Itoa(min(4*runtime.GOMAXPROCS(0), 32))); err != nil {
-			panic(err)
-		}
-	}
 }
 
 func requireGit(t *testing.T) {

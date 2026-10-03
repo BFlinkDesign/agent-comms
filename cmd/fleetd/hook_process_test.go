@@ -3,13 +3,10 @@ package main
 import (
 	"bytes"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +27,6 @@ func TestMain(m *testing.M) {
 	// out the settle time each time was most of their run. The test of the wait
 	// itself puts back the value fleetd runs with.
 	productionSettle, refileSettle = refileSettle, 100*time.Millisecond
-	moreParallel()
 	// Every test runs git with an empty global config and no system one, as on a
 	// fresh machine, and none reaches this machine's home directory, or a salt or
 	// journal directory its environment sets. Set once here, for the whole run,
@@ -63,22 +59,6 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.RemoveAll(home)
 	os.Exit(code)
-}
-
-// moreParallel runs four tests to a processor, at most 32 at once, unless the
-// run sets -test.parallel itself: they wait on the git processes they start far
-// more than they use a processor, and on Windows, which starts processes slowly,
-// one test to a processor took most of the CI job's time. A run as fleetd, above,
-// never gets here: its arguments are fleetd's.
-func moreParallel() {
-	flag.Parse()
-	set := false
-	flag.Visit(func(f *flag.Flag) { set = set || f.Name == "test.parallel" })
-	if !set {
-		if err := flag.Set("test.parallel", strconv.Itoa(min(4*runtime.GOMAXPROCS(0), 32))); err != nil {
-			panic(err)
-		}
-	}
 }
 
 // productionSettle is refileSettle as fleetd runs with it.
