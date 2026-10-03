@@ -292,7 +292,10 @@ on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
 on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
 no host journal file) while another branch holds one: it is refused, naming the
-branch the journal is on, with nothing pushed or moved. Two machines that make two
+branch the journal is on, with nothing pushed or moved. A sync onto such a branch
+publishes nothing either, so that a machine not yet put on the journal's branch
+cannot make a cleaned default a second journal; its records wait for
+`fleetd init --branch`. Two machines that make two
 such branches the journal's at once are told so: the push notes, in
 `.git/fleetd-look`, that a look at origin's other branches is due, and every init
 makes it until one finds no other journal (a first init in a new directory whose
@@ -433,7 +436,8 @@ push that deletes a usable `fleetd.json` leaves in place the copy each clone's w
 tree holds, so those machines keep their ids, and every sync says so; `fleetd init`
 on any machine puts it back as the journal's branch last held it, along its first
 parents, refusing a `--salt` that contradicts it, so a machine set up meanwhile gets
-the fleet's id too. Where there is none to put back (invalid when deleted, a
+the fleet's id too (unless the branch holds no records while another branch holds
+a journal, which init then names). Where there is none to put back (invalid when deleted, a
 history rewritten without it, or history merged in since that held another salt,
 leaving it unclear which line was the branch's own), the deletion comes in, and a
 clone that has used the fleet's salt publishes nothing under another until init

@@ -425,7 +425,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 				"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
 				"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
 		}
-		commit, published, err := snapshotCommit(g, remoteTip, own, o.File, o.Message)
+		commit, published, err := snapshotCommit(g, remoteTip, branch, own, o.File, o.Message)
 		if err != nil {
 			return res, err
 		}
@@ -547,9 +547,10 @@ func batchSSH(g git) []string {
 }
 
 // snapshotCommit builds, without touching the working tree or the index, a commit
-// on top of remoteTip whose only change is this host's file as of its last
-// complete line. It returns "" when the remote already has every complete record.
-func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, error) {
+// on top of remoteTip, origin's branch, whose only change is this host's file as
+// of its last complete line. It returns "" when the remote already has every
+// complete record.
+func snapshotCommit(g git, remoteTip, branch, own, file, message string) (string, int, error) {
 	data, err := journal.ReadRegular(file)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", 0, nil
@@ -599,9 +600,38 @@ func snapshotCommit(g git, remoteTip, own, file, message string) (string, int, e
 		return "", 0, err
 	}
 	var entries []string
+	top := map[string]string{}
 	for _, entry := range strings.Split(listing, "\x00") {
-		if _, path, ok := strings.Cut(entry, "\t"); ok && path != own {
+		meta, path, ok := strings.Cut(entry, "\t")
+		if !ok {
+			continue
+		}
+		if fields := strings.Fields(meta); len(fields) == 3 {
+			top[path] = fields[1]
+		}
+		if path != own {
 			entries = append(entries, entry)
+		}
+	}
+	// Nor onto a branch that holds no journal while another of origin's branches
+	// holds one, as a default branch cleaned down to a README once the fleet
+	// moved its journal does: published there, these records would start a
+	// second journal, which the fleetd.json init puts back for them makes whole.
+	// Only such a branch costs a look at the others.
+	if !holdsJournal(top) {
+		holding, err := journalsBut(g, branch)
+		if err != nil {
+			return "", 0, err
+		}
+		if len(holding) > 0 {
+			on := holding[0]
+			if len(holding) > 1 {
+				on = "each of " + strings.Join(holding, ", ")
+			}
+			return "", 0, fmt.Errorf("%w: origin's %s holds no journal, but %s holds one, where the fleet publishes; "+
+				"this machine's records would start a second journal on %s, so they wait. `fleetd init --dir \"%s\" "+
+				"--branch <branch> <journal URL>` puts this clone on the journal's branch", ErrJournalElsewhere,
+				branch, on, branch, g.dir)
 		}
 	}
 	entries = append(entries, "100644 blob "+strings.TrimSpace(blob)+"\t"+own)

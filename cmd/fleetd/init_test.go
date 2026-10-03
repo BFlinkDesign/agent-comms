@@ -2523,6 +2523,28 @@ func TestAHookThatDerivedItsIdWithoutFleetdJsonPublishesNothingOnceAnUnusableOne
 	}
 }
 
+// A salt note that cannot be read or replaced, a directory where it goes, stops
+// no sync while fleetd.json is in place: the note speaks only once the file is
+// lost.
+func TestASaltNoteThatIsADirectoryStopsNoSyncWhileFleetdJsonIsInPlace(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(dir, ".git", saltCacheName)
+	if err := os.Remove(cache); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cache, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatalf("sync with a directory where the salt note goes: %v", err)
+	}
+}
+
 // A sync stopped because its salt came from a stale FLEET_SALT says to give init
 // the salt the clone noted, with --salt, which init takes over FLEET_SALT: the
 // advice followed in the same environment keeps the fleet's id. Plain, init

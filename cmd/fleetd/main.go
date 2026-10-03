@@ -594,13 +594,25 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 		// nothing under another id: its records wait, as they do while the journal
 		// holds one, and the sync after init files them under the fleet's. With an
 		// unusable one every command derives the salt it last held, so only an id
-		// derived before one came in differs.
-		if last := cachedSalt(store.Dir()); !ok && last != "" && last != h.Salt {
+		// derived before one came in differs. A note there that cannot be read, a
+		// link or a FIFO planted in its place say, still says the clone used one:
+		// only a missing note means it never did.
+		last := cachedSalt(store.Dir())
+		note := filepath.Join(gitDir, saltCacheName)
+		if _, err := os.Lstat(note); !ok && err == nil && last == "" {
+			stale = fmt.Errorf("%w, and %s, which notes the salt this clone used, cannot be read or holds none: its "+
+				"records would go out under %s, which may be another id than the fleet's, so nothing was published. "+
+				"Put the fleet's salt in that file, as another machine's .git/fleetd-salt holds it, or give it to "+
+				"`fleetd init --dir \"%s\" --salt <salt> <journal URL>`", gitsync.ErrNoFleetFile, note, h.ID, store.Dir())
+			cancel()
+			return
+		}
+		if !ok && last != "" && last != h.Salt {
 			stale = fmt.Errorf("%w, whose salt this clone used before: its records would go out under %s, another id "+
 				"than the fleet's, so nothing was published. `fleetd init --dir \"%s\" --salt <salt> <journal URL>`, "+
 				"given the salt %s holds, puts the journal's %s in place, or one with that salt where the journal has "+
 				"none to put back, after which a sync files them under the fleet's id", gitsync.ErrNoFleetFile, h.ID,
-				store.Dir(), filepath.Join(gitDir, saltCacheName), gitsync.FleetFile)
+				store.Dir(), note, gitsync.FleetFile)
 			cancel()
 			return
 		}
@@ -632,7 +644,8 @@ func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bo
 func fleetFileGone(dir string) string {
 	return fmt.Sprintf("the journal repository no longer holds %s, which gives every machine of the fleet its id: "+
 		"this machine keeps its copy in %s, so its records keep their id. `fleetd init --dir \"%s\" <journal URL>` "+
-		"puts it back as the repository last held it, as init on any machine does", gitsync.FleetFile, dir, dir)
+		"puts it back as the repository last held it, as init on any machine does, unless another of its branches "+
+		"holds a journal while this one holds no records, which init then names", gitsync.FleetFile, dir, dir)
 }
 
 // printSyncStatus says how fresh the answer is: a clone holds the other machines'

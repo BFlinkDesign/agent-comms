@@ -1676,8 +1676,29 @@ func WriteNote(ctx context.Context, path string, data []byte) error {
 	}
 	if err != nil {
 		os.Remove(f.Name())
+		return err
 	}
-	return err
+	pruneNoteTemps(path)
+	return nil
+}
+
+// pruneNoteTemps removes the temporary files that writes of the note at path
+// left when killed before their rename: those older than staleLock, so that one
+// another process is writing now stays. It is best effort.
+func pruneNoteTemps(path string) {
+	dir, prefix := filepath.Dir(path), "."+filepath.Base(path)+"."
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > staleLock {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // RenameRetry renames, retrying for a few seconds while Windows refuses because

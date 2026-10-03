@@ -3624,6 +3624,78 @@ func TestInitRefusesTheDefaultOfAJournalMovedOffIt(t *testing.T) {
 	}
 }
 
+// A journal moved in the order a person would move it, copied to a branch of its
+// own, the default cleaned down to a README, then each machine put on the new
+// branch, stays whole when a machine's hook syncs between the cleaning and that
+// machine's turn: the sync publishes nothing on the cleaned default, saying where
+// the journal is, so a new machine's plain init is still refused there, naming
+// the journal's branch, with nothing pushed; and the record that waited goes out
+// on the journal's branch once the machine is put on it.
+func TestAHookBeforeTheRepointDoesNotReopenTheMovedJournalsDefault(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	remote := newEmptyRemote(t)
+	b := filepath.Join(t.TempDir(), "b")
+	mustInit(t, InitOptions{URL: remote, Dir: b, Salt: "s"})
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:b1"}`)
+	mustSync(t, options(b, "host-b"))
+	d := filepath.Join(t.TempDir(), "d")
+	mustInit(t, InitOptions{URL: remote, Dir: d})
+	appendLines(t, filepath.Join(d, "host-d.jsonl"), `{"id":"hive:d1"}`)
+	mustSync(t, options(d, "host-d"))
+	w := filepath.Join(t.TempDir(), "w")
+	run(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+	identify(t, w)
+	run(t, w, "push", "--quiet", "origin", "main:journal")
+	run(t, w, "rm", "--quiet", FleetFile, "host-b.jsonl", "host-d.jsonl")
+	write(t, filepath.Join(w, "README.md"), "the journal is on branch journal\n")
+	run(t, w, "add", "README.md")
+	run(t, w, "commit", "--quiet", "-m", "main is for people; the journal moved to branch journal")
+	run(t, w, "push", "--quiet", "origin", "main")
+	mustInit(t, InitOptions{URL: remote, Dir: b, Branch: "journal"})
+	// D's hook fires once before D is put on journal; a git that cannot say what
+	// origin's other branches hold stops that sync too, with nothing published.
+	appendLines(t, filepath.Join(d, "host-d.jsonl"), `{"id":"hive:d2"}`)
+	o := options(d, "host-d")
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		if slices.Contains(args, "for-each-ref") && slices.Contains(args, "refs/remotes/origin/") {
+			return "", errors.New("git for-each-ref: exit status 128: fatal: unable to read refs")
+		}
+		return Git(ctx, dir, stdin, args...)
+	}
+	if res, err := Sync(context.Background(), o); err == nil || !strings.Contains(err.Error(), "unable to read refs") ||
+		res.Published != 0 {
+		t.Errorf("D's sync with a git that cannot list origin's branches = %+v, %v; want git's error, nothing published",
+			res, err)
+	}
+	res, err := Sync(context.Background(), options(d, "host-d"))
+	if !errors.Is(err, ErrJournalElsewhere) || res.Published != 0 || !strings.Contains(err.Error(), "but journal holds one") ||
+		!strings.Contains(err.Error(), "--branch <branch>") {
+		t.Errorf("D's sync before it is put on journal = %+v, %v; want ErrJournalElsewhere naming journal, nothing published",
+			res, err)
+	}
+	heads := func() string {
+		return run(t, filepath.Dir(remote), "--git-dir", remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/")
+	}
+	before := heads()
+	got, err := Init(context.Background(), InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "c")})
+	if !errors.Is(err, ErrJournalElsewhere) || !strings.Contains(err.Error(), "holds one on journal") {
+		t.Errorf("a new machine's init = %+v, %v; want ErrJournalElsewhere naming journal", got, err)
+	}
+	if after := heads(); after != before {
+		t.Errorf("init pushed:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	mustInit(t, InitOptions{URL: remote, Dir: d, Branch: "journal"})
+	// A copy of the journal kept on another branch stops no sync on the journal's.
+	run(t, filepath.Dir(remote), "--git-dir", remote, "branch", "backup", "journal")
+	if res := mustSync(t, options(d, "host-d")); res.Published != 1 {
+		t.Errorf("D's sync once on journal = %+v; want the record that waited published", res)
+	}
+	if got := run(t, filepath.Dir(remote), "--git-dir", remote, "show", "journal:host-d.jsonl"); !strings.Contains(got, "hive:d2") {
+		t.Errorf("journal's host-d.jsonl holds %q, want the record that waited", got)
+	}
+}
+
 // A side branch cut before main changed its fleetd.json takes main in, and the
 // file's deletion, and is pushed to main as a fast forward: main's first parents
 // are then the side branch's, and git cannot say which line was main's own. With

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,11 +189,18 @@ func TestAFIFOAtANoteInTheGitDirectoryHoldsNothingUp(t *testing.T) {
 			returnsWithin(t, 30*time.Second, "where with a FIFO at "+note, func() {
 				_, _, _ = exec(t, "where", "--dir", dir)
 			})
+			var err error
 			returnsWithin(t, 30*time.Second, "a sync with a FIFO at "+note, func() {
-				_, _, _ = exec(t, "sync", "--dir", dir, "--timeout", "10s")
+				_, _, err = exec(t, "sync", "--dir", dir, "--timeout", "10s")
 			})
-			if _, err := os.Lstat(filepath.Join(dir, ".git", "fleetd-sync.lock")); err == nil {
+			if _, lerr := os.Lstat(filepath.Join(dir, ".git", "fleetd-sync.lock")); lerr == nil {
 				t.Fatal("the sync left its lock behind")
+			}
+			// With fleetd.json in place, a note that cannot be read stops nothing;
+			// without it, the sync waits for init, as for any clone that lost it.
+			if want := note == "the salt cache, without fleetd.json"; want != errors.Is(err, gitsync.ErrNoFleetFile) ||
+				!want && err != nil {
+				t.Fatalf("a sync with a FIFO at %s: %v", note, err)
 			}
 		})
 	}
@@ -391,6 +399,79 @@ func TestAFIFOWhereANoteIsWrittenHoldsNothingUp(t *testing.T) {
 			if note == "the salt cache's" && cachedSalt(dir) != "s" {
 				t.Fatalf("the salt cache holds %q, want s", cachedSalt(dir))
 			}
+		})
+	}
+}
+
+// A clone that has used the fleet's salt, and lost fleetd.json with none to put
+// back, publishes nothing under another id even when its note of that salt is
+// one readNote refuses: a link, a FIFO, a directory or a note past its bound
+// still says the clone used a salt. Only a missing note means none.
+func TestAnUnreadableSaltNoteStillHoldsTheRecords(t *testing.T) {
+	t.Parallel()
+	for _, note := range []string{"a link to the salt", "a FIFO", "a directory", "the salt past 1 MiB"} {
+		t.Run(note, func(t *testing.T) {
+			t.Parallel()
+			remote := emptyJournalRemote(t)
+			b := filepath.Join(t.TempDir(), "b")
+			if _, _, err := exec(t, "init", "--dir", b, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			fleetID := hostID(t, "--dir", b)
+			if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatal(err)
+			}
+			w := filepath.Join(t.TempDir(), "w")
+			gitIn(t, filepath.Dir(w), "clone", "--quiet", remote, w)
+			commit := []string{"-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet"}
+			if err := os.WriteFile(filepath.Join(w, gitsync.FleetFile), []byte("not json\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, w, append(commit, "-am", "oops")...)
+			gitIn(t, w, "push", "--quiet", "origin", "main")
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, w, "rm", "--quiet", gitsync.FleetFile)
+			gitIn(t, w, append(commit, "-m", "tidy up")...)
+			gitIn(t, w, "push", "--quiet", "origin", "main")
+			if _, _, err := exec(t, "sync", "--dir", b); err != nil {
+				t.Fatal(err)
+			}
+			cache := filepath.Join(b, ".git", saltCacheName)
+			var err error
+			switch note {
+			case "a link to the salt":
+				aside := filepath.Join(t.TempDir(), "salt")
+				if err = os.Rename(cache, aside); err == nil {
+					err = os.Symlink(aside, cache)
+				}
+			case "a FIFO":
+				if err = os.Remove(cache); err == nil {
+					err = syscall.Mkfifo(cache, 0o600)
+				}
+			case "a directory":
+				if err = os.Remove(cache); err == nil {
+					err = os.MkdirAll(filepath.Join(cache, "x"), 0o755)
+				}
+			case "the salt past 1 MiB":
+				err = os.WriteFile(cache, []byte("s\n"+strings.Repeat(" ", maxNoteBytes)), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "record", "--dir", b, "--type", "note", "--note", "b2"); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = exec(t, "sync", "--dir", b, "--timeout", "10s")
+			if !errors.Is(err, gitsync.ErrNoFleetFile) || !strings.Contains(err.Error(), "cannot be read or holds none") ||
+				!strings.Contains(err.Error(), "--salt <salt> <journal URL>") {
+				t.Errorf("sync: %v; want ErrNoFleetFile, saying the note cannot be read, nothing published", err)
+			}
+			onlyUnderTheFleetsId(t, remote, fleetID)
 		})
 	}
 }

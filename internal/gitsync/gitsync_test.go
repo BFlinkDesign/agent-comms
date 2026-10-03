@@ -1049,6 +1049,41 @@ func TestAPushTheRemoteRefusesIsReportedAsRefused(t *testing.T) {
 	}
 }
 
+// WriteNote removes what writes of its note killed before their rename left:
+// temporary files older than staleLock. One as fresh as a write going on now
+// stays, and so do another note's.
+func TestWriteNoteRemovesTheTemporaryFilesKilledWritesLeft(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	note := filepath.Join(dir, "fleetd-sync.json")
+	stale := filepath.Join(dir, ".fleetd-sync.json.111")
+	fresh := filepath.Join(dir, ".fleetd-sync.json.222")
+	other := filepath.Join(dir, ".fleetd-salt.333")
+	long := time.Now().Add(-2 * staleLock)
+	for _, p := range []string{stale, fresh, other} {
+		write(t, p, "a write killed part way\n")
+		if p != fresh {
+			if err := os.Chtimes(p, long, long); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := WriteNote(context.Background(), note, []byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the stale temporary file: %v; want it removed", err)
+	}
+	for _, p := range []string{fresh, other} {
+		if _, err := os.Lstat(p); err != nil {
+			t.Errorf("%s: %v; want it kept", p, err)
+		}
+	}
+	if got := readFile(t, note); got != "{}\n" {
+		t.Errorf("the note holds %q", got)
+	}
+}
+
 // A rename Windows keeps refusing is retried for a few seconds, but never past
 // the caller's deadline.
 func TestARenameRetryStopsWhenTheContextEnds(t *testing.T) {

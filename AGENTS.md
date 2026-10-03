@@ -191,6 +191,12 @@ whatever the clone's own refspec, and leave its tags alone. They prune, so a
 branch the remote deleted or renamed goes from the clone too, a `--single-branch`
 clone included: a sync or init on a branch that followed it stops and says so,
 pushing nothing, since a push would bring the branch back and split the journal.
+A sync onto a branch that holds no journal, neither `fleetd.json` nor a host
+journal file, while another of origin's branches holds one, as a default branch
+cleaned down to a README once the fleet moved its journal does, publishes
+nothing either: a machine not yet put on the journal's branch would start a
+second journal there. Its records wait, and `fleetd init --branch <branch>`
+puts it on the journal's.
 Their pushes go onto the tip they fetched and nowhere else, so a branch renamed
 or deleted in between refuses them, as a race lost. Only a person knows where the
 journal went: after a rename, or a deletion on purpose, `fleetd init --branch
@@ -405,7 +411,9 @@ was wrong:
   machines keep their ids, and every `fleetd sync`, and the hook's log, says so.
   `fleetd init`, on any machine, puts it back as the journal's branch last held
   it, along its first parents, so a machine set up meanwhile gets the fleet's id
-  too; a `--salt` that contradicts it is refused, and a `FLEET_SALT` that does is
+  too, unless the branch holds no records while another of origin's branches
+  holds a journal, a backup say: init cannot tell that from a journal moved
+  there, and is refused, naming it; a `--salt` that contradicts it is refused, and a `FLEET_SALT` that does is
   overridden with a warning. Where there is none to put back (the last was
   invalid, a push rewrote the history without it, or history merged in since
   held another salt, which leaves it unclear which line was the branch's own),
@@ -417,7 +425,8 @@ was wrong:
   one: deleted, not yet written by an init stopped short, or never there, as
   in a clone set up before the journal had one, as v0.1.0 left it. It stops
   them too while the clone has used the fleet's salt, which it keeps in
-  `.git/fleetd-salt`, and this machine's records would go under another. The
+  `.git/fleetd-salt` (a note there it cannot read counts as one), and this
+  machine's records would go under another. The
   records would go out under another id; they wait, and init given that salt
   with `--salt` puts the file in place, after which a sync files them under the
   fleet's id (without `--salt`, where the journal has no `fleetd.json` to put
@@ -440,8 +449,10 @@ was wrong:
   re-filed), which it writes through a file of its own renamed into place. So,
   too, are the journal files: this machine's own, which a record appends to,
   and every machine's, which `where` reads, and which a push can make a link;
-  `where` names such a file and reports the rest, and reports a line longer
-  than 64 KiB without holding it. A note larger than 1 MiB is not read, and a
+  `where` names such a file and reports the rest, and skips a line longer than
+  64 KiB, saying so; for a machine with records, though, it still reads that
+  machine's file whole, and the remote's copy, to say what it has published. A
+  note larger than 1 MiB is not read, and a
   sync considers at most 64 distinct salts, those noted first. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
