@@ -40,7 +40,8 @@ var (
 	ErrNotJournal = errors.New("gitsync: the repository does not look like a fleet journal")
 	// ErrSaltMismatch means a salt was given that differs from the journal's.
 	ErrSaltMismatch = errors.New("gitsync: the salt given differs from the journal's fleetd.json")
-	// ErrBadFleetFile means FleetFile exists but is not valid JSON, or holds no salt.
+	// ErrBadFleetFile means FleetFile exists but is not a regular file of a
+	// sensible size, cannot be read, is not valid JSON, or holds no salt.
 	ErrBadFleetFile = errors.New("gitsync: fleetd.json is not usable")
 	// ErrNeedSalt means the journal holds records but no FleetFile, so the salt
 	// its machines use cannot be known, and inventing one would give each of them
@@ -69,7 +70,7 @@ var hostFile = regexp.MustCompile(`^host-[a-z0-9_-]{1,59}\.jsonl$`)
 // ReadFleet reads FleetFile from a journal directory; ok is false when it has none.
 func ReadFleet(dir string) (f Fleet, ok bool, err error) {
 	path := filepath.Join(dir, FleetFile)
-	data, err := os.ReadFile(path)
+	data, err := readFleetFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Fleet{}, false, nil
 	}
@@ -80,6 +81,22 @@ func ReadFleet(dir string) (f Fleet, ok bool, err error) {
 		return Fleet{}, false, err
 	}
 	return f, true, nil
+}
+
+// maxFleetFileBytes bounds FleetFile, which holds a few lines.
+const maxFleetFileBytes = 64 << 10
+
+// readFleetFile reads FleetFile at path. FleetFile comes from the remote, so any
+// machine able to push can make it a link, a directory, a FIFO or a file of any
+// size. Anything but a regular file of at most maxFleetFileBytes is
+// ErrBadFleetFile: not trusted, so the salt the file last held is used, and a
+// sync can still bring in a fixed one. A missing file is os.ErrNotExist.
+func readFleetFile(path string) ([]byte, error) {
+	data, err := readRegular(path, maxFleetFileBytes)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %v", ErrBadFleetFile, err)
+	}
+	return data, err
 }
 
 func parseFleet(data []byte, where string) (Fleet, error) {
@@ -117,8 +134,7 @@ type InitResult struct {
 	Started bool `json:"started"`
 	// WroteFleetFile is set when Init committed FleetFile to the repository.
 	WroteFleetFile bool `json:"wrote_fleet_file"`
-	// Cloned is set when Dir was not a clone, or was one with no commit, and now
-	// follows the journal.
+	// Cloned is set when Dir was not a clone and now is.
 	Cloned bool `json:"cloned"`
 	// Branch is the branch the clone follows.
 	Branch string `json:"branch"`
@@ -146,8 +162,8 @@ type InitResult struct {
 // has FleetFile added to its repository the same way, with plumbing; then the
 // journal's FleetFile replaces the one in its work tree, if they differ, and the
 // tracked files it lacks are checked out. The rest of its work tree is left to
-// the next sync. A clone with no commit, such as a plain clone of the repository
-// made while it was empty, is set up in place, on the branch it is on.
+// the next sync. A clone with no commit and no branch, such as a plain clone of
+// the repository made while it was empty, is refused, with advice that works.
 //
 // A repository without FleetFile gets it in a commit of its own, pushed at once;
 // an empty repository gets it as its first commit. One that already holds
@@ -260,37 +276,38 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if !sameURL(origin, url) {
 		return res, fmt.Errorf("%w: %s follows %s, not %s", ErrOtherRemote, o.Dir, origin, url)
 	}
-	// A clone with no commit, such as a plain clone of the journal repository made
-	// while it was still empty, has nothing to follow yet: it is set up in place,
-	// as initNew sets up a new directory, on the branch it is on. One with branches
-	// is not, even on a branch with no commit (git checkout --orphan): setting it
-	// up would move a branch that may hold commits of its own.
-	_, err = g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-	if err != nil && ctx.Err() != nil {
-		return res, err
-	}
-	unborn := err != nil
-	if unborn {
+	// A clone with no commit and no branch, such as a plain clone of the journal
+	// repository made while it was still empty, has nothing to follow. Its git
+	// directory holds no commit: without it, init sets the directory up as a new
+	// one, keeping every file in it. A clone with branches, on one with no commit
+	// yet (git checkout --orphan), is refused below for want of an upstream, so
+	// that none of its branches is moved.
+	if _, err := g.line("rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
 		branches, err := g.line("for-each-ref", "--format=%(refname)", "refs/heads/")
 		if err != nil {
 			return res, err
 		}
-		unborn = branches == ""
-	}
-	if !unborn {
-		upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-		if err != nil {
-			if ctx.Err() != nil {
-				return res, err
-			}
-			return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+		if branches == "" {
+			return res, fmt.Errorf("%w: %s has no commit, as a clone made while the journal repository was empty has none; "+
+				"delete its .git directory, then run fleetd init again, which sets it up and keeps every other file there",
+				ErrNoUpstream, o.Dir)
 		}
-		remote, branch, ok := strings.Cut(upstream, "/")
-		if !ok || remote != "origin" {
-			return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
-		}
-		res.Branch = branch
 	}
+	upstream, err := g.line("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil {
+		if ctx.Err() != nil {
+			return res, err
+		}
+		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+	}
+	remote, branch, ok := strings.Cut(upstream, "/")
+	if !ok || remote != "origin" {
+		return res, fmt.Errorf("%w: upstream %q is not origin/<branch>", ErrNoUpstream, upstream)
+	}
+	res.Branch = branch
 	unlock, gitDir, err := lock(g)
 	if err != nil {
 		return res, err
@@ -299,7 +316,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	// An init stopped after moving its clone's git directory in, and before
 	// filling the index, left a clone with no index: every file would look
 	// deleted, and untracked, to git. Filling it now finishes that init.
-	if _, err := os.Stat(filepath.Join(gitDir, "index")); !unborn && errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(gitDir, "index")); errors.Is(err, os.ErrNotExist) {
 		if _, err := g.line("read-tree", "HEAD"); err != nil {
 			return res, err
 		}
@@ -307,26 +324,8 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin")...); err != nil {
 		return res, err
 	}
-	if unborn {
-		if res.Branch, err = startBranch(g, o.URL); err != nil {
-			return res, err
-		}
-	}
 	if err := bootstrap(g, o, &res); err != nil {
 		return res, err
-	}
-	if unborn {
-		for _, args := range [][]string{
-			{"update-ref", "refs/heads/" + res.Branch, res.Head},
-			{"symbolic-ref", "HEAD", "refs/heads/" + res.Branch},
-			{"branch", "--quiet", "--set-upstream-to=origin/" + res.Branch, res.Branch},
-			{"read-tree", "HEAD"},
-		} {
-			if _, err := g.line(args...); err != nil {
-				return res, err
-			}
-		}
-		res.Cloned = true
 	}
 	if err := adoptFleetFile(g, o.Dir, gitDir, res.Head); err != nil {
 		return res, err
@@ -350,9 +349,12 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 		return err
 	}
 	path := filepath.Join(dir, FleetFile)
-	have, err := os.ReadFile(path)
-	switch {
-	case err == nil:
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("%w: %s is a directory; remove it, then run fleetd init again", ErrBadFleetFile, path)
+	}
+	// One that is not a regular file to trust, a link say, has no salt to note,
+	// and is replaced below.
+	if have, err := readFleetFile(path); err == nil {
 		f, perr := parseFleet(have, path)
 		w, _ := parseFleet([]byte(want), FleetFile)
 		if perr == nil && f.Salt != w.Salt {
@@ -360,8 +362,6 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 				return err
 			}
 		}
-	case !errors.Is(err, os.ErrNotExist):
-		return err
 	}
 	// "<mode> blob <id>\t<path>" from the tree, "<mode> <id> 0\t<path>" from the index.
 	entry, err := g.line("ls-tree", tip, "--", FleetFile)
@@ -551,8 +551,10 @@ func oneBranch(g git, branch string) error {
 		}
 	}
 	if len(others) > 0 {
-		return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s; "+
-			"delete the one that is not the repository's default, then run fleetd init again", branch, strings.Join(others, ", "))
+		return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s. Keep the repository's "+
+			"default branch: on any machine whose journal follows the other one, delete the journal's .git directory, "+
+			"or its next sync recreates that branch (its records stay); then delete the other branch, and run fleetd "+
+			"init again on those machines and on this one", branch, strings.Join(others, ", "))
 	}
 	return nil
 }
@@ -568,7 +570,7 @@ func placeFleetFile(g git, dir, gitDir, tip string) error {
 		return err
 	}
 	path := filepath.Join(dir, FleetFile)
-	have, err := os.ReadFile(path)
+	have, err := readFleetFile(path)
 	switch {
 	case err == nil && string(have) == want:
 		return nil
@@ -632,7 +634,7 @@ func NotePastSalt(gitDir, salt string) error {
 // rewrote the file. Anything at path but a regular file, such as a symbolic link
 // or a FIFO an account able to write there could plant, is refused.
 func AppendSalt(path, salt string) error {
-	data, err := readRegular(path)
+	data, err := readRegular(path, maxSaltsBytes)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -660,18 +662,30 @@ func AppendSalt(path, salt string) error {
 // that is not a whole quoted string is skipped, and so is anything at path but a
 // regular file.
 func ReadSalts(path string) []string {
-	data, _ := readRegular(path)
+	data, _ := readRegular(path, maxSaltsBytes)
 	return parseSalts(data)
 }
 
-// readRegular reads the file at path if it is a regular file.
-func readRegular(path string) ([]byte, error) {
+// maxSaltsBytes bounds a salts file, which holds a line per salt.
+const maxSaltsBytes = 1 << 20
+
+// readRegular reads the file at path if it is a regular file of at most limit
+// bytes, so that one planted there, a large sparse file say, cannot exhaust
+// memory.
+func readRegular(path string, limit int64) ([]byte, error) {
 	f, err := journal.OpenRegular(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return io.ReadAll(f)
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("refusing to read %s: it is larger than %d bytes", path, limit)
+	}
+	return data, nil
 }
 
 func parseSalts(data []byte) []string {

@@ -2,7 +2,10 @@
 
 package journal
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 // openAppend opens the journal for appending.
 //
@@ -22,9 +25,11 @@ func openAppend(path string) (*os.File, error) {
 func syncDir(string) error { return nil }
 
 // OpenRegular opens path, a file beside the journal that another account able to
-// write there could have replaced, refusing anything but a regular file. Windows
-// keeps its named pipes outside the file system, so no open of a path there can
-// wait on one; the caller's Lstat check is again the only symlink guard.
+// write there could have replaced, refusing a symbolic link or a directory.
+// Windows keeps its named pipes outside the file system, so no open of a path
+// there can wait on one. Other reparse points, such as OneDrive's placeholders,
+// which Go reports as irregular, are files to open; the Lstat check is again the
+// only symlink guard.
 func OpenRegular(path string, flag int, perm os.FileMode) (*os.File, error) {
 	if err := refuseIrregular(path); err != nil {
 		return nil, err
@@ -34,4 +39,32 @@ func OpenRegular(path string, flag int, perm os.FileMode) (*os.File, error) {
 		return nil, err
 	}
 	return checkRegular(f)
+}
+
+// refuseIrregular refuses a path that holds a symbolic link or a directory,
+// before OpenRegular opens it; a path that holds nothing yet is fine.
+func refuseIrregular(path string) error {
+	fi, err := os.Lstat(path)
+	switch {
+	case err != nil:
+		return nil
+	case fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("refusing to open the symbolic link %s", path)
+	case fi.IsDir():
+		return fmt.Errorf("refusing to open %s: it is a directory", path)
+	}
+	return nil
+}
+
+// checkRegular returns f unless it is a directory, which it closes.
+func checkRegular(f *os.File) (*os.File, error) {
+	fi, err := f.Stat()
+	if err == nil && fi.IsDir() {
+		err = fmt.Errorf("refusing to open %s: it is a directory", f.Name())
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }

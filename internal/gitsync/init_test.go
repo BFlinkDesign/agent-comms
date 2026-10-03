@@ -341,8 +341,9 @@ func TestTwoMachinesStartingTwoBranchesAtOnceAreToldSo(t *testing.T) {
 			// This machine's git is not told the default branch (protocol v0).
 			return Git(ctx, dir, stdin, append([]string{"-c", "protocol.version=0"}, args...)...)
 		}})
-	if !raced || err == nil || !strings.Contains(err.Error(), "two branches at once") {
-		t.Fatalf("raced %v, err = %v; want the second machine told the journal was started on two branches", raced, err)
+	if !raced || err == nil || !strings.Contains(err.Error(), "two branches at once") || !strings.Contains(err.Error(), ".git") {
+		t.Fatalf("raced %v, err = %v; want the second machine told the journal was started on two branches, "+
+			"and what a machine already following the other one must do", raced, err)
 	}
 }
 
@@ -459,5 +460,37 @@ func TestInitPutsTheJournalsFleetFileInTheIndexOnlyOnceTheWorkTreeHasIt(t *testi
 	}
 	if have, err := os.ReadFile(filepath.Join(clone, FleetFile)); err != nil || string(have) != want {
 		t.Fatalf("after init the clone's fleetd.json is %q (%v), want the journal's", have, err)
+	}
+}
+
+// fleetd.json is a few lines. One far larger is not read, even when it is valid
+// JSON throughout, so that a file of any size, which anyone able to push can
+// commit, cannot exhaust memory.
+func TestReadFleetRefusesAnOversizedFleetFile(t *testing.T) {
+	dir := t.TempDir()
+	big := `{"salt": "s"}` + strings.Repeat(" ", 100<<10) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, FleetFile), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if f, ok, err := ReadFleet(dir); !errors.Is(err, ErrBadFleetFile) {
+		t.Fatalf("ReadFleet on a %d-byte fleetd.json: %+v, %v, %v; want ErrBadFleetFile", len(big), f, ok, err)
+	}
+}
+
+// A salts file holds a line per salt. One far larger is neither read nor
+// appended to, so that a large file planted there cannot exhaust memory.
+func TestASaltsFileTooLargeToBeOneIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "salts")
+	if err := os.WriteFile(path, make([]byte, 2<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadSalts(path); len(got) != 0 {
+		t.Fatalf("read %q from an oversized salts file", got)
+	}
+	if err := AppendSalt(path, "x"); err == nil {
+		t.Fatal("noted a salt in an oversized salts file")
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != 2<<20 {
+		t.Fatalf("the oversized salts file changed: %v (%v)", info.Size(), err)
 	}
 }

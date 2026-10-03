@@ -3,10 +3,13 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/BFlinkDesign/agent-comms/internal/gitsync"
 )
 
 // returnsWithin runs f and fails the test if it has not returned within d: a
@@ -71,5 +74,71 @@ func TestAFIFOAtTheHookLogDoesNotHoldUpWhereOrAHook(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("the hook returned %v; a hook must exit 0 whatever happens", err)
+	}
+}
+
+// fleetd.json comes from the remote, and a symbolic link there is checked out
+// as one: a link to a FIFO must not hold up a record, which reads fleetd.json
+// for its salt.
+func TestAFleetFileLinkedToAFIFODoesNotHoldUpARecord(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	editor := filepath.Join(t.TempDir(), "editor")
+	gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
+	gitIn(t, editor, "rm", "--quiet", gitsync.FleetFile)
+	if err := os.Symlink(fifo, filepath.Join(editor, gitsync.FleetFile)); err != nil {
+		t.Skipf("cannot make a symbolic link here: %v", err)
+	}
+	gitIn(t, editor, "add", gitsync.FleetFile)
+	gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "a link")
+	gitIn(t, editor, "push", "--quiet")
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	returnsWithin(t, 30*time.Second, "a record with fleetd.json linked to a FIFO", func() {
+		_, _, err = exec(t, "record", "--dir", dir, "--type", "note", "--note", "while fleetd.json is a link")
+	})
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+}
+
+// init on a clone whose fleetd.json is a link to a FIFO replaces it, rather than
+// reading through it for a salt to note and waiting for a writer.
+func TestInitOnACloneWhoseFleetFileLinksToAFIFOReturns(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	path := filepath.Join(dir, gitsync.FleetFile)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(fifo, path); err != nil {
+		t.Skipf("cannot make a symbolic link here: %v", err)
+	}
+	var err error
+	returnsWithin(t, 30*time.Second, "init with fleetd.json linked to a FIFO", func() {
+		_, _, err = exec(t, "init", "--dir", dir, remote)
+	})
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("after init fleetd.json is %v (%v), want a regular file", info.Mode(), err)
 	}
 }

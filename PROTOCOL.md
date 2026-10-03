@@ -284,7 +284,8 @@ that already holds records without one needs the salt its machines use (`--salt`
 `$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
 the ids they had). When the repository's default branch does not exist, the journal is
 on its only branch; with several, init is refused. A plain clone of the repository
-made while it was empty is set up in place, on the branch it is on. A `fleetd.json`
+made while it was empty, which has no commit, is refused with the advice to delete
+its `.git` directory and run init again. A `fleetd.json`
 in the journal directory with another salt is replaced by the journal's. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
 `.gitattributes`, or a directory, is refused; so is a journal directory holding

@@ -122,9 +122,15 @@ directory that is already a clone of another repository is refused too. A
 `fleetd.json` already in the journal directory with another salt is replaced by the
 journal's, and init's own sync files the records written under its salt under the
 journal's. A plain clone of the repository made while it was still empty has no
-commit to follow; init starts the journal there as in a new directory, on the
-branch that clone is on. When two machines start the same empty repository at once, the one
-whose push loses takes the other's commit and salt. Running init again finishes
+commit to follow: init refuses it and says to delete its `.git` directory, which
+holds no commit, after which init sets the directory up as a new one, keeping its
+files. When two machines start the same empty repository at once, the one
+whose push loses takes the other's commit and salt. Two machines whose git
+disagrees on an empty repository's default branch can start it on two branches;
+the second is told to keep the repository's default. A machine whose journal
+follows the other branch must have its journal's `.git` directory deleted before
+that branch is, or its next sync recreates it; init run there again keeps its
+records. Running init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
 which init and every sync wait out for ten minutes. When this machine's journal
 directory was set up again, or restored from an older copy, its file no longer
@@ -267,7 +273,9 @@ was wrong:
   nothing to set in its environment. `--salt` may repeat it but not contradict it.
   A `FLEET_SALT` that contradicts it is overridden with a warning, since refusing
   would drop every record of a hook started with a stale one. An invalid
-  `fleetd.json` is not trusted: the salt it last held, kept in the clone's git
+  `fleetd.json` (not valid JSON, no salt, or not a regular file of at most
+  64 KiB, as a link or a directory pushed by mistake would be) is not trusted,
+  and a sync still brings in a fixed one: the salt it last held, kept in the clone's git
   directory, is used until a sync brings in a fixed one. Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
