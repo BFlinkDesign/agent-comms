@@ -705,38 +705,55 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 }
 
 // noUpstream is the error for a clone whose HEAD follows no remote branch. A
-// branch here that does is the journal's, and the clone is told to check it out
-// again: pushing the current branch, as a clone that never followed the journal
-// needs, would start the journal on a second branch, and cannot push a branch with
-// no commit, or a detached HEAD, at all. A current branch that follows one this
-// clone no longer has is told so: the remote may have deleted or renamed it, and
-// pushing would recreate it.
+// branch here that follows one of origin's is the journal's, and the clone is told
+// to check it out again: pushing the current branch, as a clone that never followed
+// the journal needs, would start the journal on a second branch, and cannot push a
+// branch with no commit, or a detached HEAD, at all. With no such branch, one of
+// origin's that no branch here is named after serves as well: checking it out
+// makes a branch that follows it. A current branch that follows one this clone no
+// longer has is told so: the remote may have deleted or renamed it, and pushing
+// would recreate it. Branches are compared by full name, since a tag can share a
+// branch's short one.
 func noUpstream(g git) error {
-	head, _ := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
-	out, err := g.line("for-each-ref", "--format=%(refname:lstrip=2) %(upstream)", "refs/heads/")
+	head, _ := g.line("symbolic-ref", "--quiet", "HEAD")
+	out, err := g.line("for-each-ref", "--format=%(refname) %(upstream)", "refs/heads/")
 	if err != nil {
 		return err
 	}
+	local := map[string]bool{}
 	var following []string
 	for _, line := range strings.Split(out, "\n") {
-		name, upstream, _ := strings.Cut(line, " ")
-		if !strings.HasPrefix(upstream, "refs/remotes/") {
+		ref, upstream, _ := strings.Cut(line, " ")
+		name := strings.TrimPrefix(ref, "refs/heads/")
+		local[name] = true
+		if !strings.HasPrefix(upstream, "refs/remotes/origin/") {
 			continue
 		}
-		if name == head {
+		if ref == head {
 			return fmt.Errorf("%w: %s follows %s, which this clone no longer has, as when the remote deleted or renamed it",
 				ErrNoUpstream, name, strings.TrimPrefix(upstream, "refs/remotes/"))
 		}
 		following = append(following, name)
 	}
+	if len(following) == 0 {
+		remote, err := g.line("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/")
+		if err != nil {
+			return err
+		}
+		for _, name := range strings.Split(remote, "\n") {
+			if name != "" && name != "HEAD" && !local[name] {
+				following = append(following, name)
+			}
+		}
+	}
 	switch len(following) {
 	case 0:
 		return fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, g.dir)
 	case 1:
-		return fmt.Errorf("%w: check out the branch that follows the journal: `git -C %s checkout %s`",
+		return fmt.Errorf("%w: check out the branch that follows the journal: `git -C \"%s\" checkout %s`",
 			ErrNoUpstream, g.dir, following[0])
 	}
-	return fmt.Errorf("%w: check out the branch that follows the journal, one of %s: `git -C %s checkout <branch>`",
+	return fmt.Errorf("%w: check out the branch that follows the journal, one of %s: `git -C \"%s\" checkout <branch>`",
 		ErrNoUpstream, strings.Join(following, ", "), g.dir)
 }
 

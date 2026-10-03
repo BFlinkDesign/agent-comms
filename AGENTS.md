@@ -277,8 +277,10 @@ was wrong:
   larger than 64 KiB, or is a link or a directory, as one pushed by mistake
   would be (on unix, anything but a regular file). The salt it last held, which
   init and every command that reads it keep in the clone's git directory, is
-  used until a sync brings in a fixed one; init itself refuses a journal whose
-  `fleetd.json` is invalid. Records this machine
+  used until a sync brings in a fixed one. init itself refuses a journal whose
+  `fleetd.json` is invalid, or larger than 32 KiB in git: checked out with CRLF
+  line endings, as Git for Windows does by default, it can be twice that.
+  Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
   are filed under the fleet's id by the next sync, while it holds its lock. A
@@ -291,7 +293,8 @@ was wrong:
   falls back to, and notes it once it can. Either note is one quoted salt per
   line, and a symbolic link or a directory there, or on unix anything else but
   a regular file, such as a FIFO, is refused rather than written through or
-  waited on; so is the hook log. A note larger than 1 MiB is not read. It
+  waited on; so is the hook log. A note larger than 1 MiB is not read, and a
+  sync considers at most 64 distinct salts, those noted first. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
   published, and one a killed sync left missing is put back too. A file git

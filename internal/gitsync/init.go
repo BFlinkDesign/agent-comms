@@ -673,9 +673,11 @@ func ReadSalts(path string) []string {
 // maxSaltsBytes bounds a salts file, which holds a line per salt.
 const maxSaltsBytes = 1 << 20
 
-// fleetBlob returns commit's FleetFile, refusing one larger than ReadFleet reads
-// before reading any of it, so that init accepts no fleetd.json that every other
-// command would refuse. where names the repository in the error.
+// fleetBlob returns commit's FleetFile, refusing one too large before reading any
+// of it, so that init accepts no fleetd.json that every other command would
+// refuse. Checked out with CRLF line endings, as Git for Windows checks text out
+// by default, a file can be twice its size in git, so the limit is half of what
+// ReadFleet reads. where names the repository in the error.
 func fleetBlob(g git, commit, where string) (string, error) {
 	size, err := g.line("cat-file", "-s", commit+":"+FleetFile)
 	if err != nil {
@@ -685,8 +687,8 @@ func fleetBlob(g git, commit, where string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("gitsync: git gave %q as the size of %s's %s", size, where, FleetFile)
 	}
-	if n > maxFleetFileBytes {
-		return "", fmt.Errorf("%w: %s's %s is larger than %d bytes", ErrBadFleetFile, where, FleetFile, maxFleetFileBytes)
+	if n > maxFleetFileBytes/2 {
+		return "", fmt.Errorf("%w: %s's %s is larger than %d bytes", ErrBadFleetFile, where, FleetFile, maxFleetFileBytes/2)
 	}
 	return g.raw(nil, "cat-file", "blob", commit+":"+FleetFile)
 }

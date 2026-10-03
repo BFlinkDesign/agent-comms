@@ -964,39 +964,53 @@ func TestInitRefusesASaltThatContradictsTheJournalsAndSetsNothingUp(t *testing.T
 // A clone whose fleetd.json holds another salt than the journal's, edited by
 // hand or left by an earlier setup, gets the journal's from init, as a new clone
 // does, and the records written under the other salt are published under the
-// fleet's.
+// fleet's. init notes the salt of the file it replaces itself: the salt cache,
+// which would also name it, is best effort, and a virus scanner holding its
+// temporary file on Windows can keep it from being written.
 func TestInitOnACloneReplacesAFleetFileWithAnotherSalt(t *testing.T) {
-	remote := emptyJournalRemote(t)
-	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(t.TempDir(), "journal")
-	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
-	if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
-		t.Fatal(err)
-	}
-	stdout, _, err := exec(t, "init", "--dir", dir, remote)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "the-fleets" {
-		t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v), want the journal's salt", fleet, ok, err)
-	}
-	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
-		t.Fatalf("after init, the record written under the replaced salt is on no remote file; init said %q", stdout)
-	}
-	fleetFileAged(t, dir)
-	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
-		t.Fatal("the record written under the other salt is not published under the fleet's")
-	}
-	if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
-		t.Fatalf("git status after the sync:\n%s", out)
+	for _, cached := range []bool{true, false} {
+		t.Run(map[bool]string{true: "the salt cached", false: "no salt cache"}[cached], func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "the-fleets", remote); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(t.TempDir(), "journal")
+			gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+			if !cached {
+				if err := os.Mkdir(filepath.Join(dir, ".git", saltCacheName+".tmp"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, gitsync.FleetFile), []byte(`{"salt": "another"}`+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written under the other salt"); err != nil {
+				t.Fatal(err)
+			}
+			if got := cachedSalt(dir); cached != (got == "another") {
+				t.Fatalf("the salt cache holds %q", got)
+			}
+			stdout, _, err := exec(t, "init", "--dir", dir, remote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "the-fleets" {
+				t.Fatalf("after init the clone's fleetd.json is %+v (%v, %v), want the journal's salt", fleet, ok, err)
+			}
+			if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
+				t.Fatalf("after init, the record written under the replaced salt is on no remote file; init said %q", stdout)
+			}
+			fleetFileAged(t, dir)
+			if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := remoteHostRecords(t, remote, "the-fleets", "written under the other salt"); !ok {
+				t.Fatal("the record written under the other salt is not published under the fleet's")
+			}
+			if out, _ := osexec.Command("git", "-C", dir, "status", "--porcelain").CombinedOutput(); strings.TrimSpace(string(out)) != "" {
+				t.Fatalf("git status after the sync:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -1291,38 +1305,50 @@ func TestInitOnACloneWithNoCommitSaysHowToSetItUp(t *testing.T) {
 	}
 }
 
-// A clone whose fleetd.json is a symbolic link gets a regular file in its place:
-// fleetd reads fleetd.json only as one, so no record was written under the salt
-// of the file a link points at, and that salt is not noted.
+// A clone whose fleetd.json is a symbolic link gets a regular file in its place,
+// even when the link points at the journal's own content: fleetd reads
+// fleetd.json only as a regular file. So no record was written under the salt of
+// the file a link points at, and that salt is not noted.
 func TestInitReplacesAFleetFileThatIsASymbolicLink(t *testing.T) {
-	remote := emptyJournalRemote(t)
-	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(t.TempDir(), "journal")
-	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
-	path := filepath.Join(dir, gitsync.FleetFile)
-	target := filepath.Join(t.TempDir(), "elsewhere.json")
-	if err := os.WriteFile(target, []byte(`{"salt": "linked"}`+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, path); err != nil {
-		t.Skipf("cannot make a symbolic link here: %v", err)
-	}
-	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
-		t.Fatal(err)
-	}
-	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("after init fleetd.json is %v (%v), want a regular file", info.Mode(), err)
-	}
-	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s" {
-		t.Fatalf("after init fleetd.json is %+v (%v, %v), want the journal's", fleet, ok, err)
-	}
-	if past := gitsync.PastSalts(filepath.Join(dir, ".git")); len(past) != 0 {
-		t.Fatalf("init noted %q as past salts for a link", past)
+	for _, own := range []bool{true, false} {
+		t.Run(map[bool]string{true: "to the journal's own content", false: "to another salt"}[own], func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(t.TempDir(), "journal")
+			gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+			path := filepath.Join(dir, gitsync.FleetFile)
+			content := []byte(`{"salt": "linked"}` + "\n")
+			if own {
+				var err error
+				if content, err = os.ReadFile(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := filepath.Join(t.TempDir(), "elsewhere.json")
+			if err := os.WriteFile(target, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Skipf("cannot make a symbolic link here: %v", err)
+			}
+			if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+				t.Fatal(err)
+			}
+			if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("after init fleetd.json is %v (%v), want a regular file", info.Mode(), err)
+			}
+			if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s" {
+				t.Fatalf("after init fleetd.json is %+v (%v, %v), want the journal's", fleet, ok, err)
+			}
+			if past := gitsync.PastSalts(filepath.Join(dir, ".git")); len(past) != 0 {
+				t.Fatalf("init noted %q as past salts for a link", past)
+			}
+		})
 	}
 }
 
@@ -1542,27 +1568,41 @@ func TestInitKeepsTheJournalsSaltForWhenFleetFileIsUnusable(t *testing.T) {
 	})
 }
 
-// Every command refuses a fleetd.json over 64 KiB, so init refuses one too, on a
-// new directory or a clone: a machine set up with a salt the others would not
-// read would record under a second id. Nor is a larger one read whole.
+// Every command refuses a fleetd.json over 64 KiB as it stands in the work tree,
+// and CRLF line endings, which Git for Windows checks text out with by default,
+// can double one. So init refuses a journal whose fleetd.json is over half that,
+// on a new directory or a clone: a machine set up with a salt it could not then
+// read would record under a second id, or warn on every record. Nor is a larger
+// one read whole.
 func TestInitRefusesAJournalWhoseFleetFileIsTooLarge(t *testing.T) {
-	remote := emptyJournalRemote(t)
-	first := filepath.Join(t.TempDir(), "first")
-	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
-		t.Fatal(err)
-	}
-	editor := filepath.Join(t.TempDir(), "editor")
-	gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
-	big := `{"salt": "s"}` + strings.Repeat(" ", 70<<10) + "\n"
-	if err := os.WriteFile(filepath.Join(editor, gitsync.FleetFile), []byte(big), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "a large fleetd.json")
-	gitIn(t, editor, "push", "--quiet")
-	for _, dir := range []string{filepath.Join(t.TempDir(), "journal"), first} {
-		if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrBadFleetFile) {
-			t.Fatalf("init --dir %s on a journal whose fleetd.json is %d bytes: %v; want ErrBadFleetFile", dir, len(big), err)
-		}
+	for name, big := range map[string]string{
+		"over 64 KiB":                       `{"salt": "s"}` + strings.Repeat(" ", 70<<10) + "\n",
+		"over 64 KiB once checked out CRLF": `{"salt": "s"}` + strings.Repeat("\n", 40<<10),
+	} {
+		t.Run(name, func(t *testing.T) {
+			remote := emptyJournalRemote(t)
+			first := filepath.Join(t.TempDir(), "first")
+			if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
+				t.Fatal(err)
+			}
+			editor := filepath.Join(t.TempDir(), "editor")
+			gitIn(t, filepath.Dir(editor), "clone", "--quiet", remote, editor)
+			if err := os.WriteFile(filepath.Join(editor, gitsync.FleetFile), []byte(big), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitIn(t, editor, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "a large fleetd.json")
+			gitIn(t, editor, "push", "--quiet")
+			crlf := filepath.Join(t.TempDir(), "crlf")
+			gitIn(t, filepath.Dir(crlf), "-c", "core.autocrlf=true", "clone", "--quiet", remote, crlf)
+			if _, _, err := gitsync.ReadFleet(crlf); !errors.Is(err, gitsync.ErrBadFleetFile) {
+				t.Fatalf("a core.autocrlf=true checkout of a %d-byte fleetd.json reads as %v; the test needs one fleetd refuses", len(big), err)
+			}
+			for _, dir := range []string{filepath.Join(t.TempDir(), "journal"), first} {
+				if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrBadFleetFile) {
+					t.Fatalf("init --dir %s on a journal whose fleetd.json is %d bytes: %v; want ErrBadFleetFile", dir, len(big), err)
+				}
+			}
+		})
 	}
 }
 

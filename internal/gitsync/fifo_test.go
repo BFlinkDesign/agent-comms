@@ -67,6 +67,41 @@ func TestASparseSaltsFileFarLargerThanMemoryIsRefusedAtOnce(t *testing.T) {
 	}
 }
 
+// A FIFO where a file stands that the remote changed is kept as this machine's
+// change, unread: opening it would wait for a writer that never comes, past the
+// sync's deadline and holding its lock.
+func TestAFIFOInPlaceOfAChangedFileIsKeptUnread(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	write(t, filepath.Join(b, "README.md"), "changed on b\n")
+	run(t, b, "commit", "--quiet", "-am", "b changes the readme")
+	run(t, b, "push", "--quiet")
+	fifo := filepath.Join(a, "README.md")
+	if err := os.Remove(fifo); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	type outcome struct {
+		res Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := Sync(context.Background(), options(a, "host-a"))
+		done <- outcome{res, err}
+	}()
+	select {
+	case o := <-done:
+		if o.err != nil || !slices.Contains(o.res.Kept, "README.md") {
+			t.Fatalf("sync with a FIFO as README.md: %+v, %v; want it kept", o.res, o.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("a sync with a FIFO as README.md had not returned after 30s")
+	}
+}
+
 // A file this machine changed that the remote changed too is kept as this
 // machine's change, unless it holds only the start of git's copy. One more than
 // twice the size of git's copy cannot, CRLF line endings and all, so it is kept

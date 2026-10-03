@@ -414,18 +414,22 @@ func TestASecondSyncOfTheSameCloneWaitsItsTurn(t *testing.T) {
 // A branch made by hand in a journal clone follows nothing. Pushing it, as
 // `git push -u` would, would start the journal on a second branch; the clone is
 // told to check the journal's branch out again instead, and then syncs. So is a
-// clone whose HEAD was detached.
+// clone whose HEAD was detached, even once the branch is gone: git makes it again,
+// following the journal's, from the remote's.
 func TestABranchMadeByHandIsToldToCheckOutTheJournalsBranch(t *testing.T) {
-	for name, leave := range map[string][]string{
-		"a branch made by hand": {"switch", "--quiet", "-c", "local-only"},
-		"a detached HEAD":       {"checkout", "--quiet", "--detach"},
+	for name, leave := range map[string][][]string{
+		"a branch made by hand":         {{"switch", "--quiet", "-c", "local-only"}},
+		"a detached HEAD":               {{"checkout", "--quiet", "--detach"}},
+		"a detached HEAD and no branch": {{"checkout", "--quiet", "--detach"}, {"branch", "--quiet", "-D", "main"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, m := fleet(t, 1)
-			run(t, m[0], leave...)
+			for _, args := range leave {
+				run(t, m[0], args...)
+			}
 			_, err := Sync(context.Background(), options(m[0], "h"))
-			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "checkout main") || strings.Contains(err.Error(), "push -u") {
-				t.Fatalf("expected ErrNoUpstream saying to check out main, got %v", err)
+			if want := "`git -C \"" + m[0] + "\" checkout main`"; !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+				t.Fatalf("expected ErrNoUpstream saying %s, got %v", want, err)
 			}
 			run(t, m[0], "checkout", "--quiet", "main")
 			mustSync(t, options(m[0], "h"))
@@ -433,22 +437,58 @@ func TestABranchMadeByHandIsToldToCheckOutTheJournalsBranch(t *testing.T) {
 	}
 }
 
+// A branch that lost its upstream is not told to check itself out, which would
+// change nothing; the advice to set one, as on main, still works.
+func TestABranchThatLostItsUpstreamIsNotToldToCheckItselfOut(t *testing.T) {
+	_, m := fleet(t, 1)
+	run(t, m[0], "branch", "--unset-upstream")
+	_, err := Sync(context.Background(), options(m[0], "h"))
+	if !errors.Is(err, ErrNoUpstream) || strings.Contains(err.Error(), "checkout main") || !strings.Contains(err.Error(), "git push -u") {
+		t.Fatalf("expected ErrNoUpstream saying to set one, got %v", err)
+	}
+	run(t, m[0], "push", "--quiet", "-u", "origin", "main")
+	mustSync(t, options(m[0], "h"))
+}
+
+// Only a branch that follows the journal's remote is offered: not one that
+// follows another remote, which init and sync refuse, nor one that follows a
+// branch of this clone.
+func TestOnlyABranchThatFollowsTheJournalIsNamed(t *testing.T) {
+	remote, m := fleet(t, 1)
+	run(t, m[0], "remote", "add", "other", remote)
+	run(t, m[0], "fetch", "--quiet", "other")
+	run(t, m[0], "branch", "--quiet", "--track", "theirs", "other/main")
+	run(t, m[0], "branch", "--quiet", "--track", "local", "main")
+	run(t, m[0], "checkout", "--quiet", "--detach")
+	_, err := Sync(context.Background(), options(m[0], "h"))
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "checkout main`") || strings.Contains(err.Error(), "one of") {
+		t.Fatalf("expected ErrNoUpstream naming main alone, got %v", err)
+	}
+}
+
 // A clone whose branch the remote deleted, or renamed, and whose remote-tracking
 // copy of it was pruned, is told so, not to push it: that would recreate the
-// branch the fleet left.
+// branch the fleet left. A tag named like the branch changes nothing.
 func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
-	remote, m := fleet(t, 2)
-	a, admin := m[0], m[1]
-	run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
-	run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
-	run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
-	run(t, a, "fetch", "--quiet", "--prune")
-	_, err := Sync(context.Background(), options(a, "h"))
-	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "no longer has") || strings.Contains(err.Error(), "push -u") {
-		t.Fatalf("expected ErrNoUpstream saying the branch is gone, got %v", err)
-	}
-	if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/main").Output(); err == nil {
-		t.Fatalf("the sync recreated main at %s", out)
+	for _, tag := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "with a tag named like it"}[tag], func(t *testing.T) {
+			remote, m := fleet(t, 2)
+			a, admin := m[0], m[1]
+			if tag {
+				run(t, a, "tag", "main")
+			}
+			run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
+			run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
+			run(t, a, "fetch", "--quiet", "--prune")
+			_, err := Sync(context.Background(), options(a, "h"))
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "main follows origin/main, which this clone no longer has") {
+				t.Fatalf("expected ErrNoUpstream saying the branch is gone, got %v", err)
+			}
+			if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/main").Output(); err == nil {
+				t.Fatalf("the sync recreated main at %s", out)
+			}
+		})
 	}
 }
 

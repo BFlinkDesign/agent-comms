@@ -1286,3 +1286,34 @@ func TestWhereLeavesARefiledRecordOutOfTheLatestActivity(t *testing.T) {
 		t.Fatalf("where reports last %q (out of order: %v, %d records), want current work, in order, 2 records", e.LastNote, e.TimestampsOutOfOrder, e.Records)
 	}
 }
+
+// A salts note holds a handful of salts. One written full of them, by a tool gone
+// wrong say, must not hold up every sync: re-filing considers the salts noted
+// first, a few dozen at most, and the sync publishes within its time.
+func TestASaltsNoteFullOfSaltsDoesNotHoldUpSyncs(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for i := 0; i < 100000; i++ {
+		fmt.Fprintf(&b, "%q\n", fmt.Sprint(i))
+	}
+	if err := os.WriteFile(saltsNote(dir), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(gitsync.ReadSalts(saltsNote(dir))); got != 100000 {
+		t.Fatalf("the salts note reads as %d salts; the test needs all 100000 read", got)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "with a full salts note"); err != nil {
+		t.Fatal(err)
+	}
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir, "--timeout", "20s"); err != nil {
+		t.Fatalf("sync with %d bytes of salts noted: %v", b.Len(), err)
+	}
+	if _, ok := remoteHostRecords(t, remote, "s", "with a full salts note"); !ok {
+		t.Fatal("the record written with a full salts note was not published")
+	}
+}

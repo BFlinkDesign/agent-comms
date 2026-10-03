@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -46,19 +45,32 @@ const refiledName = "refiled.json"
 // movedCopy matches a moved file's name: a journal file's, then when it moved.
 var movedCopy = regexp.MustCompile(`^(host-[a-z0-9_-]{1,59})\.jsonl\.[0-9]+$`)
 
+// maxSalts bounds the salts one pass derives an identity from: each costs a
+// derivation, which on macOS starts a process, and a look at git's copy of a
+// file. The notes hold a handful; one written full of salts must not hold up
+// every sync. The salts noted first are the ones kept.
+const maxSalts = 64
+
 // otherIdentities lists this machine under each salt it may have recorded with
 // besides the fleet's: none, FLEET_SALT, every salt noted in the clone's git
 // directory as one the journal no longer uses, and every salt noted beside the
 // journal directory as one a record was written under before it had fleetd.json.
 func otherIdentities(dir, gitDir string, me hostOut) []hostOut {
 	var out []hostOut
+	seen, ids := map[string]bool{}, map[string]bool{me.ID: true}
 	salts := append([]string{"", os.Getenv("FLEET_SALT")}, gitsync.PastSalts(gitDir)...)
 	for _, salt := range append(salts, notedSalts(dir)...) {
-		h := identity(salt)
-		if h.ID == me.ID || slices.ContainsFunc(out, func(o hostOut) bool { return o.ID == h.ID }) {
+		if seen[salt] {
 			continue
 		}
-		out = append(out, h)
+		if len(seen) == maxSalts {
+			break
+		}
+		seen[salt] = true
+		if h := identity(salt); !ids[h.ID] {
+			ids[h.ID] = true
+			out = append(out, h)
+		}
 	}
 	return out
 }
