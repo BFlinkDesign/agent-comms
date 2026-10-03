@@ -122,17 +122,21 @@ directory that is already a clone of another repository is refused too. A
 `fleetd.json` already in the journal directory with another salt is replaced by the
 journal's, and init's own sync files the records written under its salt under the
 journal's, and so is one git converted on checkout, as a `.gitattributes` can have
-it do, so that fleetd cannot read the journal's salt from it. A plain clone of the
-repository made while it was still empty, and not fetched since, has nothing to
-follow: init refuses it and says to delete its `.git` directory, which holds no
-commit, after which init sets the directory up as a new one, keeping its files. A
-clone whose HEAD follows no branch, detached, on an orphan, on a branch made by
-hand, or with no commit while it holds origin's branches, is told how to get to the
-journal's branch, by init and sync alike. That branch is origin's default, else
-origin's only branch: `git -C "<dir>" switch main` to a branch there that follows
-it, else `branch --set-upstream-to` or `switch --track` to it, never another of
-origin's branches; a branch name a shell would not take as it stands is printed
-as `<branch>`. When two machines start the same empty repository at once, the one
+it do, so that fleetd cannot read the journal's salt from it. A clone a person
+moved off the journal's branch, detached, on an orphan branch or one made by hand,
+on a branch that follows something else, or with no commit yet, as a plain clone of
+the repository made while it was empty has, is put back on it by init: the
+remote's default branch, else its only branch. Only refs and git's index change,
+never a file, so this machine's records stay as they are, which git's own ways
+back (`git switch`, `git checkout`) refuse to promise; a branch with commits of its
+own is not moved, and init's sync then reports them. Sync tells any such clone to
+run `fleetd init --dir "<dir>" <journal URL>`. A branch that follows one of
+origin's the clone no longer has, deleted or renamed on the remote, is left for a
+person, and named as such. When the repository has no branch yet, a clone with no
+commit and no branch is told to delete its `.git` directory, which holds no
+commit, after which init sets the directory up as a new one, keeping its files;
+one with commits of its own, to move its `.git` directory out of the journal
+directory. When two machines start the same empty repository at once, the one
 whose push loses takes the other's commit and salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal

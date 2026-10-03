@@ -283,11 +283,17 @@ an `about` line), on the branch it names as its default, else `main`; a reposito
 that already holds records without one needs the salt its machines use (`--salt` or
 `$FLEET_SALT`), or a new one if they ran without a salt (their earlier records keep
 the ids they had). When the repository's default branch does not exist, the journal is
-on its only branch; with several, init is refused. A plain clone of the repository
-made while it was empty, which has no commit, no branch and none of origin's, is
-refused with the advice to delete its `.git` directory and run init again; one that
-has fetched origin's branches since is told how to get to the journal's branch, as
-below. A `fleetd.json`
+on its only branch; with several, init is refused. A clone a person moved off the
+journal's branch (detached, an orphan branch or one made by hand, a branch that
+follows something else, or no commit yet, as a plain clone made while the
+repository was empty has) is put back on it: the remote's default branch, else its
+only branch. Only refs and the index change, never a file; the journal's branch
+here starts at origin's tip and moves only forward to it, so one with commits of
+its own stays, and init's sync reports them. A branch that follows one of origin's
+the clone no longer has is left for a person. When the repository has no branch
+yet, a clone with no commit and no branch is told to delete its `.git` directory
+and run init again, and one with commits of its own to move its `.git` directory
+out. A `fleetd.json`
 in the journal directory with another salt is replaced by the journal's, and so is
 one no command would read (over 64 KiB, say), whose salt is not noted, or one git
 converted on checkout, as a `.gitattributes` can have it do, so that fleetd cannot
@@ -309,18 +315,13 @@ remote declines (a hook, branch protection, a ruleset). Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository, with an upstream branch. A clone whose HEAD follows none,
-detached, an orphan, or on a branch made by hand, is told how to get back to the
-journal's branch, with a command that works when followed. That branch is
-origin's default, else origin's only branch: switch to a branch there that follows
-it (`git -C "<dir>" switch main`), else make the current branch follow it (`git -C
-"<dir>" branch --set-upstream-to=origin/main`) or switch to it (`git -C "<dir>"
-switch --track origin/main`); with neither known, the only branch there that
-follows one of origin's. Pushing the current branch would start the journal on a
-second one, so that is advised only to a clone that holds none of origin's
-branches, after `git fetch origin`. A branch name a shell would not take as it
-stands is printed as `<branch>`. A branch that follows one
-the clone no longer has, deleted or renamed on the remote, is named as such. It notes each outcome in the clone's
+journal repository, on a branch with a commit that follows one of origin's. Any
+other clone (detached, an orphan branch or one made by hand, a branch that follows
+something else, or no commit yet) is told to run
+`fleetd init --dir "<dir>" <journal URL>`, which puts it back on the journal's branch without touching a file,
+as above: `git switch` refuses, or overwrites this machine's records, when they are
+in the work tree and the branch's files lack them. A branch that follows one the
+clone no longer has, deleted or renamed on the remote, is named as such. It notes each outcome in the clone's
 `.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never rewrites that file. A push rejected

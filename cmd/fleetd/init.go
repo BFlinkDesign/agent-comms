@@ -86,7 +86,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	if *asJSON {
 		out := map[string]any{
 			"dir": journalDir, "url": url, "branch": res.Branch, "head": res.Head, "started": res.Started,
-			"wrote_fleet_file": res.WroteFleetFile, "cloned": res.Cloned, "restored": res.Restored, "published": published,
+			"wrote_fleet_file": res.WroteFleetFile, "cloned": res.Cloned, "reattached": res.Reattached, "restored": res.Restored,
+			"published": published,
 		}
 		if syncErr != nil {
 			out["sync_error"] = syncErr.Error()
@@ -106,9 +107,12 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	case res.WroteFleetFile:
 		fmt.Fprintf(stdout, "added %s to %s, with the salt this machine was given\n", gitsync.FleetFile, url)
 	}
-	if res.Cloned {
+	switch {
+	case res.Cloned:
 		fmt.Fprintf(stdout, "the journal is set up at %s, following %s\n", journalDir, res.Branch)
-	} else {
+	case res.Reattached:
+		fmt.Fprintf(stdout, "the journal at %s is back on its branch, %s, with its files as they were\n", journalDir, res.Branch)
+	default:
 		fmt.Fprintf(stdout, "the journal at %s was already set up, following %s\n", journalDir, res.Branch)
 	}
 	if failed != nil {

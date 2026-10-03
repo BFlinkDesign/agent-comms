@@ -1228,9 +1228,10 @@ func TestAnInitWhoseIndexUpdateFailsLeavesTheJournalsSaltInPlace(t *testing.T) {
 
 // A clone on a branch with no commit yet, made with `git checkout --orphan`, was
 // not cloned from the empty repository: its other branches may hold commits of
-// their own. init refuses it, as any clone without an upstream, and moves none of
-// its branches.
-func TestInitRefusesACloneOnAnOrphanBranch(t *testing.T) {
+// their own. init puts it back on the journal's branch and moves none of them:
+// main here holds a commit the remote lacks, so it stays where it is, and init's
+// sync says so, with the way to drop the commit that keeps this machine's records.
+func TestInitPutsACloneOnAnOrphanBranchBackWithoutMovingItsBranches(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1247,15 +1248,15 @@ func TestInitRefusesACloneOnAnOrphanBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitIn(t, dir, "checkout", "--quiet", "--orphan", "scratch")
-	// Its git directory holds commits: init must not advise deleting it, nor
-	// pushing a branch that has no commit; main is the branch to go back to.
 	_, _, err = exec(t, "init", "--dir", dir, remote)
-	if !errors.Is(err, gitsync.ErrNoUpstream) || strings.Contains(err.Error(), "delete its .git") ||
-		strings.Contains(err.Error(), "push -u") || !strings.Contains(err.Error(), "switch main`") {
-		t.Fatalf("init on a clone on an orphan branch: %v, want ErrNoUpstream saying to switch to main", err)
+	if !errors.Is(err, gitsync.ErrLocalCommits) || !strings.Contains(err.Error(), "reset --soft") {
+		t.Fatalf("init on a clone on an orphan branch, main with a commit of its own: %v, want ErrLocalCommits", err)
 	}
 	if now, err := osexec.Command("git", "-C", dir, "rev-parse", "main").Output(); err != nil || string(now) != string(mine) {
 		t.Fatalf("init moved main from %s to %s (%v)", mine, now, err)
+	}
+	if head, err := osexec.Command("git", "-C", dir, "symbolic-ref", "HEAD").Output(); err != nil || string(head) != "refs/heads/main\n" {
+		t.Fatalf("after init HEAD is %q (%v), want main", head, err)
 	}
 }
 
@@ -1435,10 +1436,10 @@ func TestInitOnACloneWhoseFleetFileIsADirectorySaysSo(t *testing.T) {
 	}
 }
 
-// A clone whose HEAD was detached, by checking out a commit say, is told to check
-// the journal's branch out again, rather than to push a branch it is not on; and
-// once it has, init sets it up.
-func TestInitOnADetachedCloneSaysToCheckOutItsBranch(t *testing.T) {
+// A clone whose HEAD was detached, by checking out a commit say, is told by sync to
+// run init, rather than to push a branch it is not on; and init puts it back on
+// the journal's branch.
+func TestInitPutsADetachedCloneBackOnItsBranch(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
 		t.Fatal(err)
@@ -1446,14 +1447,16 @@ func TestInitOnADetachedCloneSaysToCheckOutItsBranch(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "journal")
 	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
 	gitIn(t, dir, "checkout", "--quiet", "--detach")
-	for _, cmd := range [][]string{{"init", "--dir", dir, remote}, {"sync", "--dir", dir}} {
-		if _, _, err := exec(t, cmd...); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "switch main`") {
-			t.Fatalf("%s on a clone with a detached HEAD: %v; want ErrNoUpstream saying to switch to main", cmd[0], err)
-		}
+	want := "`fleetd init --dir \"" + dir + "\" <journal URL>`"
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("sync on a clone with a detached HEAD: %v; want ErrNoUpstream saying %s", err, want)
 	}
-	gitIn(t, dir, "switch", "--quiet", "main")
-	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
-		t.Fatalf("init once main was checked out: %v", err)
+	stdout, _, err := exec(t, "init", "--dir", dir, remote)
+	if err != nil || !strings.Contains(stdout, "is back on its branch, main, with its files as they were") {
+		t.Fatalf("init on a clone with a detached HEAD: %v\n%s", err, stdout)
+	}
+	if head, err := osexec.Command("git", "-C", dir, "symbolic-ref", "HEAD").Output(); err != nil || string(head) != "refs/heads/main\n" {
+		t.Fatalf("after init HEAD is %q (%v), want main", head, err)
 	}
 }
 
@@ -1635,8 +1638,8 @@ func TestInitOnANewDirectoryReplacesAFleetFileTooLargeToRead(t *testing.T) {
 
 // A clone with no commit on HEAD and no branch of its own can still hold
 // origin's branches, the commits they name, and fleetd's own notes in its git
-// directory: init does not tell anyone to delete that. It says to switch to the
-// journal's branch, which works.
+// directory: init does not tell anyone to delete that. It puts the clone on the
+// journal's branch, and the notes stay.
 func TestInitOnAnUnbornCloneWithOriginsBranchesKeepsItsGitDirectory(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "first"), "--salt", "s", remote); err != nil {
@@ -1646,16 +1649,19 @@ func TestInitOnAnUnbornCloneWithOriginsBranchesKeepsItsGitDirectory(t *testing.T
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
 		t.Fatal(err)
 	}
+	if err := gitsync.NotePastSalt(filepath.Join(dir, ".git"), "before"); err != nil {
+		t.Fatal(err)
+	}
 	gitIn(t, dir, "checkout", "--quiet", "--orphan", "scratch")
 	gitIn(t, dir, "branch", "--quiet", "-D", "main")
-	_, _, err := exec(t, "init", "--dir", dir, remote)
-	want := "`git -C \"" + dir + "\" switch --track origin/main`"
-	if !errors.Is(err, gitsync.ErrNoUpstream) || strings.Contains(err.Error(), "delete its .git") || !strings.Contains(err.Error(), want) {
-		t.Fatalf("init on an unborn clone with origin's branches: %v; want ErrNoUpstream saying %s", err, want)
-	}
-	gitIn(t, dir, "switch", "--quiet", "--track", "origin/main")
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
-		t.Fatalf("init once the advice was followed: %v", err)
+		t.Fatalf("init on an unborn clone with origin's branches: %v", err)
+	}
+	if up, err := osexec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "@{upstream}").Output(); err != nil || string(up) != "origin/main\n" {
+		t.Fatalf("after init the clone follows %q (%v), want origin/main", up, err)
+	}
+	if past := gitsync.PastSalts(filepath.Join(dir, ".git")); !slices.Contains(past, "before") {
+		t.Fatalf("after init the clone's notes are %q, want the one it held", past)
 	}
 }
 
@@ -1695,8 +1701,8 @@ func TestInitReadsBackAFleetFileGitConvertedOnCheckout(t *testing.T) {
 
 // A plain clone of the journal repository made while it was still empty, which
 // has fetched since another machine started the journal, has a branch with no
-// commit that follows origin's. init tells it how to get to the journal's branch,
-// rather than failing on the commit it does not have; and then sets it up.
+// commit that follows origin's. Rather than failing on the commit it does not
+// have, init puts the clone on the journal's branch.
 func TestInitOnAPlainCloneOfTheEmptyJournalThatHasSinceFetched(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	dir := filepath.Join(t.TempDir(), "journal")
@@ -1705,16 +1711,50 @@ func TestInitOnAPlainCloneOfTheEmptyJournalThatHasSinceFetched(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitIn(t, dir, "fetch", "--quiet")
-	_, _, err := exec(t, "init", "--dir", dir, remote)
-	want := "`git -C \"" + dir + "\" switch --track origin/main`"
-	if !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), want) {
-		t.Fatalf("init on a plain clone of the empty journal that has fetched since: %v; want ErrNoUpstream saying %s", err, want)
-	}
-	gitIn(t, dir, "switch", "--quiet", "--track", "origin/main")
 	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
-		t.Fatalf("init once the advice was followed: %v", err)
+		t.Fatalf("init on a plain clone of the empty journal that has fetched since: %v", err)
 	}
 	if fleet, ok, err := gitsync.ReadFleet(dir); err != nil || !ok || fleet.Salt != "s" {
 		t.Fatalf("after init fleetd.json is %+v (%v, %v), want the journal's", fleet, ok, err)
+	}
+}
+
+// A person who checks out an older commit in the journal has git rewrite this
+// machine's file to that commit's copy, and a hook's record then follows it there.
+// git's own way back, `git switch main`, refuses then, and stashing to get past
+// that leaves the file in conflict. The sync says to run init; init puts the clone
+// back without touching the file, and says to reclaim; init --reclaim publishes
+// every record this machine wrote.
+func TestAnOlderCommitCheckedOutByHandEndsWithEveryRecordPublished(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range []string{"first of this machine", "second of this machine"} {
+		if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", note); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitIn(t, dir, "checkout", "--quiet", "HEAD~1")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "made while detached"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrNoUpstream) || !strings.Contains(err.Error(), "fleetd init --dir") {
+		t.Fatalf("sync on a clone detached at an older commit: %v; want ErrNoUpstream saying to run init", err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); !errors.Is(err, gitsync.ErrSameFile) || !strings.Contains(err.Error(), "--reclaim") {
+		t.Fatalf("init on a clone detached at an older commit: %v; want ErrSameFile saying to reclaim", err)
+	}
+	if _, _, err := exec(t, "init", "--reclaim", "--dir", dir, remote); err != nil {
+		t.Fatalf("init --reclaim: %v", err)
+	}
+	for _, note := range []string{"first of this machine", "second of this machine", "made while detached"} {
+		if n, ok := remoteHostRecords(t, remote, "s", note); !ok || n != 3 {
+			t.Fatalf("the remote holds %d records for this machine, and %q is among them: %v", n, note, ok)
+		}
 	}
 }
