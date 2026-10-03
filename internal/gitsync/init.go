@@ -290,7 +290,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 		return res, err
 	}
 	defer unlock()
-	if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "--prune", "origin")...); err != nil {
+	if err := fetchOrigin(g); err != nil {
 		return res, err
 	}
 	if res.Branch, res.Reattached, err = onBranch(g, gitDir, url); err != nil {
@@ -350,14 +350,14 @@ func onBranch(g git, gitDir, url string) (branch string, reattached bool, err er
 			return "", false, err
 		}
 		if theirs != "" {
-			return "", false, goneError(head, theirs)
+			return "", false, goneError(g, head, theirs)
 		}
 	}
 	if branch, err = journalBranch(g, url); err != nil {
 		return "", false, err
 	}
 	if _, err := g.line("rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch); err != nil {
-		// A branch made after init's fetch, or one a narrowed refspec leaves out.
+		// A branch made after init's fetch.
 		if _, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "origin",
 			"+refs/heads/"+branch+":refs/remotes/origin/"+branch)...); err != nil {
 			return "", false, err
@@ -404,9 +404,10 @@ func onBranch(g git, gitDir, url string) (branch string, reattached bool, err er
 		}
 	}
 	// A clone made with --single-branch fetches its own branch alone: git takes
-	// origin's branch for the upstream only once the clone's fetch covers it.
+	// origin's branch for the upstream only once the clone's refspec covers it, so
+	// the refspec is widened to every branch of origin's, as a clone's is.
 	if _, err := g.line("rev-parse", "--symbolic-full-name", branch+"@{upstream}"); err != nil {
-		if _, err := g.line("remote", "set-branches", "--add", "origin", branch); err != nil {
+		if _, err := g.line("remote", "set-branches", "origin", "*"); err != nil {
 			return "", false, err
 		}
 	}
@@ -464,9 +465,9 @@ func leftAsItIs(g git, gitDir, head, branch string) error {
 // journalBranch names the journal's branch for a clone that does not follow it:
 // a branch this clone has followed, of the same name on origin, if origin still
 // has it, since a remote's default can change while its machines go on publishing
-// to the branch they follow; with several such branches, or none, the remote's
-// default, as init's own clone would follow; else origin's only branch. With
-// several and no default on origin the journal could be on any. A repository with
+// to the branch they follow; else the remote's default, as init's own clone would
+// follow; else origin's only branch. With several such branches, none of them the
+// default, the journal could be on any, and a person says which. A repository with
 // no branch at all has no journal to follow yet: a clone with no commit and no
 // ref, such as a plain clone made while the repository was empty, holds nothing
 // in its git directory, and without it init sets the directory up as a new one,
@@ -507,11 +508,16 @@ func journalBranch(g git, url string) (string, error) {
 		return def, nil
 	case len(followed) == 1:
 		return followed[0], nil
-	case len(followed) > 1 && heads[def]:
-		return def, nil
 	case len(followed) > 1:
-		return "", fmt.Errorf("%w: this clone follows %s on %s, none of them its default; make the branch that holds "+
-			"the journal its default, then run fleetd init again", ErrNoDefaultBranch, strings.Join(followed, ", "), url)
+		// The fleet may publish to any of them, the remote's default having moved
+		// since, so none is taken for the journal's.
+		why, named := ErrNoDefaultBranch, "names no default branch that exists"
+		if heads[def] {
+			why, named = ErrNoUpstream, "has "+def+" for its default"
+		}
+		return "", fmt.Errorf("%w: this clone follows %s on %s, which %s, so the journal could be on any of them: for "+
+			"each one it is not on, `git -C \"%s\" branch --unset-upstream <branch>`, then run fleetd init again, "+
+			"which takes the one left, or with none left the default", why, strings.Join(followed, ", "), url, named, g.dir)
 	}
 	if heads[def] {
 		return def, nil
@@ -770,7 +776,10 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 		if err != nil {
 			return err
 		}
-		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "origin", commit+":refs/heads/"+res.Branch)...)
+		// Onto the tip looked at, or, starting the journal, onto no branch at all:
+		// a branch renamed or deleted meanwhile refuses it, as a race lost.
+		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "--force-with-lease=refs/heads/"+res.Branch+":"+tip,
+			"origin", commit+":refs/heads/"+res.Branch)...)
 		switch {
 		case err == nil:
 			res.WroteFleetFile, res.Started = true, tip == ""
@@ -786,7 +795,7 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 		}
 		// Either way the remote has a tip to look at again: this machine's
 		// commit, or the one that beat it.
-		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", "--prune", "origin")...); err != nil {
+		if err := fetchOrigin(g); err != nil {
 			return err
 		}
 	}
@@ -807,9 +816,10 @@ func oneBranch(g git, branch string) error {
 	}
 	if len(others) > 0 {
 		return fmt.Errorf("gitsync: the journal was started on two branches at once, %s and %s. Keep the repository's "+
-			"default branch: on any machine whose journal follows the other one, delete the journal's .git directory, "+
-			"or its next sync stops once that branch is gone (its records stay); then delete the other branch, and run "+
-			"fleetd init again on those machines and on this one", branch, strings.Join(others, ", "))
+			"default branch: on any machine whose journal follows the other one, delete the journal's .git directory (its "+
+			"records stay; left in place, its syncs stop once that branch is gone, until `git branch --unset-upstream` "+
+			"is run there); then delete the other branch, and run fleetd init again on those machines and on this one",
+			branch, strings.Join(others, ", "))
 	}
 	return nil
 }

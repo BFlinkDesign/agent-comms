@@ -287,9 +287,11 @@ on its only branch; with several, init is refused. A clone a person moved off th
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
 while the repository was empty has) is put back on it: the branch it follows, of
-the same name on origin, if origin still has it; with several such branches, or
-none, the remote's default, the branch its HEAD names; else its only branch. A
-`--single-branch` clone fetches that branch from then on. Only refs and the index
+the same name on origin, if origin still has it; else the remote's default, the
+branch its HEAD names; else its only branch. Following several of origin's
+branches, none of them the default, a clone is left as it is, and init says to
+unset the upstream of each the journal is not on. A `--single-branch` clone put
+on another branch is set to fetch every branch of origin's. Only refs and the index
 change, never a file, and HEAD last; the journal's branch here starts at origin's
 tip and moves only forward to it, so one with commits of its own stays, and
 init's sync reports them. The repair is refused, with nothing moved, in a
@@ -303,7 +305,8 @@ only the start of the remote's copy up to date; a rewritten one stays changed
 until `git checkout -- <file>`, and a removed one stays, untracked, its records
 listed by `fleetd where` as not published, until deleted by hand. A branch that
 follows one of origin's the clone no longer has, as after init's pruning fetch,
-is left for a person, with nothing pushed. When the repository has no branch
+is left for a person, with nothing pushed; init's pushes, like sync's, go onto
+the tip it fetched and nowhere else. When the repository has no branch
 yet, a clone with no commit and no ref of any kind is told to delete its `.git`
 directory and run init again, and one with commits of its own to move its
 `.git` directory, and every file there but journal files and `fleetd.json`,
@@ -337,17 +340,21 @@ a branch of the clone or another remote's, or no commit yet) is told to run
 `fleetd init --dir "<dir>" <journal URL>`, which puts it back on the journal's branch without touching a file,
 or says what stops it, as above: `git switch` refuses, or overwrites this
 machine's records, when they are in the work tree and the branch's files lack
-them. Its fetch prunes, so a branch the remote deleted or renamed goes from the
-clone too: a sync on a branch that followed it stops, pushing nothing, which
-would bring the branch back, and says what a person does: have the branch follow
-the new name (`git branch --set-upstream-to`), or push one deleted by mistake
-back from the machine that synced last. It notes each outcome in the clone's
-`.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
-`<host-id>.jsonl`, up to its last complete line, in a commit built directly on
-the remote tip. It never rebases and never rewrites that file. A push rejected
-because another machine pushed first is retried, up to three attempts; a push
-the remote declines (a hook, branch protection, a ruleset) fails at once,
-saying it was refused. It then
+them. Its fetch takes every branch of origin's, whatever the clone's refspec,
+leaves the clone's tags alone, and prunes, so a branch the remote deleted or
+renamed goes from the clone too: a sync on a branch that followed it fetches once
+more, in case it was pushed back, then stops, pushing nothing, which would bring
+the branch back, and says what a person does: after a rename, or a deletion on
+purpose, `git branch --unset-upstream`, then init; push one deleted by mistake
+back from the machine that synced last (`git push origin HEAD`). Its push goes
+onto the tip it fetched and nowhere else (`--force-with-lease` naming that tip),
+so a branch renamed or deleted in between refuses it, as a race lost. It notes
+each outcome in the clone's `.git/fleetd-sync.json`, which `fleetd where`
+reports. It publishes only this host's `<host-id>.jsonl`, up to its last
+complete line, in a commit built directly on the remote tip. It never rebases
+and never rewrites that file. A push rejected because another machine pushed
+first is retried, up to three attempts; a push the remote declines (a hook,
+branch protection, a ruleset) fails at once, saying it was refused. It then
 brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
 (`kept` in `--json`). Anything staged with `git add` and not committed is the

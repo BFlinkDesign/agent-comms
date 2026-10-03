@@ -297,6 +297,17 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	// somewhere the fleet never looks. Full names, so that a branch here named
 	// origin/main never passes for origin's.
 	upstream, err := g.line("rev-parse", "--symbolic-full-name", "@{u}")
+	if err != nil && ctx.Err() == nil {
+		// A branch of origin's that an earlier sync found gone may be back, pushed
+		// again after a mistaken deletion, and only a fetch brings it back here.
+		again, ferr := refetchGone(g)
+		if ferr != nil {
+			return res, ferr
+		}
+		if again {
+			upstream, err = g.line("rev-parse", "--symbolic-full-name", "@{u}")
+		}
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return res, err
@@ -329,9 +340,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	ssh := batchSSH(g)
 	var tip string
 	for res.Attempts = 1; ; res.Attempts++ {
-		// Pruned, so that a branch the remote deleted or renamed is gone here too,
-		// and never recreated by this machine's push.
-		if _, err := g.line(append(ssh, "fetch", "--quiet", "--no-tags", "--prune", remote)...); err != nil {
+		if err := fetchOrigin(g); err != nil {
 			return res, err
 		}
 		remoteTip, err := g.line("rev-parse", "--verify", "refs/remotes/"+upstream)
@@ -339,7 +348,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			if ctx.Err() != nil {
 				return res, err
 			}
-			return res, goneError(localRef, branch)
+			return res, goneError(g, localRef, branch)
 		}
 		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
 			if ctx.Err() != nil {
@@ -357,7 +366,10 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			tip = remoteTip
 			break
 		}
-		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", remote, commit+":refs/heads/"+branch)...)
+		// Onto the tip this sync fetched and nothing else: a branch the remote has
+		// renamed or deleted since, or moved on, refuses it, as a race lost.
+		out, err := g.line(append(ssh, "push", "--porcelain", "--no-verify", "--force-with-lease=refs/heads/"+branch+":"+remoteTip,
+			remote, commit+":refs/heads/"+branch)...)
 		if err == nil {
 			tip, res.Published = commit, published
 			break
@@ -741,7 +753,7 @@ func noUpstream(g git) error {
 			return err
 		}
 		if theirs != "" {
-			return goneError(head, theirs)
+			return goneError(g, head, theirs)
 		}
 	}
 	return fmt.Errorf("%w: `fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, "+
@@ -768,12 +780,43 @@ func goneUpstream(g git, head string) (string, error) {
 
 // goneError says what to do about a branch that follows one of origin's the
 // clone no longer has. Branch names come from the remote, so none is put into a
-// command a person might paste.
-func goneError(head, theirs string) error {
+// command a person might paste. The way past a rename, or a deletion on purpose,
+// works in a clone made with --single-branch too, where git refuses to have a
+// branch follow one of origin's that the clone's own refspec leaves out.
+func goneError(g git, head, theirs string) error {
 	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
-		"it; if it was renamed, have this branch follow the new name (git branch --set-upstream-to), and if it was "+
-		"deleted by mistake, push it back from the machine that synced last (git push)",
-		ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs)
+		"it. If it was renamed, or deleted on purpose, `git -C \"%s\" branch --unset-upstream` and then `fleetd init "+
+		"--dir \"%s\" <journal URL>` put the clone on the journal's branch; if it was deleted by mistake, push it back "+
+		"from the machine that synced last, in its journal directory with `git push origin HEAD`, and every machine's "+
+		"next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"), theirs, g.dir, g.dir)
+}
+
+// refetchGone fetches when HEAD's branch follows one of origin's that this clone
+// no longer has, and reports whether it did: a branch pruned once is never
+// looked at again otherwise, even after a person pushes it back.
+func refetchGone(g git) (bool, error) {
+	head, err := g.line("symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return false, g.ctx.Err()
+	}
+	theirs, err := goneUpstream(g, head)
+	if err != nil || theirs == "" {
+		return false, err
+	}
+	return true, fetchOrigin(g)
+}
+
+// fetchOrigin brings in every branch of origin's, as a remote-tracking branch of
+// the same name, whatever the clone's own refspec says: one made with
+// --single-branch names one branch, and a fetch of it fails outright once the
+// remote has deleted or renamed that branch. It prunes, so that a branch the
+// remote deleted or renamed goes from the clone too, never to be pushed back; and
+// since it names its refspec, git leaves the clone's tags alone even where a
+// person's configuration says fetch.pruneTags.
+func fetchOrigin(g git) error {
+	_, err := g.line(append(batchSSH(g), "fetch", "--quiet", "--no-tags", "--prune", "origin",
+		"+refs/heads/*:refs/remotes/origin/*")...)
+	return err
 }
 
 func mapKeys(m map[string]bool) []string {

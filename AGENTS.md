@@ -128,13 +128,17 @@ follows nothing, a branch of the clone or another remote's, or with no commit
 yet, as a plain clone of the repository made while it was empty has, is put back
 on it by init. The journal's branch is the one this clone follows, of the same
 name on origin, if origin still has it, since a remote's default can change while
-its machines go on publishing where they did; with several such branches, or
-none, the remote's default, the branch its HEAD names; else its only branch. A
-clone made with `--single-branch` fetches the branch it is put back on from then
-on. Only refs and git's index change, never a file, so this machine's records
-stay as they are, which git's own ways back (`git switch`, `git checkout`) refuse
-to promise; HEAD moves last, so init run again finishes a repair cut short. A
-branch with commits of its own is not moved, and init's sync then reports them.
+its machines go on publishing where they did; else the remote's default, the
+branch its HEAD names; else its only branch. A clone that follows several of
+origin's branches, none of them the default, could be meant for any: init moves
+nothing, and says to unset the upstream of each the journal is not on (`git -C
+"<dir>" branch --unset-upstream <branch>`), then run it again. A clone made with
+`--single-branch` is set to fetch every branch of origin's, as a clone does, when
+it is put back on another. Only refs and git's index change, never a file, so
+this machine's records stay as they are, which git's own ways back (`git
+switch`, `git checkout`) refuse to promise; HEAD moves last, so init run again
+finishes a repair cut short. A branch with commits of its own is not moved, and
+init's sync then reports them.
 The repair is refused, with nothing moved, in a repository that is not a journal,
 in the middle of a rebase, merge, cherry-pick, revert or bisect, with a commit
 only HEAD holds, or with the journal's branch checked out in another worktree;
@@ -151,12 +155,18 @@ untracked, and `fleetd where` lists its records as not published until it is
 deleted by hand. Sync syncs only a branch that follows one of origin's, and tells
 any other clone to run `fleetd init --dir "<dir>" <journal URL>`; one that follows
 another of origin's branches, as `git switch stray` makes, syncs with that
-branch, as before. Sync's and init's fetches prune, so a branch the remote
-deleted or renamed goes from the clone too: a sync or init on a branch that
-followed it stops and says so, pushing nothing, since a push would bring the
-branch back and split the journal. A person then has the branch follow the new
-name (`git branch --set-upstream-to`), or pushes a branch deleted by mistake back
-from the machine that synced last. When the repository has no branch yet, a
+branch, as before. Sync's and init's fetches take every branch of origin's,
+whatever the clone's own refspec, and leave its tags alone. They prune, so a
+branch the remote deleted or renamed goes from the clone too, a `--single-branch`
+clone included: a sync or init on a branch that followed it stops and says so,
+pushing nothing, since a push would bring the branch back and split the journal.
+Their pushes go onto the tip they fetched and nowhere else, so a branch renamed
+or deleted in between refuses them, as a race lost. After a rename, or a deletion
+on purpose, `git branch --unset-upstream` and then fleetd init put the clone on
+the journal's branch; a branch deleted by mistake is pushed back from the machine
+that synced last (`git push origin HEAD` in its journal directory), and every
+machine's next sync takes it up again, since a sync whose branch is gone fetches
+once more before it says so. When the repository has no branch yet, a
 clone with no commit and no ref of any kind (a branch, a tag, a stash) is told to
 delete its `.git` directory, which holds nothing, after which init sets the
 directory up as a new one, keeping its files; one with commits of its own, to
@@ -166,9 +176,11 @@ empty repository at once, the one whose push loses takes the other's commit and
 salt. Two machines whose git
 disagrees on an empty repository's default branch can start it on two branches;
 the second is told to keep the repository's default. A machine whose journal
-follows the other branch must have its journal's `.git` directory deleted before
-that branch is, or its next sync stops once the branch is gone; init run there
-again keeps its records. Running init again finishes
+follows the other branch has its journal's `.git` directory deleted before that
+branch is, and init run there again keeps its records; left in place, the
+directory's syncs stop once the branch is gone, until `git branch
+--unset-upstream` and init are run there, which keep its records too. Running
+init again finishes
 what an interrupted run began; one killed outright leaves the sync lock behind,
 which init and every sync wait out for ten minutes. When this machine's journal
 directory was set up again, or restored from an older copy, its file no longer

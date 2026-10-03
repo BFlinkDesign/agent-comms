@@ -623,27 +623,52 @@ func TestAnOlderCommitCheckedOutIsPutBackAndLeftForReclaim(t *testing.T) {
 	}
 }
 
-// A clone whose branch the remote renamed, or deleted, is told so by sync and by
-// init, and nothing is pushed: a push would recreate the branch the fleet left.
-// Their own fetches prune the clone's copy of the branch, so this holds whether a
-// person pruned it or not, and a tag named like the branch changes nothing.
+// A clone whose branch the remote renamed, or deleted on purpose, is told so by
+// sync and by init, and nothing is pushed: a push would recreate the branch the
+// fleet left. Their own fetches prune the clone's copy of the branch, so this
+// holds whether a person pruned it or not, in a clone made with --single-branch
+// too, and a tag named like the branch changes nothing. The way on the message
+// gives puts the clone on the journal's branch, which the next sync publishes to.
 func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 	requireGit(t)
+	renamed := func(t *testing.T, remote string) {
+		run(t, filepath.Dir(remote), "--git-dir", remote, "branch", "-m", "main", "trunk")
+	}
 	for _, c := range []struct {
-		name  string
-		leave [][]string
+		name   string
+		single bool
+		change func(t *testing.T, remote string)
+		leave  [][]string
 	}{
-		{"renamed on the remote", nil},
-		{"renamed on the remote, and pruned by hand", [][]string{{"fetch", "--quiet", "--prune"}}},
-		{"renamed on the remote, beside a tag named like it", [][]string{{"tag", "main"}}},
+		{"renamed on the remote", false, renamed, nil},
+		{"renamed on the remote, and pruned by hand", false, renamed, [][]string{{"fetch", "--quiet", "--prune"}}},
+		{"renamed on the remote, beside a tag named like it", false, renamed, [][]string{{"tag", "main"}}},
+		{"renamed on the remote, in a clone made with --single-branch", true, renamed, nil},
+		{"deleted on purpose, beside a default of its own", false, func(t *testing.T, remote string) {
+			// Another machine started the journal on trunk at the same time, and the
+			// fleet kept trunk.
+			other := filepath.Join(t.TempDir(), "other")
+			run(t, filepath.Dir(other), "init", "--quiet", "--initial-branch=trunk", other)
+			identify(t, other)
+			write(t, filepath.Join(other, "README.md"), "started at the same time\n")
+			run(t, other, "add", ".")
+			run(t, other, "commit", "--quiet", "-m", "the other start")
+			run(t, other, "push", "--quiet", remote, "trunk")
+			run(t, other, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+			run(t, other, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+		}, nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			remote, m := newFleet(t, 1)
 			a := m[0]
+			if c.single {
+				a = filepath.Join(t.TempDir(), "a")
+				run(t, filepath.Dir(a), "clone", "--quiet", "--single-branch", "--branch", "main", remote, a)
+			}
 			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
 			mustSync(t, options(a, "host-a"))
-			run(t, a, "--git-dir", remote, "branch", "-m", "main", "trunk")
+			c.change(t, remote)
 			for _, args := range c.leave {
 				run(t, a, args...)
 			}
@@ -652,13 +677,102 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 			if _, err := Sync(context.Background(), options(a, "host-a")); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
 				t.Fatalf("sync: %v, want ErrNoUpstream saying the branch is gone", err)
 			}
-			if _, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"}); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
+			_, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), gone) {
 				t.Fatalf("init: %v, want ErrNoUpstream saying the branch is gone", err)
 			}
 			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); heads != "refs/heads/trunk" {
 				t.Fatalf("the remote has %q, want trunk alone", heads)
 			}
+			if want := "`git -C \"" + a + "\" branch --unset-upstream`"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("init: %v, want it to name %s", err, want)
+			}
+			run(t, a, "branch", "--unset-upstream")
+			if res := mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"}); !res.Reattached || res.Branch != "trunk" {
+				t.Fatalf("init = %+v, want the clone put on trunk", res)
+			}
+			mustSync(t, options(a, "host-a"))
+			if got := run(t, a, "--git-dir", remote, "show", "trunk:host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}" {
+				t.Fatalf("trunk holds %q for host-a", got)
+			}
 		})
+	}
+}
+
+// A branch deleted by mistake, and pushed back from the machine that synced
+// last as the message says, is taken up again by every other machine's next
+// sync, though each had pruned its copy of the branch.
+func TestABranchPushedBackAfterAMistakenDeletionIsTakenUpAgain(t *testing.T) {
+	remote, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	mustSync(t, options(b, "host-b"))
+	run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a2"}`)
+	if _, err := Sync(context.Background(), options(a, "host-a")); !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "`git push origin HEAD`") {
+		t.Fatalf("sync: %v, want ErrNoUpstream saying how to push the branch back", err)
+	}
+	run(t, b, "push", "--quiet", "origin", "HEAD")
+	mustSync(t, options(a, "host-a"))
+	if got := remoteFile(t, remote, "host-a.jsonl"); got != "{\"id\":\"hive:a1\"}\n{\"id\":\"hive:a2\"}\n" {
+		t.Fatalf("main holds %q for host-a", got)
+	}
+}
+
+// A branch the remote renames between a sync's fetch and its push is not brought
+// back by the push, nor by init's: each pushes onto the tip it fetched and
+// nothing else, and then says the branch is gone.
+func TestARenameBetweenTheFetchAndThePushRecreatesNothing(t *testing.T) {
+	requireGit(t)
+	for _, by := range []string{"sync", "init"} {
+		t.Run(by, func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 1)
+			a := m[0]
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+			renamed := false
+			rename := func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+				if !renamed && slices.Contains(args, "push") {
+					renamed = true
+					run(t, a, "--git-dir", remote, "branch", "-m", "main", "trunk")
+				}
+				return Git(ctx, dir, stdin, args...)
+			}
+			var err error
+			if by == "sync" {
+				o := options(a, "host-a")
+				o.Run = rename
+				_, err = Sync(context.Background(), o)
+			} else {
+				_, err = Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s", Run: rename})
+			}
+			if !renamed || !errors.Is(err, ErrNoUpstream) {
+				t.Fatalf("%s: %v, want ErrNoUpstream once the branch was renamed", by, err)
+			}
+			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); heads != "refs/heads/trunk" {
+				t.Fatalf("the remote has %q, want trunk alone", heads)
+			}
+		})
+	}
+}
+
+// fleetd's fetches name their refspec, so a person's fetch.pruneTags does not
+// delete the clone's tags, which may be all that holds a commit of theirs.
+func TestAPruningFetchLeavesTheClonesTagsAlone(t *testing.T) {
+	remote, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "fetch.prune", "true")
+	run(t, a, "config", "fetch.pruneTags", "true")
+	run(t, a, "tag", "keep")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:a1"}`)
+	mustSync(t, options(a, "host-a"))
+	if tags := run(t, a, "tag"); tags != "keep" {
+		t.Fatalf("after the sync the clone's tags are %q", tags)
+	}
+	mustInit(t, InitOptions{URL: remote, Dir: a, Salt: "s"})
+	if tags := run(t, a, "tag"); tags != "keep" {
+		t.Fatalf("after init the clone's tags are %q", tags)
 	}
 }
 
@@ -669,16 +783,21 @@ func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 	requireGit(t)
 	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "merge-base", "prepare",
-		"detached symbolic-ref", "by hand for-each-ref"} {
+		"detached symbolic-ref", "by hand for-each-ref", "gone symbolic-ref", "gone for-each-ref",
+		"gone refs/remotes/origin/main", "gone fetch"} {
 		t.Run(at, func(t *testing.T) {
 			t.Parallel()
-			_, m := newFleet(t, 1)
+			remote, m := newFleet(t, 1)
 			appendLines(t, filepath.Join(m[0], "host-a.jsonl"), `{"id":"hive:1"}`)
 			// Off the journal's branch, the time can run out while the sync works out
-			// what to say about it.
+			// what to say about it; with its branch gone, while it looks for it again.
 			switch state, call, _ := strings.Cut(at, " "); state {
 			case "detached":
 				run(t, m[0], "checkout", "--quiet", "--detach")
+				at = call
+			case "gone":
+				run(t, m[0], "--git-dir", remote, "branch", "-m", "main", "trunk")
+				run(t, m[0], "fetch", "--quiet", "--prune")
 				at = call
 			case "by":
 				run(t, m[0], "switch", "--quiet", "-c", "local-only")

@@ -374,7 +374,8 @@ func TestTwoMachinesStartingTwoBranchesAtOnceAreToldSo(t *testing.T) {
 			// This machine's git is not told the default branch (protocol v0).
 			return Git(ctx, dir, stdin, append([]string{"-c", "protocol.version=0"}, args...)...)
 		}})
-	if !raced || err == nil || !strings.Contains(err.Error(), "two branches at once") || !strings.Contains(err.Error(), ".git") {
+	if !raced || err == nil || !strings.Contains(err.Error(), "two branches at once") || !strings.Contains(err.Error(), ".git") ||
+		!strings.Contains(err.Error(), "`git branch --unset-upstream`") {
 		t.Fatalf("raced %v, err = %v; want the second machine told the journal was started on two branches, "+
 			"and what a machine already following the other one must do", raced, err)
 	}
@@ -857,13 +858,18 @@ func TestInitPutsACloneBackOnTheBranchItFollows(t *testing.T) {
 }
 
 // A clone that follows several of origin's branches goes back to the remote's
-// default, one of them or not; with no default on the remote, init moves nothing.
-func TestInitPutsACloneFollowingSeveralBranchesBackOnTheDefault(t *testing.T) {
+// default among them. With none of them the default, the fleet may publish to
+// any, since a remote's default can move: init moves nothing, and says how to
+// leave it one to follow, after which init puts the clone back there.
+func TestInitPutsACloneFollowingSeveralBranchesBackOnTheDefaultAmongThem(t *testing.T) {
 	requireGit(t)
-	for _, c := range []struct{ name, head, want string }{
-		{"trunk the default", "refs/heads/trunk", "trunk"},
-		{"a third branch the default", "refs/heads/journal", "journal"},
-		{"no branch the default", "refs/heads/gone", ""},
+	for _, c := range []struct {
+		name, head, want string
+		why              error
+	}{
+		{"trunk the default", "refs/heads/trunk", "trunk", nil},
+		{"a third branch the default", "refs/heads/journal", "", ErrNoUpstream},
+		{"no branch the default", "refs/heads/gone", "", ErrNoDefaultBranch},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -876,14 +882,18 @@ func TestInitPutsACloneFollowingSeveralBranchesBackOnTheDefault(t *testing.T) {
 			run(t, a, "checkout", "--quiet", "--detach")
 			before := clonedState(t, a)
 			res, err := Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
-			if c.want == "" {
-				if !errors.Is(err, ErrNoDefaultBranch) || !strings.Contains(err.Error(), "main, trunk") {
-					t.Fatalf("init on a clone following two branches, neither the default: %v, want ErrNoDefaultBranch naming both", err)
+			if c.why != nil {
+				advice := "`git -C \"" + a + "\" branch --unset-upstream <branch>`"
+				if !errors.Is(err, c.why) || !strings.Contains(err.Error(), "main, trunk") || !strings.Contains(err.Error(), advice) {
+					t.Fatalf("init on a clone following two branches, neither the default: %v, want %v naming both and saying %s", err, c.why, advice)
 				}
 				if after := clonedState(t, a); after != before {
 					t.Fatalf("init moved things in a clone it refused:\nbefore:\n%s\nafter:\n%s", before, after)
 				}
-				return
+				// The fleet publishes to main.
+				run(t, a, "branch", "--unset-upstream", "trunk")
+				c.want = "main"
+				res, err = Init(context.Background(), InitOptions{URL: remote, Dir: a, Salt: "s"})
 			}
 			if err != nil || !res.Reattached || res.Branch != c.want {
 				t.Fatalf("init = %+v, %v; want the clone put back on %s", res, err, c.want)
@@ -1025,6 +1035,14 @@ func TestInitPutsASingleBranchCloneBackOnABranchItDidNotFetch(t *testing.T) {
 			if got := readFile(t, filepath.Join(a, "host-b.jsonl")); got != "{\"id\":\"hive:b1\"}\n" {
 				t.Fatalf("the work tree holds %q for host-b", got)
 			}
+			// The clone now fetches every branch of origin's, so that main, which it
+			// was made with, can go: the clone's own fetch, and sync, carry on.
+			if refspec := run(t, a, "config", "--get-all", "remote.origin.fetch"); refspec != "+refs/heads/*:refs/remotes/origin/*" {
+				t.Fatalf("the clone fetches %q", refspec)
+			}
+			run(t, b, "push", "--quiet", "origin", ":refs/heads/main")
+			run(t, a, "fetch", "--quiet")
+			mustSync(t, options(a, "host-a"))
 		})
 	}
 }
@@ -1106,15 +1124,27 @@ func TestInitPutsACloneBackOnceItsDetachedCommitIsKept(t *testing.T) {
 
 // A branch the remote deleted while init was setting the journal up on it, once
 // another machine's push had beaten init's, is not started again from nothing,
-// with a salt of its own: init stops, and pushes nothing. The time running out as
-// init looks for the branch again reads as that, not as the branch gone.
+// with a salt of its own: init stops, and pushes nothing, in a clone made with
+// --single-branch too. The time running out as init looks for the branch again
+// reads as that, not as the branch gone.
 func TestInitStopsWhenTheJournalsBranchGoesWhileItSetsItUp(t *testing.T) {
 	requireGit(t)
-	for _, gone := range []bool{true, false} {
-		t.Run(map[bool]string{true: "deleted", false: "the time runs out"}[gone], func(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		gone, single bool
+	}{
+		{"deleted", true, false},
+		{"deleted, in a clone made with --single-branch", true, true},
+		{"the time runs out", false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			remote, m := newFleet(t, 1)
 			a := m[0]
+			if c.single {
+				a = filepath.Join(t.TempDir(), "a")
+				run(t, filepath.Dir(a), "clone", "--quiet", "--single-branch", "--branch", "main", remote, a)
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			pushed, refetched := false, false
@@ -1129,10 +1159,10 @@ func TestInitStopsWhenTheJournalsBranchGoesWhileItSetsItUp(t *testing.T) {
 						run(t, a, append(id, "update-ref", "refs/heads/main", next)...)
 					case pushed && !refetched && slices.Contains(args, "fetch"):
 						refetched = true
-						if gone {
+						if c.gone {
 							run(t, a, "--git-dir", remote, "update-ref", "-d", "refs/heads/main")
 						}
-					case refetched && !gone && slices.Contains(args, "refs/remotes/origin/main"):
+					case refetched && !c.gone && slices.Contains(args, "refs/remotes/origin/main"):
 						cancel()
 					}
 					return Git(ctx, dir, stdin, args...)
@@ -1140,13 +1170,13 @@ func TestInitStopsWhenTheJournalsBranchGoesWhileItSetsItUp(t *testing.T) {
 			if !refetched {
 				t.Fatalf("init did not look again: %v", err)
 			}
-			if gone && (!errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "no longer has main")) {
+			if c.gone && (!errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "no longer has main")) {
 				t.Fatalf("init: %v, want ErrNoUpstream saying the branch went", err)
 			}
-			if !gone && (!errors.Is(err, context.Canceled) || errors.Is(err, ErrNoUpstream)) {
+			if !c.gone && (!errors.Is(err, context.Canceled) || errors.Is(err, ErrNoUpstream)) {
 				t.Fatalf("init: %v, want the cancellation", err)
 			}
-			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); gone && heads != "" {
+			if heads := run(t, a, "--git-dir", remote, "for-each-ref", "--format=%(refname)", "refs/heads/"); c.gone && heads != "" {
 				t.Fatalf("init pushed %q", heads)
 			}
 		})
