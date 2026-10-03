@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -511,5 +512,28 @@ func TestTheCachedSaltIsKeptExactly(t *testing.T) {
 		if got := cachedSalt(dir); got != salt {
 			t.Errorf("cached %q, read back %q", salt, got)
 		}
+	}
+}
+
+// PROTOCOL.md, the canonical command list, lists fleetd's commands as the usage
+// text does, line for line, so neither can gain or lose a flag alone.
+func TestProtocolListsTheCommandsTheUsageDoes(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "PROTOCOL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var documented, used []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "fleetd ") {
+			documented = append(documented, strings.TrimSpace(line))
+		}
+	}
+	for _, line := range strings.Split(usage, "\n") {
+		if strings.HasPrefix(line, "  fleetd ") {
+			used = append(used, strings.TrimSpace(line))
+		}
+	}
+	if len(used) == 0 || !slices.Equal(documented, used) {
+		t.Fatalf("PROTOCOL.md lists\n%s\nthe usage text\n%s", strings.Join(documented, "\n"), strings.Join(used, "\n"))
 	}
 }

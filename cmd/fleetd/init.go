@@ -26,8 +26,8 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 	reclaim := fs.Bool("reclaim", false, "put this machine's published records back at the start of its journal file, "+
 		"after its journal directory was set up again or restored from an older copy")
 	timeout := fs.Duration("timeout", 2*time.Minute, "give up after this long")
-	branch := fs.String("branch", "", "the journal's branch, where init cannot tell which it is (else the branch the "+
-		"clone follows, else the remote's default)")
+	branch := fs.String("branch", "", "the journal's branch, where init cannot tell which it is (else the one init "+
+		"recorded, else the branch the clone follows, else the remote's default); init records it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -57,6 +57,11 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		URL: url, Dir: journalDir, Salt: given, Strict: from == "--salt" && given != "", Branch: *branch,
 	})
 	switch {
+	case errors.Is(err, gitsync.ErrSaltMismatch) && from == "--salt" && *branch != "":
+		// The branch named may not be the fleet's at all.
+		return fmt.Errorf("%w: --salt differs from the salt in %s's %s on %s; with it this machine would get a "+
+			"second host id. If %s holds the fleet's journal, unset --salt, or set it to that journal's; if not, name "+
+			"the branch that does with --branch", gitsync.ErrSaltMismatch, url, gitsync.FleetFile, *branch, *branch)
 	case errors.Is(err, gitsync.ErrSaltMismatch) && from == "--salt":
 		return saltMismatch(from, url)
 	case errors.Is(err, gitsync.ErrNeedSalt):

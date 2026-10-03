@@ -260,12 +260,13 @@ comms belief <channel> <claim> [confidence]
 comms refute <belief_id> <reason> [correction] [channel]
 
 # Host attribution (fleetd — a separate single static binary, no runtime)
-fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--timeout 2m] URL
+fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--branch B] [--timeout 2m] URL
 fleetd host   [--json] [--dir D] [--salt S]
 fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
 fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
 fleetd where  [--json] [--dir D] [--limit N]
 fleetd hook   <claude|cursor|codex|grok> [--dir D] [--salt S] [--timeout 40s] [--no-sync] [--json] [event-json]
+fleetd version
 ```
 
 `fleetd hook` is what an AI tool's own hook configuration runs; AGENTS.md has
@@ -285,25 +286,32 @@ that already holds records without one needs the salt its machines use (`--salt`
 the ids they had). When the repository's default branch does not exist, the journal is
 on its only branch; with several, init is refused, unless `--branch` names the
 journal's (which, on an empty repository, names the branch the journal starts
-on). A clone a person moved off the
+on). Init never starts the journal on a branch that holds none (no `fleetd.json`,
+no host journal file) while another branch holds one: it is refused, naming the
+branch the journal is on, with nothing pushed or moved. A clone a person moved off the
 journal's branch (detached, an orphan branch, a branch that follows nothing, a
 branch of the clone or another remote's, or no commit yet, as a plain clone made
-while the repository was empty has) is put back on it: the branch it follows, of
-the same name on origin, if origin still has it; else the remote's default, the
-branch its HEAD names; else its only branch. `--branch` names the journal's
-branch instead, where a person knows better; origin must have it. Following
-several of origin's branches, none of them the default, a clone is left as it is,
-and init says to name the journal's with `--branch`. A `--single-branch` clone put on
-another branch has its refspec's branch lines replaced by one for every branch
-of origin's, its other lines kept. Only refs and the index
+while the repository was empty has) is put back on it: the branch init recorded
+when it last set the clone up (`fleetd.branch` in the clone's git config), while
+origin has it, else, recorded and gone, none (init says what a person does, as for
+a gone branch); with no record, the branch it follows, of the same name on origin,
+if origin still has it; else the remote's default, the branch its HEAD names; else
+its only branch. `--branch` names the journal's branch instead, where a person
+knows better; origin must have it, and init records it. Following several of
+origin's branches, none of them the default, a clone is left as it is, and init
+says to name the journal's with `--branch`. A clone whose fetch does not take
+origin's branch to `origin/<branch>` (`--single-branch`, or a line mapping origin's
+branches elsewhere first) has its refspec's branch lines replaced by one for every
+branch of origin's, its other lines kept; such a line in an included file is named
+instead, with nothing moved. Only refs and the index
 change, never a file, and HEAD last; the journal's branch here starts at origin's
 tip and moves only forward to it, so one with commits of its own stays, and
 init's sync reports them. The repair is refused, with nothing moved, in a
 repository that is not a journal, in the middle of a rebase, merge, cherry-pick,
 revert or bisect, with a commit only HEAD holds (init names the command that
 keeps it on a branch), or with the journal's branch checked out in another
-worktree; a refusal after the repair, a salt that differs from the journal's
-say, leaves the clone on the journal's branch. Of a file the remote changed or
+worktree; a `--salt` differing from the journal's is refused before the repair,
+and a refusal after it leaves the clone on the journal's branch. Of a file the remote changed or
 removed since the commit the clone was on, the next sync brings one that holds
 only the start of the remote's copy up to date; a rewritten one stays changed
 until `git checkout -- <file>`, and a removed one stays, untracked, its records
@@ -339,8 +347,10 @@ credential that cannot push included, is reported and retried by the next sync.
 `fleetd sync` requires the journal directory to be the root of a clone of the
 journal repository, on a branch with a commit that follows one of origin's; never
 another remote's, which would take this machine's records where the fleet does not
-look. Any other clone (detached, an orphan branch, a branch that follows nothing,
-a branch of the clone or another remote's, or no commit yet) is told to run
+look, nor, once init has recorded the journal's branch, another of origin's. Any
+other clone (detached, an orphan branch, a branch that follows nothing, a branch
+of the clone or another remote's, another of origin's than the one recorded, or
+no commit yet) is told to run
 `fleetd init --dir "<dir>" <journal URL>`, which puts it back on the journal's branch without touching a file,
 or says what stops it, as above: `git switch` refuses, or overwrites this
 machine's records, when they are in the work tree and the branch's files lack

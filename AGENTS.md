@@ -115,7 +115,12 @@ journal is on that branch; a server that does not advertise an empty repository'
 default leaves the first machine starting `main` whatever the repository's HEAD
 names. With several branches and no default among them, init is refused before
 anything is pushed, unless `--branch` names the one the journal is on; on an
-empty repository, `--branch` names the one the journal starts on. A repository
+empty repository, `--branch` names the one the journal starts on. Init never
+starts the journal on a branch that holds none, neither `fleetd.json` nor a host
+journal file, while another branch holds one, since the fleet publishes there:
+a repository whose default holds only a README while the journal is on another
+branch is refused, naming the branch the journal is on, for `--branch`, with
+nothing pushed or moved. A repository
 with anything but host journal files, `fleetd.json`, a README, a LICENSE,
 `.gitignore` or `.gitattributes`, or with a directory, is refused, and so is a
 journal directory holding anything but journal files and `fleetd.json`. A
@@ -127,16 +132,23 @@ it do, so that fleetd cannot read the journal's salt from it. A clone a person
 moved off the journal's branch, detached, on an orphan branch, on a branch that
 follows nothing, a branch of the clone or another remote's, or with no commit
 yet, as a plain clone of the repository made while it was empty has, is put back
-on it by init. The journal's branch is the one this clone follows, of the same
-name on origin, if origin still has it, since a remote's default can change while
-its machines go on publishing where they did; else the remote's default, the
-branch its HEAD names; else its only branch. A clone that follows several of
-origin's branches, none of them the default, could be meant for any: init moves
-nothing, and says to name the journal's with `fleetd init --branch <branch>`,
-which puts the clone there, wherever init would otherwise look. A clone made
-with `--single-branch` that is put back on another branch has its refspec's
-branch lines give way to one for every branch of origin's, as a clone has; its
-other lines stay. Only refs and git's index change, never a file, so
+on it by init. The journal's branch is the one init recorded when it last set
+the clone up, in the clone's own git config (`fleetd.branch`), while origin has
+it; recorded and gone from origin, it is left for a person, as a branch the remote
+deleted or renamed is (below), with the same advice. A clone with no record, set
+up before init kept one, takes the branch it follows, of the same name on origin,
+if origin still has it, since a remote's default can change while its machines go
+on publishing where they did; else the remote's default, the branch its HEAD
+names; else its only branch. A clone that follows several of origin's branches,
+none of them the default, could be meant for any: init moves nothing, and says to
+name the journal's with `fleetd init --dir "<dir>" --branch <branch> <journal
+URL>`, which puts the clone there, wherever init would otherwise look, and records
+it. A clone whose fetch does not take origin's branch to `origin/<branch>`, as one
+made with `--single-branch` and put back on another branch, or one mapping
+origin's branches somewhere else first, has its refspec's branch lines give way to
+one for every branch of origin's, as a clone has; its other lines stay. Such a
+line in a file the clone's config includes, which init does not rewrite, is named
+instead, and nothing moves. Only refs and git's index change, never a file, so
 this machine's records stay as they are, which git's own ways back (`git
 switch`, `git checkout`) refuse to promise; HEAD moves last, so init run again
 finishes a repair cut short. A branch with commits of its own is not moved, and
@@ -145,9 +157,10 @@ The repair is refused, with nothing moved, in a repository that is not a journal
 in the middle of a rebase, merge, cherry-pick, revert or bisect, with a commit
 only HEAD holds, or with the journal's branch checked out in another worktree;
 init says which, and for the commit names the command that keeps it on a branch.
-These are the repair's refusals: a clone on the journal's branch needs no repair,
-and one init refuses after the repair, for a salt that differs from the
-journal's say, stays on the journal's branch. A repair leaves every file as it
+These are the repair's refusals: a clone on the journal's branch needs no repair.
+A `--salt` that differs from the salt of the journal the repair would put the
+clone on is refused before it, with nothing moved; one init refuses after the
+repair stays on the journal's branch. A repair leaves every file as it
 is, so a clone put back from an older commit keeps that commit's copy of a file
 the remote has changed or removed since. The next sync brings a file that holds
 only the start of the remote's copy, as a journal file does, up to date; one the
@@ -156,8 +169,10 @@ remote rewrote stays as it is, changed as far as `git status` can tell, until
 untracked, and `fleetd where` lists its records as not published until it is
 deleted by hand. Sync syncs only a branch that follows one of origin's, and tells
 any other clone to run `fleetd init --dir "<dir>" <journal URL>`; one that follows
-another of origin's branches, as `git switch stray` makes, syncs with that
-branch, as before. Sync's and init's fetches take every branch of origin's,
+another of origin's branches than the one init recorded, as `git switch stray`
+makes, is told the same, naming both, and init puts it back, unless `fleetd init
+--branch` says the journal moved there. A clone with no record syncs with the
+branch it follows, as before. Sync's and init's fetches take every branch of origin's,
 whatever the clone's own refspec, and leave its tags alone. They prune, so a
 branch the remote deleted or renamed goes from the clone too, a `--single-branch`
 clone included: a sync or init on a branch that followed it stops and says so,

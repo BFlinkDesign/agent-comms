@@ -582,12 +582,19 @@ func TestInitRefusesSeveralBranchesWithoutADefault(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	recordsOn(t, remote, "master", "trunk")
 	before := remoteBranchList(t, remote)
-	_, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "journal"), "--salt", "s", remote)
+	dir := filepath.Join(t.TempDir(), "journal")
+	_, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote)
 	if !errors.Is(err, gitsync.ErrNoDefaultBranch) || !strings.Contains(err.Error(), "master, trunk") {
 		t.Fatalf("err = %v, want ErrNoDefaultBranch naming master and trunk", err)
 	}
+	if want := "`fleetd init --dir \"" + dir + "\" --branch <branch> <journal URL>`"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %v, want it to name %s", err, want)
+	}
 	if after := remoteBranchList(t, remote); after != before {
 		t.Errorf("init pushed: %q became %q", before, after)
+	}
+	if stdout, _, err := exec(t, "init", "--dir", dir, "--branch", "trunk", "--salt", "s", remote); err != nil || !strings.Contains(stdout, "following trunk") {
+		t.Fatalf("init with the advice followed: %v, output %q", err, stdout)
 	}
 }
 
@@ -1781,5 +1788,30 @@ func TestInitFollowsTheBranchItIsTold(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "journal")
 	if stdout, _, err := exec(t, "init", "--dir", dir, "--branch", "journal", remote); err != nil || !strings.Contains(stdout, "following journal") {
 		t.Fatalf("init --branch journal: %v, output %q", err, stdout)
+	}
+}
+
+// A --salt that differs from the journal's on the branch --branch names is
+// refused, and the message says that branch may not be the fleet's, rather than
+// to take its salt.
+func TestInitWithABranchWhoseSaltDiffersSaysTheBranchMayNotBeTheFleets(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	first := filepath.Join(t.TempDir(), "first")
+	if _, _, err := exec(t, "init", "--dir", first, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	apart := filepath.Join(t.TempDir(), "apart")
+	gitIn(t, filepath.Dir(apart), "init", "--quiet", "--initial-branch=docs", apart)
+	if err := os.WriteFile(filepath.Join(apart, gitsync.FleetFile), []byte("{\"salt\": \"other\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, apart, "add", ".")
+	gitIn(t, apart, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "another fleet")
+	gitIn(t, apart, "push", "--quiet", remote, "docs")
+	dir := filepath.Join(t.TempDir(), "journal")
+	_, _, err := exec(t, "init", "--dir", dir, "--branch", "docs", "--salt", "s", remote)
+	if !errors.Is(err, gitsync.ErrSaltMismatch) || !strings.Contains(err.Error(), "If docs holds the fleet's journal") ||
+		!strings.Contains(err.Error(), "name the branch that does with --branch") {
+		t.Fatalf("init --branch docs --salt s: %v, want ErrSaltMismatch saying docs may not be the fleet's", err)
 	}
 }

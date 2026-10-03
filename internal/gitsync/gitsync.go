@@ -318,6 +318,18 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 	if !ok {
 		return res, noUpstream(g)
 	}
+	// Nor another of origin's branches than the one init set the clone up on, as
+	// after a person's git switch, or a repair cut short: init puts it back.
+	recorded, err := recordedBranch(g)
+	if err != nil {
+		return res, err
+	}
+	if recorded != "" && recorded != branch {
+		return res, fmt.Errorf("%w: it follows origin/%s, while the journal is on %s, the branch init set it up on: "+
+			"`fleetd init --dir \"%s\" <journal URL>` puts it back there, leaving its files as they are, or says what "+
+			"stops it; if the journal has moved, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` puts it "+
+			"on <branch>", ErrNoUpstream, branch, recorded, g.dir, g.dir)
+	}
 	remote := "origin"
 	upstream = remote + "/" + branch
 	localRef, err := g.line("symbolic-ref", "--quiet", "HEAD")
@@ -784,11 +796,32 @@ func goneUpstream(g git, head string) (string, error) {
 // a rename, or a deletion on purpose, so the way on is init told the branch.
 func goneError(g git, head, theirs string) error {
 	return fmt.Errorf("%w: %s follows origin/%s, which this clone no longer has, as when the remote deleted or renamed "+
-		"it. If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" --branch <branch> <journal URL>` "+
-		"puts the clone on <branch>, the one the journal is on now; if it was deleted by mistake, push it back from "+
-		"the machine that synced last, with `git push origin HEAD:<branch>` in its journal directory and %s for "+
-		"<branch>, and every machine's next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"),
-		theirs, g.dir, theirs)
+		"it. %s, and every machine's next sync takes it up again", ErrNoUpstream, strings.TrimPrefix(head, "refs/heads/"),
+		theirs, goneAdvice(g.dir, theirs))
+}
+
+// goneAdvice is what a person does about theirs, a branch of origin's the
+// journal was on, gone from the clone in dir.
+func goneAdvice(dir, theirs string) string {
+	return fmt.Sprintf("If it was renamed, or deleted on purpose, `fleetd init --dir \"%s\" --branch <branch> <journal "+
+		"URL>` puts the clone on <branch>, the one the journal is on now; if it was deleted by mistake, push it back "+
+		"from the machine that synced last, with `git push origin HEAD:<branch>` in its journal directory and %s for "+
+		"<branch>", dir, theirs)
+}
+
+// branchKey is where init records the journal's branch, in the clone's own
+// config: the branch it set the clone up on, which it puts the clone back on,
+// and the one every sync checks the clone follows.
+const branchKey = "fleetd.branch"
+
+// recordedBranch is the journal's branch as init last set the clone up, or ""
+// when init never recorded one, as for a clone set up before it did.
+func recordedBranch(g git) (string, error) {
+	branch, err := g.line("config", "--local", "--get", branchKey)
+	if err != nil {
+		return "", g.ctx.Err()
+	}
+	return branch, nil
 }
 
 // refetchGone fetches when HEAD's branch follows one of origin's that this clone

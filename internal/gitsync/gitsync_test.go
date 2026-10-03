@@ -844,8 +844,8 @@ func TestAPruningFetchLeavesTheClonesTagsAlone(t *testing.T) {
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
-	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "merge-base", "prepare",
-		"detached symbolic-ref", "by hand for-each-ref", "gone symbolic-ref", "gone for-each-ref",
+	for _, at := range []string{"--show-toplevel", "@{u}", "fleetd.branch", "symbolic-ref", "refs/remotes/origin/main",
+		"merge-base", "prepare", "detached symbolic-ref", "by hand for-each-ref", "gone symbolic-ref", "gone for-each-ref",
 		"gone refs/remotes/origin/main", "gone fetch", "other symbolic-ref"} {
 		t.Run(at, func(t *testing.T) {
 			t.Parallel()
