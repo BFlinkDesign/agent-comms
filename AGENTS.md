@@ -273,10 +273,12 @@ was wrong:
   nothing to set in its environment. `--salt` may repeat it but not contradict it.
   A `FLEET_SALT` that contradicts it is overridden with a warning, since refusing
   would drop every record of a hook started with a stale one. An invalid
-  `fleetd.json` (not valid JSON, no salt, or not a regular file of at most
-  64 KiB, as a link or a directory pushed by mistake would be) is not trusted,
-  and a sync still brings in a fixed one: the salt it last held, kept in the clone's git
-  directory, is used until a sync brings in a fixed one. Records this machine
+  `fleetd.json` is not trusted: one that is not valid JSON, holds no salt, is
+  larger than 64 KiB, or is a link or a directory, as one pushed by mistake
+  would be (on unix, anything but a regular file). The salt it last held, which
+  init and every command that reads it keep in the clone's git directory, is
+  used until a sync brings in a fixed one; init itself refuses a journal whose
+  `fleetd.json` is invalid. Records this machine
   wrote under another salt (none or `FLEET_SALT` before it knew the fleet's, the
   salt of a `fleetd.json` init replaced, or the journal's salt before it changed)
   are filed under the fleet's id by the next sync, while it holds its lock. A
@@ -287,9 +289,9 @@ was wrong:
   directory, or in `journal.salts` when that cannot be written. While neither
   can be, fleetd warns, keeps that salt as the one an invalid `fleetd.json`
   falls back to, and notes it once it can. Either note is one quoted salt per
-  line, and anything there but a regular file, such as a symbolic link or a
-  FIFO, is refused rather than written through or waited on; so is the hook
-  log. It
+  line, and a symbolic link or a directory there, or on unix anything else but
+  a regular file, such as a FIFO, is refused rather than written through or
+  waited on; so is the hook log. A note larger than 1 MiB is not read. It
   moves their file into the clone's git directory, `fleetd-pre-init/`, and files
   the records the old id never published; a file git tracks is put back as
   published, and one a killed sync left missing is put back too. A file git

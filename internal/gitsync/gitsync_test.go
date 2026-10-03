@@ -411,12 +411,44 @@ func TestASecondSyncOfTheSameCloneWaitsItsTurn(t *testing.T) {
 	}
 }
 
-func TestACloneWithoutAnUpstreamSaysHowToSetOne(t *testing.T) {
-	_, m := fleet(t, 1)
-	run(t, m[0], "switch", "--quiet", "-c", "local-only")
-	_, err := Sync(context.Background(), options(m[0], "h"))
-	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "git push -u") {
-		t.Fatalf("expected ErrNoUpstream with a fix, got %v", err)
+// A branch made by hand in a journal clone follows nothing. Pushing it, as
+// `git push -u` would, would start the journal on a second branch; the clone is
+// told to check the journal's branch out again instead, and then syncs. So is a
+// clone whose HEAD was detached.
+func TestABranchMadeByHandIsToldToCheckOutTheJournalsBranch(t *testing.T) {
+	for name, leave := range map[string][]string{
+		"a branch made by hand": {"switch", "--quiet", "-c", "local-only"},
+		"a detached HEAD":       {"checkout", "--quiet", "--detach"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, m := fleet(t, 1)
+			run(t, m[0], leave...)
+			_, err := Sync(context.Background(), options(m[0], "h"))
+			if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "checkout main") || strings.Contains(err.Error(), "push -u") {
+				t.Fatalf("expected ErrNoUpstream saying to check out main, got %v", err)
+			}
+			run(t, m[0], "checkout", "--quiet", "main")
+			mustSync(t, options(m[0], "h"))
+		})
+	}
+}
+
+// A clone whose branch the remote deleted, or renamed, and whose remote-tracking
+// copy of it was pruned, is told so, not to push it: that would recreate the
+// branch the fleet left.
+func TestABranchTheCloneNoLongerHasIsNamedAsSuch(t *testing.T) {
+	remote, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	run(t, admin, "push", "--quiet", "origin", "main:refs/heads/trunk")
+	run(t, admin, "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+	run(t, admin, "push", "--quiet", "origin", ":refs/heads/main")
+	run(t, a, "fetch", "--quiet", "--prune")
+	_, err := Sync(context.Background(), options(a, "h"))
+	if !errors.Is(err, ErrNoUpstream) || !strings.Contains(err.Error(), "no longer has") || strings.Contains(err.Error(), "push -u") {
+		t.Fatalf("expected ErrNoUpstream saying the branch is gone, got %v", err)
+	}
+	if out, err := exec.Command("git", "--git-dir", remote, "rev-parse", "--verify", "--quiet", "refs/heads/main").Output(); err == nil {
+		t.Fatalf("the sync recreated main at %s", out)
 	}
 }
 
@@ -1215,6 +1247,37 @@ func TestASyncUpdatesACRLFCopyThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
 	}
 	got, err := os.ReadFile(filepath.Join(a, "host-b.jsonl"))
 	want := "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n{\"id\":\"hive:3\"}\n"
+	if err != nil || strings.ReplaceAll(string(got), "\r\n", "\n") != want {
+		t.Fatalf("host-b.jsonl holds %q (%v), want %q", got, err, want)
+	}
+}
+
+// A CRLF copy of short lines that holds only the start of git's copy can be
+// larger than git's LF copy, by up to twice: it is still read, and updated.
+func TestACRLFCopyLargerThanGitsCopyCanStillHoldOnlyItsStart(t *testing.T) {
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	run(t, a, "config", "core.autocrlf", "true")
+	var lines []string
+	for i := 1; i <= 30; i++ {
+		lines = append(lines, fmt.Sprintf(`{"id":"hive:%d"}`, i))
+	}
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), lines...)
+	mustSync(t, options(b, "host-b"))
+	mustSync(t, options(a, "host-a"))
+	// The first 29 lines, with CRLF endings: larger than git's 30 LF lines.
+	short := strings.Join(lines[:29], "\r\n") + "\r\n"
+	if git := len(strings.Join(lines, "\n")) + 1; len(short) <= git {
+		t.Fatalf("the CRLF copy is %d bytes, git's %d; the test needs it larger", len(short), git)
+	}
+	write(t, filepath.Join(a, "host-b.jsonl"), short)
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:31"}`)
+	mustSync(t, options(b, "host-b"))
+	if res := mustSync(t, options(a, "host-a")); len(res.Kept) != 0 {
+		t.Fatalf("a CRLF copy behind git's was kept: %+v", res)
+	}
+	got, err := os.ReadFile(filepath.Join(a, "host-b.jsonl"))
+	want := strings.Join(append(lines, `{"id":"hive:31"}`), "\n") + "\n"
 	if err != nil || strings.ReplaceAll(string(got), "\r\n", "\n") != want {
 		t.Fatalf("host-b.jsonl holds %q (%v), want %q", got, err, want)
 	}

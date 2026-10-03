@@ -286,7 +286,9 @@ the ids they had). When the repository's default branch does not exist, the jour
 on its only branch; with several, init is refused. A plain clone of the repository
 made while it was empty, which has no commit, is refused with the advice to delete
 its `.git` directory and run init again. A `fleetd.json`
-in the journal directory with another salt is replaced by the journal's. A repository whose top level
+in the journal directory with another salt is replaced by the journal's, and so is
+one no command would read (over 64 KiB, say), whose salt is not noted. A journal
+whose own `fleetd.json` is invalid, or larger than 64 KiB, is refused. A repository whose top level
 holds anything but `host-*.jsonl`, `fleetd.json`, README, LICENSE, `.gitignore` or
 `.gitattributes`, or a directory, is refused; so is a journal directory holding
 anything but journal files and `fleetd.json`, or a clone of another repository.
@@ -302,7 +304,11 @@ remote declines (a hook, branch protection, a ruleset). Any other failure, a
 credential that cannot push included, is reported and retried by the next sync.
 
 `fleetd sync` requires the journal directory to be the root of a clone of the
-journal repository, with an upstream branch. It notes each outcome in the clone's
+journal repository, with an upstream branch. A clone whose HEAD follows none,
+detached or on a branch made by hand, while another branch there follows the
+journal, is told to check that one out (`git -C <dir> checkout main`): pushing the
+current branch would start the journal on a second one. A branch that follows one
+the clone no longer has, deleted or renamed on the remote, is named as such. It notes each outcome in the clone's
 `.git/fleetd-sync.json`, which `fleetd where` reports. It publishes only this host's
 `<host-id>.jsonl`, up to its last complete line, in a commit built directly on
 the remote tip. It never rebases and never rewrites that file. A push rejected

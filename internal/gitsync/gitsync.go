@@ -296,7 +296,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		if ctx.Err() != nil {
 			return res, err
 		}
-		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+		return res, noUpstream(g)
 	}
 	remote, branch, ok := strings.Cut(upstream, "/")
 	if !ok {
@@ -674,15 +674,21 @@ func locallyChanged(g git, paths []string) (map[string]bool, error) {
 // behindIndex returns, of paths, the regular files whose content is a strict
 // start of the index's copy, line endings aside: files with nothing of their own
 // that git's copy lacks. A file that cannot be read, or is not a regular file, is
-// not among them.
+// not among them. Nor is one more than twice the size of the index's copy: a
+// strict start of it is shorter, and CRLF line endings at most double that, so
+// such a file is never read.
 func behindIndex(g git, paths []string) (map[string]bool, error) {
 	behind := map[string]bool{}
 	for _, path := range paths {
-		info, err := os.Lstat(filepath.Join(g.dir, path))
-		if err != nil || !info.Mode().IsRegular() {
+		size, err := g.line("cat-file", "-s", ":"+path)
+		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(g.dir, path))
+		n, err := strconv.ParseInt(size, 10, 64)
+		if err != nil {
+			continue
+		}
+		data, err := readRegular(filepath.Join(g.dir, path), 2*n)
 		if err != nil {
 			continue
 		}
@@ -696,6 +702,42 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 		}
 	}
 	return behind, nil
+}
+
+// noUpstream is the error for a clone whose HEAD follows no remote branch. A
+// branch here that does is the journal's, and the clone is told to check it out
+// again: pushing the current branch, as a clone that never followed the journal
+// needs, would start the journal on a second branch, and cannot push a branch with
+// no commit, or a detached HEAD, at all. A current branch that follows one this
+// clone no longer has is told so: the remote may have deleted or renamed it, and
+// pushing would recreate it.
+func noUpstream(g git) error {
+	head, _ := g.line("symbolic-ref", "--quiet", "--short", "HEAD")
+	out, err := g.line("for-each-ref", "--format=%(refname:lstrip=2) %(upstream)", "refs/heads/")
+	if err != nil {
+		return err
+	}
+	var following []string
+	for _, line := range strings.Split(out, "\n") {
+		name, upstream, _ := strings.Cut(line, " ")
+		if !strings.HasPrefix(upstream, "refs/remotes/") {
+			continue
+		}
+		if name == head {
+			return fmt.Errorf("%w: %s follows %s, which this clone no longer has, as when the remote deleted or renamed it",
+				ErrNoUpstream, name, strings.TrimPrefix(upstream, "refs/remotes/"))
+		}
+		following = append(following, name)
+	}
+	switch len(following) {
+	case 0:
+		return fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, g.dir)
+	case 1:
+		return fmt.Errorf("%w: check out the branch that follows the journal: `git -C %s checkout %s`",
+			ErrNoUpstream, g.dir, following[0])
+	}
+	return fmt.Errorf("%w: check out the branch that follows the journal, one of %s: `git -C %s checkout <branch>`",
+		ErrNoUpstream, strings.Join(following, ", "), g.dir)
 }
 
 func mapKeys(m map[string]bool) []string {

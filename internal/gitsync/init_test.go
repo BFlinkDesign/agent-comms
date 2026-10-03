@@ -463,6 +463,35 @@ func TestInitPutsTheJournalsFleetFileInTheIndexOnlyOnceTheWorkTreeHasIt(t *testi
 	}
 }
 
+// init sizes up the journal's fleetd.json before reading any of it, on a new
+// directory or a clone: one far larger, which anyone able to push can commit,
+// would otherwise be read whole into memory before it was refused.
+func TestInitNeverReadsAnOversizedFleetFile(t *testing.T) {
+	remote := emptyRemote(t)
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	mustInit(t, InitOptions{URL: remote, Dir: first, Salt: "s"})
+	big := `{"salt": "s"}` + strings.Repeat(" ", 70<<10) + "\n"
+	if err := os.WriteFile(filepath.Join(first, FleetFile), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, first, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-am", "a large fleetd.json")
+	run(t, first, "push", "--quiet")
+	for _, dir := range []string{filepath.Join(root, "new"), first} {
+		var read []string
+		_, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir, Run: func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+			if slices.Contains(args, "blob") && slices.ContainsFunc(args, func(a string) bool { return strings.HasSuffix(a, ":"+FleetFile) }) {
+				read = append(read, strings.Join(args, " "))
+			}
+			return Git(ctx, dir, stdin, args...)
+		}})
+		if !errors.Is(err, ErrBadFleetFile) || len(read) > 0 {
+			t.Fatalf("init --dir %s on a %d-byte fleetd.json: %v, having read it with %q; want ErrBadFleetFile, unread",
+				dir, len(big), err, read)
+		}
+	}
+}
+
 // fleetd.json is a few lines. One far larger is not read, even when it is valid
 // JSON throughout, so that a file of any size, which anyone able to push can
 // commit, cannot exhaust memory.
@@ -477,20 +506,26 @@ func TestReadFleetRefusesAnOversizedFleetFile(t *testing.T) {
 	}
 }
 
-// A salts file holds a line per salt. One far larger is neither read nor
-// appended to, so that a large file planted there cannot exhaust memory.
+// A salts file holds a line per salt. One far larger, even of salts throughout,
+// is neither read nor appended to, so that a large file planted there cannot
+// exhaust memory.
 func TestASaltsFileTooLargeToBeOneIsRefused(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "salts")
-	if err := os.WriteFile(path, make([]byte, 2<<20), 0o600); err != nil {
+	var b strings.Builder
+	for i := 0; b.Len() < 2<<20; i++ {
+		fmt.Fprintf(&b, "%q\n", fmt.Sprintf("salt-%d", i))
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	size := int64(b.Len())
 	if got := ReadSalts(path); len(got) != 0 {
 		t.Fatalf("read %q from an oversized salts file", got)
 	}
 	if err := AppendSalt(path, "x"); err == nil {
 		t.Fatal("noted a salt in an oversized salts file")
 	}
-	if info, err := os.Stat(path); err != nil || info.Size() != 2<<20 {
+	if info, err := os.Stat(path); err != nil || info.Size() != size {
 		t.Fatalf("the oversized salts file changed: %v (%v)", info.Size(), err)
 	}
 }

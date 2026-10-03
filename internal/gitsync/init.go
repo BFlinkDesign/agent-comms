@@ -301,7 +301,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 		if ctx.Err() != nil {
 			return res, err
 		}
-		return res, fmt.Errorf("%w: set one with `git push -u origin <branch>` in %s", ErrNoUpstream, o.Dir)
+		return res, noUpstream(g)
 	}
 	remote, branch, ok := strings.Cut(upstream, "/")
 	if !ok || remote != "origin" {
@@ -344,7 +344,7 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 // between the two then leaves the journal's salt in place, where the other order
 // would leave a file that differs from git's copy, which no sync replaces.
 func adoptFleetFile(g git, dir, gitDir, tip string) error {
-	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+	want, err := fleetBlob(g, tip, "the journal")
 	if err != nil {
 		return err
 	}
@@ -387,7 +387,9 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 	if err != nil || staged == mode+" "+id+" 0\t"+FleetFile {
 		return err
 	}
-	_, err = g.line("update-index", "--add", "--cacheinfo", mode+","+id+","+FleetFile)
+	// --replace drops what the index holds under a FleetFile directory a sync
+	// brought in, which the person has removed from the work tree.
+	_, err = g.line("update-index", "--add", "--replace", "--cacheinfo", mode+","+id+","+FleetFile)
 	return err
 }
 
@@ -478,7 +480,7 @@ func bootstrap(g git, o InitOptions, res *InitResult) error {
 				return fmt.Errorf("%w (%s): %v", ErrNotJournal, o.URL, err)
 			}
 			if _, ok := top[FleetFile]; ok {
-				data, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+				data, err := fleetBlob(g, tip, o.URL)
 				if err != nil {
 					return err
 				}
@@ -565,11 +567,13 @@ func oneBranch(g git, branch string) error {
 // it held that the journal does not use is noted in gitDir, so that the records
 // this machine wrote under it are filed under the journal's later.
 func placeFleetFile(g git, dir, gitDir, tip string) error {
-	want, err := g.raw(nil, "cat-file", "blob", tip+":"+FleetFile)
+	want, err := fleetBlob(g, tip, "the journal")
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(dir, FleetFile)
+	// One that is not a file fleetd reads, too large say, never gave a record its
+	// salt: it has no salt to note, and is replaced below.
 	have, err := readFleetFile(path)
 	switch {
 	case err == nil && string(have) == want:
@@ -582,7 +586,7 @@ func placeFleetFile(g git, dir, gitDir, tip string) error {
 				return err
 			}
 		}
-	case !errors.Is(err, os.ErrNotExist):
+	case !errors.Is(err, os.ErrNotExist) && !errors.Is(err, ErrBadFleetFile):
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -668,6 +672,24 @@ func ReadSalts(path string) []string {
 
 // maxSaltsBytes bounds a salts file, which holds a line per salt.
 const maxSaltsBytes = 1 << 20
+
+// fleetBlob returns commit's FleetFile, refusing one larger than ReadFleet reads
+// before reading any of it, so that init accepts no fleetd.json that every other
+// command would refuse. where names the repository in the error.
+func fleetBlob(g git, commit, where string) (string, error) {
+	size, err := g.line("cat-file", "-s", commit+":"+FleetFile)
+	if err != nil {
+		return "", err
+	}
+	n, err := strconv.ParseInt(size, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("gitsync: git gave %q as the size of %s's %s", size, where, FleetFile)
+	}
+	if n > maxFleetFileBytes {
+		return "", fmt.Errorf("%w: %s's %s is larger than %d bytes", ErrBadFleetFile, where, FleetFile, maxFleetFileBytes)
+	}
+	return g.raw(nil, "cat-file", "blob", commit+":"+FleetFile)
+}
 
 // readRegular reads the file at path if it is a regular file of at most limit
 // bytes, so that one planted there, a large sparse file say, cannot exhaust

@@ -220,21 +220,7 @@ func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt strin
 			fmt.Fprintf(stderr, "fleetd: warning: FLEET_SALT differs from the salt in %s's %s, which is used; unset FLEET_SALT\n",
 				journalDir, gitsync.FleetFile)
 		}
-		// A changed salt leaves this machine's records under the old one
-		// unpublished: noting it lets a sync file them under the new one. The
-		// salts note beside the journal serves when the clone's git directory
-		// cannot take the note, since re-filing reads both. Until one is written,
-		// the cache keeps the old salt, so the next run tries again.
-		if prev := cachedSalt(journalDir); prev != "" && prev != fleet.Salt {
-			if err := gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev); err != nil {
-				if note := saltsNote(journalDir); note == "" || gitsync.AppendSalt(note, prev) != nil {
-					fmt.Fprintf(stderr, "fleetd: warning: could not note the salt %s's %s held before (%v); "+
-						"this machine's records under it are filed once a later run can\n", journalDir, gitsync.FleetFile, err)
-					return fleet.Salt, true, nil
-				}
-			}
-		}
-		cacheSalt(journalDir, fleet.Salt)
+		keepSalt(journalDir, fleet.Salt, stderr)
 		return fleet.Salt, true, nil
 	case flagValue != "":
 		return flagValue, false, nil
@@ -243,6 +229,24 @@ func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt strin
 	}
 	fmt.Fprintln(stderr, "fleetd: warning: no fleetd.json in the journal, no --salt and no FLEET_SALT; host digests are unseparated")
 	return "", false, nil
+}
+
+// keepSalt makes salt, the journal's, the one cachedSalt returns. A changed salt
+// leaves this machine's records under the old one unpublished: noting it lets a
+// sync file them under the new one. The salts note beside the journal serves when
+// the clone's git directory cannot take the note, since re-filing reads both.
+// Until one is written, the cache keeps the old salt, so the next run tries again.
+func keepSalt(journalDir, salt string, stderr io.Writer) {
+	if prev := cachedSalt(journalDir); prev != "" && prev != salt {
+		if err := gitsync.NotePastSalt(filepath.Join(journalDir, ".git"), prev); err != nil {
+			if note := saltsNote(journalDir); note == "" || gitsync.AppendSalt(note, prev) != nil {
+				fmt.Fprintf(stderr, "fleetd: warning: could not note the salt %s's %s held before (%v); "+
+					"this machine's records under it are filed once a later run can\n", journalDir, gitsync.FleetFile, err)
+				return
+			}
+		}
+	}
+	cacheSalt(journalDir, salt)
 }
 
 // saltCacheName is the file, in a clone's .git directory, that keeps the last

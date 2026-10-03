@@ -68,6 +68,10 @@ func cmdInit(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "fleetd: warning: %s differs from the salt in %s's %s, which is used; unset %s\n",
 			from, url, gitsync.FleetFile, from)
 	}
+	// The salt init read is the one fleetd.json last held, for whenever the file
+	// is unusable before another command has read it: one a push made a directory,
+	// and init's own sync brought in, say.
+	keepSalt(journalDir, res.Salt, stderr)
 
 	// The journal is set up, with its fleetd.json in place. Syncing now publishes
 	// this machine's records and, once fleetd.json has been in place long enough
