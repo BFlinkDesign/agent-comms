@@ -2370,7 +2370,8 @@ func TestAStepThatFailsAfterTheRecordLeavesTheTargetRecorded(t *testing.T) {
 }
 
 // branchLike takes for a branch's name exactly what git does: each case is
-// checked against git check-ref-format itself.
+// checked against git check-ref-format itself, but for a NUL, which no program
+// can be given in an argument, and which git refuses in a ref.
 func TestBranchLikeTakesWhatGitTakes(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
@@ -2379,8 +2380,12 @@ func TestBranchLikeTakesWhatGitTakes(t *testing.T) {
 		"", "/main", "main/", "a//b", "main.", "main.lock", "a/b.lock", ".hidden", "a/.b", "a..b", "a@{b",
 		"a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a\tb", "a\nb", "a\x00b", "a\x7fb",
 	} {
-		_, err := exec.Command("git", "check-ref-format", "refs/heads/"+name).CombinedOutput()
-		if want := err == nil; branchLike(name) != want {
+		want := false
+		if !strings.ContainsRune(name, 0) {
+			_, err := exec.Command("git", "check-ref-format", "refs/heads/"+name).CombinedOutput()
+			want = err == nil
+		}
+		if branchLike(name) != want {
 			t.Errorf("branchLike(%q) = %v, git check-ref-format says %v", name, !want, want)
 		}
 	}

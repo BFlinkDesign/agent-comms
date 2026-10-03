@@ -236,11 +236,13 @@ func TestGitDirFindsTheDirectoryAGitFileNames(t *testing.T) {
 			t.Fatal(err)
 		}
 		write(t, filepath.Join(dir, ".git"), c.file)
-		if got, ok := GitDir(dir); got != c.want || ok != (c.want != "") {
+		// The same directory, which Windows can spell two ways: C:\Users\RUNNER~1
+		// and C:\Users\runneradmin.
+		if got, ok := GitDir(dir); ok != (c.want != "") || (ok && !SameDir(got, c.want)) {
 			t.Errorf("%s: GitDir = %q, %v; want %q", c.name, got, ok, c.want)
 		}
 	}
-	if got, ok := GitDir(plain); got != filepath.Join(plain, ".git") || !ok {
+	if got, ok := GitDir(plain); !ok || !SameDir(got, filepath.Join(plain, ".git")) {
 		t.Errorf("a .git directory: GitDir = %q, %v", got, ok)
 	}
 	if _, ok := GitDir(root); ok {
