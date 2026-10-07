@@ -199,6 +199,66 @@ func TestInitStartsAnEmptyJournalOnTheRemotesBranchNotThisMachinesDefault(t *tes
 	}
 }
 
+// A person's clone.defaultRemoteName names the remote of every clone git makes.
+// Init's clone in a new directory names its remote origin all the same, as every
+// later git command does: otherwise init would take a journal holding records for
+// an empty repository and push it a first commit with a new salt.
+func TestInitInANewDirectoryNamesItsRemoteOriginWhateverAPersonsGitSays(t *testing.T) {
+	remote := emptyRemote(t)
+	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "first"), Salt: "s"})
+	config := filepath.Join(t.TempDir(), "gitconfig")
+	write(t, config, "[clone]\n\tdefaultRemoteName = upstream\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", config)
+	dir := filepath.Join(t.TempDir(), "journal")
+	res, err := Init(context.Background(), InitOptions{URL: remote, Dir: dir})
+	if err != nil || res.WroteFleetFile || res.Salt != "s" {
+		t.Fatalf("init with clone.defaultRemoteName=upstream = %+v, %v; want the journal's salt, and nothing pushed", res, err)
+	}
+	if remotes := run(t, dir, "remote"); remotes != "origin" {
+		t.Fatalf("the clone's remotes are %q, want origin", remotes)
+	}
+	if left := besideClones(dir); len(left) > 0 {
+		t.Fatalf("init left %v beside the journal directory", left)
+	}
+}
+
+// Under core.autocrlf=true, Git for Windows' default, the index notes the size of
+// the CRLF copy git checked fleetd.json out with. Init, putting back a fleetd.json
+// the work tree lost, writes git's LF copy and enters it in the index again: `git
+// status` would otherwise take it for changed for good, without reading it, and
+// every sync would keep out the next change the fleet makes to it, a new salt
+// included.
+func TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "first"), Salt: "s1"})
+	root := t.TempDir()
+	c := filepath.Join(root, "c")
+	run(t, root, "clone", "--quiet", "-c", "core.autocrlf=true", remote, c)
+	noteCheckout(t, c, FleetFile)
+	if err := os.Remove(filepath.Join(c, FleetFile)); err != nil {
+		t.Fatal(err)
+	}
+	mustInit(t, InitOptions{URL: remote, Dir: c})
+	if status := run(t, c, "status", "--porcelain"); status != "" {
+		t.Fatalf("git status once init put fleetd.json back:\n%s", status)
+	}
+	// The fleet edits its salt, as the docs say a salt is changed.
+	edit := filepath.Join(root, "edit")
+	run(t, root, "clone", "--quiet", remote, edit)
+	identify(t, edit)
+	write(t, filepath.Join(edit, FleetFile), "{\n  \"salt\": \"s2\"\n}\n")
+	run(t, edit, "commit", "--quiet", "-am", "journal: a new salt")
+	run(t, edit, "push", "--quiet", "origin", "main")
+	res, err := Sync(context.Background(), options(c, "host-c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, ok, err := ReadFleet(c); len(res.Kept) != 0 || err != nil || !ok || f.Salt != "s2" {
+		t.Fatalf("sync once the salt changed: kept %v, fleetd.json %+v (%v, %v); want the new salt brought in", res.Kept, f, ok, err)
+	}
+}
+
 func TestInitRefusesARepositoryThatIsNotAJournal(t *testing.T) {
 	t.Parallel()
 	requireGit(t)

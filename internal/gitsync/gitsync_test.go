@@ -1815,6 +1815,58 @@ func TestALockAKilledGitLeftBehindIsClearedOnceStale(t *testing.T) {
 	}
 }
 
+// A person's fetch.writeCommitGraph=true has every fetch that brings a pack write
+// a commit graph, which takes a lock inside the object store: one a fetch killed
+// at the sync's deadline left there, where no stale lock is cleared, stops no
+// later sync, since fleetd's fetches write no graph.
+func TestACommitGraphLockAKilledFetchLeftStopsNoSync(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	run(t, a, "config", "fetch.writeCommitGraph", "true")
+	lock := filepath.Join(a, ".git", "objects", "info", "commit-graphs", "commit-graph-chain.lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, lock, "")
+	old := time.Now().Add(-staleLock - time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		// b publishes first, so that a's fetch brings a pack.
+		appendLines(t, filepath.Join(b, "host-b.jsonl"), fmt.Sprintf(`{"id":"hive:b%d"}`, i))
+		mustSync(t, options(b, "host-b"))
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), fmt.Sprintf(`{"id":"hive:a%d"}`, i))
+		if res, err := Sync(context.Background(), options(a, "host-a")); err != nil || res.Received != 1 || res.Published != 1 {
+			t.Fatalf("sync %d beside a commit-graph lock a killed fetch left = %+v, %v; want b's record in and a's out", i, res, err)
+		}
+	}
+}
+
+// A person's git may sign every push, or send push options with it. A remote that
+// does not take them, as a bare repository on a share does not, refuses every
+// such push, so fleetd's pushes go without either.
+func TestASyncPublishesWhateverAPersonsGitSaysToPushWith(t *testing.T) {
+	t.Parallel()
+	requireGit(t)
+	for _, setting := range [][2]string{{"push.gpgSign", "true"}, {"push.pushOption", "ci.skip"}} {
+		t.Run(setting[0], func(t *testing.T) {
+			t.Parallel()
+			remote, m := newFleet(t, 1)
+			a := m[0]
+			run(t, a, "config", setting[0], setting[1])
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+			if res, err := Sync(context.Background(), options(a, "host-a")); err != nil || res.Published != 1 {
+				t.Fatalf("sync with %s=%s = %+v, %v; want the record published", setting[0], setting[1], res, err)
+			}
+			if got := run(t, remote, "show", "main:host-a.jsonl"); got != `{"id":"hive:1"}` {
+				t.Fatalf("the remote holds %q for host-a", got)
+			}
+		})
+	}
+}
+
 // A push that lost a race to another machine is retried however the remote
 // words it. GitHub reports a race it catches while updating the ref as
 // "[remote rejected] ... (cannot lock ref ...)", not "[rejected]". A rejection
@@ -1974,6 +2026,51 @@ func TestASyncUpdatesAFileThatHoldsOnlyTheStartOfGitsCopy(t *testing.T) {
 	}
 	if status := run(t, a, "status", "--porcelain"); status != "" {
 		t.Fatalf("git status after the sync:\n%s", status)
+	}
+}
+
+// noteCheckout leaves name's index entry in dir as on a machine that checked the
+// file out well before its index was last written: noting the file's size. An
+// index written in the same instant as a file notes no size for it, git's guard
+// against racy timestamps, and git then reads the file to compare it.
+func noteCheckout(t *testing.T, dir, name string) {
+	t.Helper()
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "update-index", "--refresh")
+}
+
+// Under core.autocrlf=true, Git for Windows' default, the index notes the size of
+// the CRLF copy git checked a file out with. One rewritten with LF since, by a
+// person's tool or by fleetd itself, holds nothing git's copy lacks, but `git
+// status`, seeing the size differ, takes it for changed without reading it: the
+// remote's next change to it is brought in all the same.
+func TestAFileRewrittenWithOtherLineEndingsTakesTheRemotesChange(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 2)
+	a, b := m[0], m[1]
+	// The person's setting, in the clone's own config, as a global one would be.
+	run(t, a, "config", "core.autocrlf", "true")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(b, "host-b"))
+	mustSync(t, options(a, "host-a"))
+	path := filepath.Join(a, "host-b.jsonl")
+	if got := readFile(t, path); got != "{\"id\":\"hive:1\"}\r\n" {
+		t.Fatalf("git checked host-b.jsonl out as %q, want it with CRLF", got)
+	}
+	noteCheckout(t, a, "host-b.jsonl")
+	write(t, path, "{\"id\":\"hive:1\"}\n")
+	appendLines(t, filepath.Join(b, "host-b.jsonl"), `{"id":"hive:2"}`)
+	mustSync(t, options(b, "host-b"))
+
+	res := mustSync(t, options(a, "host-a"))
+	if len(res.Kept) != 0 {
+		t.Fatalf("a file holding git's copy with LF line endings was kept: %+v", res)
+	}
+	if got := strings.ReplaceAll(readFile(t, path), "\r\n", "\n"); got != "{\"id\":\"hive:1\"}\n{\"id\":\"hive:2\"}\n" {
+		t.Fatalf("host-b.jsonl is %q, want both of b's records", got)
 	}
 }
 

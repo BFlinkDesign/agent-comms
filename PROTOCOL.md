@@ -409,7 +409,8 @@ first is retried, up to three attempts; a push the remote declines (a hook,
 branch protection, a ruleset) fails at once, saying it was refused. It then
 brings in every other file the remote changed or deleted, except a file with
 local changes the remote does not have, which it leaves alone and reports
-(`kept` in `--json`). Anything staged with `git add` and not committed is the
+(`kept` in `--json`); one that holds only git's copy or its start, line endings
+aside, has none. Anything staged with `git add` and not committed is the
 exception: sync resets a staged edit to the remote's version and deletes a
 staged new file (`git fsck --lost-found` recovers either until the gc a sync runs
 prunes it, which it may as soon as the content is two weeks old). A git lock file older

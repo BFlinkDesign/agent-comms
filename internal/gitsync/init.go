@@ -248,7 +248,10 @@ func initNew(ctx context.Context, o InitOptions, url string, run Runner) (InitRe
 	}()
 
 	g := git{ctx: ctx, dir: parent, run: run}
-	clone := append(batchSSH(g), "-c", "init.defaultBranch="+unnamedDefault, "clone", "--quiet", "--no-checkout", "--no-tags", "--", url, tmp)
+	// --origin: every git command fleetd runs names the remote origin, whatever a
+	// person's clone.defaultRemoteName would name it.
+	clone := append(batchSSH(g), "-c", "init.defaultBranch="+unnamedDefault, "clone", "--quiet", "--no-checkout", "--no-tags",
+		"--origin", "origin", "--", url, tmp)
 	if _, err := g.line(clone...); err != nil {
 		return res, err
 	}
@@ -810,8 +813,12 @@ func adoptFleetFile(g git, dir, gitDir, tip string) error {
 			return err
 		}
 	}
+	// A file written here is entered in the index again even where the index
+	// holds its blob: the entry may note the size of a CRLF copy git checked out,
+	// and `git status`, seeing the size differ, would take the file for changed
+	// without reading it.
 	staged, err := g.line("ls-files", "--stage", "--", FleetFile)
-	if err != nil || staged == mode+" "+id+" 0\t"+FleetFile {
+	if err != nil || (same && staged == mode+" "+id+" 0\t"+FleetFile) {
 		return err
 	}
 	// --replace drops what the index holds under a FleetFile directory a sync

@@ -100,7 +100,8 @@ fleetd hook <tool>              record a Claude Code, Cursor, Codex or Grok even
 `fleetd init URL` sets a machine up, once, and then syncs. It makes the journal
 directory a clone of the journal repository without moving, rewriting or deleting
 anything in it, because a hook may be appending a record at any moment: it clones
-without a work tree beside the directory, makes sure the repository has
+without a work tree beside the directory, naming the clone's remote origin whatever
+`clone.defaultRemoteName` says, makes sure the repository has
 `fleetd.json`, writes that file into the directory so every record from then on
 uses its salt, and only then moves the clone's git directory in and checks out the
 files the directory lacks. When the repository is empty, its first commit holds
@@ -284,8 +285,9 @@ moves it aside. Instead it:
   branch, is not retried, and the error says it was refused;
 - then brings in every file the remote changed or deleted. A file with changes
   the remote does not have (an edit made by hand, say) is never overwritten;
-  sync names it. A file that holds only the start of git's copy, such as one
-  restored from an older backup, has nothing of its own and is brought up to
+  sync names it. A file that holds only git's copy or its start, line endings
+  aside, such as one restored from an older backup, or one rewritten with LF
+  where git checked it out with CRLF, has nothing of its own and is brought up to
   date, whether or not the remote changed it. The
   exception is anything staged with `git add` and not committed: the clone is
   fleetd's, so sync resets a staged edit to the remote's version and deletes a
@@ -311,7 +313,8 @@ closed only once git's output has been read to the end, so a leftover that still
 holds that output open still costs a two-second wait, as on Unix, before it is
 ended, and that git command counts as failed. Automatic `gc` and `maintenance`
 are off for every command a sync runs, so a sync never starts them inside its
-deadline. Instead, once a sync has done its work and the clone holds a thousand
+deadline, and a fetch writes no commit graph, whatever `fetch.writeCommitGraph`
+says: writing one takes a lock inside the object store. Instead, once a sync has done its work and the clone holds a thousand
 loose objects, it runs `git gc` with what is left of its deadline (`packed` in
 `--json`), so the clone does not grow without end. That gc packs objects and does
 nothing else, so one the deadline kills leaves no lock behind. A git command killed
@@ -323,8 +326,9 @@ clone for over ten minutes, such as a commit with its editor open, loses its loc
 the same way: the clone is fleetd's. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
-seconds of the deadline. Prompts, hooks, commit signing and core.fsmonitor are
-all disabled, so a sync never waits for input and starts no daemon. ssh runs in batch mode unless you
+seconds of the deadline. Prompts, hooks, commit and push signing, push options
+and core.fsmonitor are all disabled, so a sync never waits for input, starts no
+daemon, and sends the remote nothing it may refuse. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
 which is used as is. Variables that point git at a repository or carry a git
 command's own `-c` settings (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,

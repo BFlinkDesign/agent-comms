@@ -11,8 +11,8 @@
 // unpublished records on this machine, is left as it is and reported. Only
 // working-tree changes count: the clone is fleetd's, so an edit staged with
 // `git add` and not changed since is reset to the remote's version, and a file
-// that holds only the start of git's copy, such as one restored from an older
-// backup, is brought up to date.
+// that holds only git's copy or its start, line endings aside, such as one
+// restored from an older backup, is brought up to date.
 //
 // Because each host owns one file, the only way two hosts can collide is by
 // deriving the same host id. That is detected by content rather than by reading
@@ -89,10 +89,16 @@ var (
 // leaves lock files that fail every later sync until someone deletes them.
 // diff.autoRefreshIndex is on, as by default: with it off, `git diff` lists a file
 // whose content matches git's copy but whose index entry is out of date, and
-// fleetd would take it for one with records git does not have.
+// fleetd would take it for one with records git does not have. A fetch writes no
+// commit graph, whatever a person's fetch.writeCommitGraph says: writing one takes
+// a lock inside the object store, which one killed at the deadline leaves for
+// every later fetch to fail on. Pushes are neither signed nor sent with a person's
+// push options: a remote that does not take them, as a bare repository on a share
+// does not, refuses every push that carries them, and signing can prompt.
 var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
-	"-c", "diff.autoRefreshIndex=true"}
+	"-c", "diff.autoRefreshIndex=true", "-c", "fetch.writeCommitGraph=false",
+	"-c", "push.gpgSign=false", "-c", "push.pushOption="}
 
 // repositoryVariables are the variables git reads to find a repository, its
 // index or its objects, and a git command's own -c settings, as
@@ -775,7 +781,7 @@ func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool,
 			return nil, false, err
 		}
 	}
-	// A file that holds only the start of git's own copy, such as one restored
+	// A file that holds only git's own copy or its start, such as one restored
 	// from an older backup, is brought up to date even when the remote did not
 	// change it: it has no change of its own to keep.
 	modified, err := g.raw(nil, "diff", "--name-only", "-z", "--no-renames")
@@ -826,12 +832,14 @@ func locallyChanged(g git, paths []string) (map[string]bool, error) {
 	return changed, nil
 }
 
-// behindIndex returns, of paths, the regular files whose content is a strict
-// start of the index's copy, line endings aside: files with nothing of their own
-// that git's copy lacks. A file that cannot be read, or is not a regular file, is
-// not among them. Nor is one more than twice the size of the index's copy: a
-// strict start of it is shorter, and CRLF line endings at most double that, so
-// such a file is never read.
+// behindIndex returns, of paths, the regular files whose content is the index's
+// copy or a start of it, line endings aside: files with nothing of their own that
+// git's copy lacks. One equal to it counts as well: `git status` takes a file for
+// changed whenever its size differs from the one the index noted, without reading
+// it, as it does for one rewritten with other line endings than git checked it out
+// with. A file that cannot be read, or is not a regular file, is not among them.
+// Nor is one more than twice the size of the index's copy: CRLF line endings at
+// most double that, so such a file is never read.
 func behindIndex(g git, paths []string) (map[string]bool, error) {
 	behind := map[string]bool{}
 	for _, path := range paths {
@@ -852,7 +860,7 @@ func behindIndex(g git, paths []string) (map[string]bool, error) {
 			continue
 		}
 		have := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
-		if len(have) < len(indexed) && strings.HasPrefix(indexed, string(have)) {
+		if strings.HasPrefix(indexed, string(have)) {
 			behind[path] = true
 		}
 	}
