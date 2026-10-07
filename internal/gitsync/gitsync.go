@@ -95,10 +95,35 @@ var (
 // every later fetch to fail on. Pushes are neither signed nor sent with a person's
 // push options: a remote that does not take them, as a bare repository on a share
 // does not, refuses every push that carries them, and signing can prompt.
-var gitConfig = []string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
+// core.ignoreStat is off: on, git marks every entry it checks out or adds as
+// unchanged, this host's file at the end of every sync included, and `git status`
+// and `git diff` then miss every later change to the file, an edit made by hand or
+// another identity's records. Hooks a person's configuration names (hook.<name>
+// with an event and a command, which git 2.54 runs whatever core.hooksPath says)
+// are off for every event git has: hookEvents.
+var gitConfig = append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
 	"-c", "diff.autoRefreshIndex=true", "-c", "fetch.writeCommitGraph=false",
-	"-c", "push.gpgSign=false", "-c", "push.pushOption="}
+	"-c", "push.gpgSign=false", "-c", "push.pushOption=", "-c", "core.ignoreStat=false"}, hooksOff()...)
+
+// hookEvents are the hook events githooks(5) lists, as of git 2.56. These settings
+// reach only this side of a push: the receiving side runs the remote's hooks, as
+// any remote does.
+var hookEvents = []string{"applypatch-msg", "commit-msg", "fsmonitor-watchman", "p4-changelist",
+	"p4-post-changelist", "p4-pre-submit", "p4-prepare-changelist", "post-applypatch", "post-checkout",
+	"post-commit", "post-index-change", "post-merge", "post-receive", "post-rewrite", "post-update",
+	"pre-applypatch", "pre-auto-gc", "pre-commit", "pre-merge-commit", "pre-push", "pre-rebase",
+	"pre-receive", "prepare-commit-msg", "proc-receive", "push-to-checkout", "reference-transaction",
+	"sendemail-validate", "update"}
+
+// hooksOff switches each of hookEvents off; git before 2.54 ignores the settings.
+func hooksOff() []string {
+	var off []string
+	for _, event := range hookEvents {
+		off = append(off, "-c", "hook."+event+".enabled=false")
+	}
+	return off
+}
 
 // repositoryVariables are the variables git reads to find a repository, its
 // index or its objects, and a git command's own -c settings, as
@@ -144,7 +169,11 @@ func gitEnv() []string {
 		}
 		env = append(env, kv)
 	}
-	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1")
+	// GIT_ASKPASS is empty: git asks a person for credentials through GIT_ASKPASS,
+	// else core.askPass, else SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says, and
+	// Git Bash sets SSH_ASKPASS to a dialog, as an editor's terminal sets
+	// GIT_ASKPASS to one of its own. An empty value names none of the three.
+	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1", "GIT_ASKPASS=")
 	return append(env, identity...)
 }
 
@@ -156,8 +185,9 @@ type Runner func(ctx context.Context, dir string, stdin []byte, args ...string) 
 var runGitTree = runTree
 
 // Git runs the git binary on PATH. Nothing it runs may wait for a person:
-// terminal and credential prompts are off, hooks do not run, and commits are
-// never signed, since a signer can prompt. Nothing it runs may outlive it
+// terminal and credential prompts are off, askpass dialogs included, hooks do not
+// run, those a person's configuration names included, and neither commits nor
+// pushes are signed, since a signer can prompt. Nothing it runs may outlive it
 // either: core.fsmonitor is off, so git starts no fsmonitor daemon. When the context ends, git and every
 // process it started are killed: a process group on Unix, a job object on
 // Windows. A child that still holds git's output open is cut off after a short
@@ -495,8 +525,11 @@ func pack(g git) bool {
 			if loose, _ := strconv.Atoi(strings.TrimSpace(v)); loose < packLimit {
 				return false
 			}
+			// gc.pruneExpire: what a sync reset or deleted stays two weeks, as the docs
+			// say, whatever a person's configuration says.
 			_, err := g.line("-c", "gc.packRefs=false", "-c", "gc.reflogExpire=never",
-				"-c", "gc.reflogExpireUnreachable=never", "-c", "gc.writeCommitGraph=false", "gc", "--quiet")
+				"-c", "gc.reflogExpireUnreachable=never", "-c", "gc.writeCommitGraph=false",
+				"-c", "gc.pruneExpire=2.weeks.ago", "gc", "--quiet")
 			return err == nil
 		}
 	}

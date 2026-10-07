@@ -986,6 +986,88 @@ func TestAnInvalidFleetFileUsesTheSaltItLastHeldWhenThePastSaltsNoteFails(t *tes
 // where it is by every later sync, whatever the person's git configuration says
 // about refreshing git's index. Moved again, it would be copied into the git
 // directory by every sync, without end.
+// The upgrade from fleetd v0.1.0 on a machine whose person has core.ignoreStat
+// true: v0.1.0's syncs leave the machine's file marked unchanged in the index, as
+// git marks every entry update-index --cacheinfo adds then, so `git diff` misses
+// the records it gains, and re-filing would never file the one written before
+// init under the fleet's id. Init clears the mark.
+func TestAV010CloneUnderIgnoreStatFilesItsRecordsUnderTheFleetsId(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	seed := filepath.Join(t.TempDir(), "seed")
+	gitIn(t, filepath.Dir(seed), "init", "--quiet", "--initial-branch=main", seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("one file per machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, seed, "add", ".")
+	gitIn(t, seed, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "start the journal")
+	gitIn(t, seed, "push", "--quiet", remote, "main")
+	dir := filepath.Join(t.TempDir(), "journal")
+	gitIn(t, filepath.Dir(dir), "clone", "--quiet", remote, dir)
+	gitIn(t, dir, "config", "core.ignoreStat", "true")
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "published under v0.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	// As v0.1.0's update-index --cacheinfo and its checkouts leave them under
+	// core.ignoreStat.
+	own := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	gitIn(t, dir, "update-index", "--assume-unchanged", own, "README.md")
+	if _, _, err := exec(t, "init", "--dir", filepath.Join(t.TempDir(), "other"), "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "record", "--dir", dir, "--type", "note", "--note", "written before init"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exec(t, "sync", "--dir", dir); !errors.Is(err, gitsync.ErrNoFleetFile) {
+		t.Fatalf("sync after the journal gained fleetd.json: %v, want ErrNoFleetFile", err)
+	}
+	if _, _, err := exec(t, "init", "--dir", dir, remote); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := remoteHostRecords(t, remote, "s", "written before init"); n != 1 || !ok {
+		t.Fatalf("the fleet id's file holds %d records (the one written before init: %v), want that one", n, ok)
+	}
+	// "<tag> <path>": a lower-case tag is an entry still marked unchanged.
+	out, err := osexec.Command("git", "-C", dir, "ls-files", "-v").CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != "" && line[0] >= 'a' && line[0] <= 'z' {
+			t.Errorf("init left %q marked unchanged", line)
+		}
+	}
+}
+
+// An entry a person's own git marks unchanged after init, as `git add` does under
+// core.ignoreStat=true, hides from `git diff` the records another identity's file
+// gains: re-filing clears the mark and files them all the same.
+func TestARecordOfAnIdentityMarkedUnchangedAfterInitIsFiled(t *testing.T) {
+	t.Parallel()
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "config", "core.ignoreStat", "true")
+	recordWithout(t, dir, "--note", "published under no salt")
+	plain := strings.ReplaceAll(hostID(t, "--salt", "", "--dir", t.TempDir()), ":", "-") + ".jsonl"
+	gitIn(t, dir, "add", plain)
+	gitIn(t, dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "published by hand")
+	gitIn(t, dir, "push", "--quiet")
+	recordWithout(t, dir, "--note", "never published")
+	fleetFileAged(t, dir)
+	if _, _, err := exec(t, "sync", "--dir", dir); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := remoteHostRecords(t, remote, "s", "never published"); n != 1 || !ok {
+		t.Fatalf("the fleet id's file holds %d records (the one never published: %v), want that one", n, ok)
+	}
+}
+
 func TestAPublishedFileOfAnOldIdentityIsNotMovedAgainBySyncs(t *testing.T) {
 	remote := emptyJournalRemote(t)
 	// A configuration of its own: the one TestMain sets is every test's at once.

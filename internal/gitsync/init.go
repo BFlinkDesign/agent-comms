@@ -381,6 +381,9 @@ func initClone(ctx context.Context, o InitOptions, url string, run Runner) (Init
 	// made here too, once the clone is set up, and only then are such clones
 	// removed. One that finds another journal is noted here as well, so that
 	// every sync waits, as for a look this clone's own push made due.
+	if err := forgetAssumedUnchanged(g); err != nil {
+		return res, err
+	}
 	due := abandonedLooks(o.Dir)
 	if err := bootstrap(g, gitDir, o, &res); err != nil {
 		return res, err
@@ -590,10 +593,22 @@ func onBranch(g git, gitDir, url string, o InitOptions) (branch string, reattach
 // journal's branch checked out in another worktree, which would then hold a branch
 // that moved under it.
 func leftAsItIs(g git, gitDir, head, branch string) error {
+	busy := fmt.Errorf("%w: %s is in the middle of a rebase, merge, cherry-pick, revert or bisect; finish or abort "+
+		"it, then run fleetd init again", ErrNoUpstream, g.dir)
 	for _, name := range []string{"rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"} {
 		if _, err := os.Lstat(filepath.Join(gitDir, name)); err == nil {
-			return fmt.Errorf("%w: %s is in the middle of a rebase, merge, cherry-pick, revert or bisect; finish or abort "+
-				"it, then run fleetd init again", ErrNoUpstream, g.dir)
+			return busy
+		}
+	}
+	// A clone whose refs git keeps in a reftable, as git 3.0 makes every new one,
+	// keeps a cherry-pick's or a revert's ref there, not in a file.
+	refs, err := g.raw([]byte("CHERRY_PICK_HEAD\nREVERT_HEAD\n"), "cat-file", "--batch-check")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(refs), "\n") {
+		if !strings.HasSuffix(line, " missing") {
+			return busy
 		}
 	}
 	if head == "" {
@@ -738,6 +753,32 @@ func journalBranch(g git, url, named, recorded string) (string, error) {
 	return "", fmt.Errorf("%w: %s has no branch, and %s has commits of its own; move its .git directory, and every "+
 		"file there but journal files and %s, out of it, then %s, which starts the journal there",
 		ErrNoUpstream, url, g.dir, FleetFile, again)
+}
+
+// forgetAssumedUnchanged clears the mark of every index entry marked unchanged:
+// git marks each entry it checks out or adds while a person's core.ignoreStat is
+// true, as fleetd v0.1.0's syncs ran, and `git update-index --assume-unchanged`
+// marks one by hand. `git status` and `git diff` then miss every change to such a
+// file, so a sync would overwrite an edit made by hand, unreported, and re-filing
+// would never see the records another identity's file gained. fleetd's own
+// commands mark none (gitConfig); the clone is fleetd's.
+func forgetAssumedUnchanged(g git) error {
+	out, err := g.raw(nil, "ls-files", "-z", "-v")
+	if err != nil {
+		return err
+	}
+	var marked []string
+	for _, entry := range strings.Split(out, "\x00") {
+		// "<tag> <path>": a lower-case tag is an entry marked unchanged.
+		if len(entry) > 2 && entry[0] >= 'a' && entry[0] <= 'z' && entry[1] == ' ' {
+			marked = append(marked, entry[2:])
+		}
+	}
+	if len(marked) == 0 {
+		return nil
+	}
+	_, err = g.raw(nulList(marked), "update-index", "-z", "--no-assume-unchanged", "--stdin")
+	return err
 }
 
 // upstreams maps each branch here to the full name of the branch it follows, or

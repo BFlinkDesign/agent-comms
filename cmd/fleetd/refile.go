@@ -135,12 +135,20 @@ func movable(ctx context.Context, dir, name string) bool {
 	if fi, err := os.Lstat(filepath.Join(dir, name)); err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	tracked, err := gitsync.Git(ctx, dir, nil, "ls-files", "-z", "--", name)
+	tracked, err := gitsync.Git(ctx, dir, nil, "ls-files", "-z", "-v", "--", name)
 	if err != nil {
 		return false
 	}
 	if tracked == "" {
 		return true
+	}
+	// A lower-case tag is an entry marked unchanged, as a person's git marks every
+	// one it adds under core.ignoreStat: `git diff` would miss every record the file
+	// gained, so the mark goes.
+	if c := tracked[0]; c >= 'a' && c <= 'z' {
+		if _, err := gitsync.Git(ctx, dir, nil, "update-index", "--no-assume-unchanged", "--", name); err != nil {
+			return false
+		}
 	}
 	differs, err := gitsync.Git(ctx, dir, nil, "diff", "--name-only", "-z", "--", name)
 	return err == nil && differs != ""

@@ -282,6 +282,33 @@ func TestInitChecksOutAFleetdJsonGitSeesAsChangedBeforeAnySync(t *testing.T) {
 	}
 }
 
+// An entry an older git marked unchanged, as fleetd v0.1.0's checkouts leave
+// every file under a person's core.ignoreStat=true, hides an edit made by hand
+// from `git status`: init clears the mark, so the remote's next change keeps it.
+func TestInitClearsWhatAnOlderGitMarkedUnchanged(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "first"), Salt: "s"})
+	root := t.TempDir()
+	admin := filepath.Join(root, "admin")
+	run(t, root, "clone", "--quiet", remote, admin)
+	identify(t, admin)
+	write(t, filepath.Join(admin, "README.md"), "v1\n")
+	run(t, admin, "add", "README.md")
+	run(t, admin, "commit", "--quiet", "-m", "readme")
+	run(t, admin, "push", "--quiet", "origin", "main")
+	c := filepath.Join(root, "c")
+	run(t, root, "clone", "--quiet", remote, c)
+	run(t, c, "update-index", "--assume-unchanged", "README.md")
+	mustInit(t, InitOptions{URL: remote, Dir: c})
+	write(t, filepath.Join(c, "README.md"), "v1\nedited on this machine\n")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v2\n") })
+	res := mustSync(t, options(c, "host-c"))
+	if got := readFile(t, filepath.Join(c, "README.md")); got != "v1\nedited on this machine\n" || !slices.Contains(res.Kept, "README.md") {
+		t.Fatalf("README.md edited by hand is %q after the sync, kept %v; want the edit kept and named", got, res.Kept)
+	}
+}
+
 func TestInitRefusesARepositoryThatIsNotAJournal(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
@@ -1054,6 +1081,20 @@ func TestInitLeavesACloneInTheMiddleOfSomethingToAPerson(t *testing.T) {
 				t.Fatal("the rebase did not stop on a conflict")
 			}
 		}, "in the middle of a rebase"},
+		{"a cherry-pick stopped on a conflict", func(t *testing.T, a string) {
+			cherryPickStopped(t, a)
+		}, "in the middle of a rebase, merge, cherry-pick"},
+		// git 3.0 keeps every new clone's refs in a reftable, and a cherry-pick's
+		// ref with them, not in a file.
+		{"a cherry-pick stopped on a conflict, the refs in a reftable", func(t *testing.T, a string) {
+			if out, err := exec.Command("git", "-C", a, "refs", "migrate", "--ref-format=reftable").CombinedOutput(); err != nil {
+				t.Skipf("this git keeps no refs in a reftable: %v: %s", err, out)
+			}
+			cherryPickStopped(t, a)
+			if _, err := os.Lstat(filepath.Join(a, ".git", "CHERRY_PICK_HEAD")); err == nil {
+				t.Fatal("the cherry-pick's ref is a file; the case needs it in the reftable")
+			}
+		}, "in the middle of a rebase, merge, cherry-pick"},
 		{"a commit on a detached HEAD", func(t *testing.T, a string) {
 			run(t, a, "checkout", "--quiet", "--detach")
 			write(t, filepath.Join(a, "notes.txt"), "mine\n")
@@ -1079,6 +1120,22 @@ func TestInitLeavesACloneInTheMiddleOfSomethingToAPerson(t *testing.T) {
 				t.Fatalf("init moved things in a clone it left to a person:\nbefore:\n%s\nafter:\n%s", before, after)
 			}
 		})
+	}
+}
+
+// cherryPickStopped leaves a's clone on a branch of its own, made by hand, in the
+// middle of a cherry-pick stopped on a conflict.
+func cherryPickStopped(t *testing.T, a string) {
+	t.Helper()
+	run(t, a, "switch", "--quiet", "-c", "mine")
+	write(t, filepath.Join(a, "README.md"), "mine\n")
+	run(t, a, "commit", "--quiet", "-am", "mine")
+	run(t, a, "switch", "--quiet", "main")
+	write(t, filepath.Join(a, "README.md"), "theirs\n")
+	run(t, a, "commit", "--quiet", "-am", "theirs")
+	run(t, a, "switch", "--quiet", "mine")
+	if err := exec.Command("git", "-C", a, "cherry-pick", "main").Run(); err == nil {
+		t.Fatal("the cherry-pick did not stop on a conflict")
 	}
 }
 

@@ -137,7 +137,8 @@ changing any of them):
   `fleetd.json` init can put back, while the work tree holds one (`Result.FleetFileGone`): it gives
   the machine its id. `git fsck --lost-found` recovers such content
   until the gc a sync runs prunes it, which it may as soon as the content is two weeks old.
-- Nothing may wait for a person: prompts, hooks and signing (commits and pushes) are off, and ssh gets BatchMode unless the
+- Nothing may wait for a person: prompts and askpass dialogs, hooks (those a person's git configuration names
+  included) and signing (commits and pushes) are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
   is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces. On Windows, running
   git outside a job object because Windows refused one is a fallback, not a failure, and is not reported.
@@ -151,8 +152,9 @@ changing any of them):
 - A person's git configuration reaches every git command fleetd runs, and the tests run with none: an
   empty global config and no system config, so not even Git for Windows' own `core.autocrlf=true`. A
   setting that changes what a command of fleetd's does is overridden in `gitConfig` (signing, push
-  options, the commit graph) or on the command (`--origin origin` on init's clone), and gets a test
-  that sets it, as `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf.
+  options, the commit graph, `core.ignoreStat`, configured hooks), on the command (`--origin origin` on
+  init's clone, `gc.pruneExpire` on pack's gc) or in `gitEnv` (`GIT_ASKPASS`), and gets a test that
+  sets it, as `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:

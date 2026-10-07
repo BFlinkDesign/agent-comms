@@ -326,9 +326,12 @@ clone for over ten minutes, such as a commit with its editor open, loses its loc
 the same way: the clone is fleetd's. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
-seconds of the deadline. Prompts, hooks, commit and push signing, push options
-and core.fsmonitor are all disabled, so a sync never waits for input, starts no
-daemon, and sends the remote nothing it may refuse. ssh runs in batch mode unless you
+seconds of the deadline. Prompts and askpass dialogs, hooks (those a person's git
+configuration names included), commit and push signing, push options and
+core.fsmonitor are all disabled, so a sync never waits for input, starts no
+daemon, and sends the remote nothing it may refuse. `core.ignoreStat` is off for
+fleetd's commands, so git marks no file unchanged and misses no change to it, and
+init clears the marks an older git left. ssh runs in batch mode unless you
 chose your own ssh command (`GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`),
 which is used as is. Variables that point git at a repository or carry a git
 command's own `-c` settings (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,

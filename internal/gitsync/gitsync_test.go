@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1864,6 +1866,119 @@ func TestASyncPublishesWhateverAPersonsGitSaysToPushWith(t *testing.T) {
 				t.Fatalf("the remote holds %q for host-a", got)
 			}
 		})
+	}
+}
+
+// git 2.54 runs a hook a person's configuration names, hook.<name> with an event
+// and a command, whatever core.hooksPath says. One the person's git names, which
+// would fail every sync, runs inside none. On an older git no such hook runs, and
+// this passes as it is.
+func TestASyncRunsNoHookAPersonsGitConfigurationNames(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	ran := filepath.Join(t.TempDir(), "ran")
+	hook := filepath.Join(t.TempDir(), "hook")
+	write(t, hook, "#!/bin/sh\necho \"$1\" >> '"+filepath.ToSlash(ran)+"'\nexit 1\n")
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The person's settings, in the clone's own config, as global ones would be.
+	for _, event := range []string{"reference-transaction", "post-checkout", "post-index-change"} {
+		run(t, a, "config", "hook.audit-"+event+".event", event)
+		run(t, a, "config", "hook.audit-"+event+".command", filepath.ToSlash(hook))
+	}
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "changed by hand\n") })
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	res, err := Sync(context.Background(), options(a, "host-a"))
+	if err != nil || res.Published != 1 || res.Received != 1 {
+		t.Fatalf("sync beside hooks the person's git names = %+v, %v; want the record out and the change in", res, err)
+	}
+	if data, err := os.ReadFile(ran); err == nil {
+		t.Fatalf("hooks the person's git names ran inside the sync: %q", data)
+	}
+}
+
+// Under a person's core.ignoreStat=true git marks every file it checks out as
+// unchanged, and `git status` then misses an edit made by hand: the remote's next
+// change would overwrite it, unreported.
+func TestAnEditMadeByHandUnderIgnoreStatIsKept(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	run(t, a, "config", "core.ignoreStat", "true")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v2\n") })
+	mustSync(t, options(a, "host-a"))
+	write(t, filepath.Join(a, "README.md"), "v2\nedited on this machine\n")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v3\n") })
+	res := mustSync(t, options(a, "host-a"))
+	if got := readFile(t, filepath.Join(a, "README.md")); got != "v2\nedited on this machine\n" || !slices.Contains(res.Kept, "README.md") {
+		t.Fatalf("README.md edited by hand is %q after the sync, kept %v; want the edit kept and named", got, res.Kept)
+	}
+}
+
+// git asks a person for credentials through GIT_ASKPASS, else core.askPass, else
+// SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says, and an editor's terminal sets
+// GIT_ASKPASS to a dialog of its own: a sync, a hook's included, would wait for a
+// person till its deadline. Not parallel: it sets the environment.
+func TestASyncAsksNoAskpassForCredentials(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the askpass stand-in is a shell script")
+	}
+	requireGit(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="journal"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	_, m := newFleet(t, 1)
+	a := m[0]
+	asked := filepath.Join(t.TempDir(), "asked")
+	askpass := filepath.Join(t.TempDir(), "askpass")
+	write(t, askpass, "#!/bin/sh\necho \"$1\" >> '"+asked+"'\n")
+	if err := os.Chmod(askpass, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, a, "remote", "set-url", "origin", srv.URL+"/journal.git")
+	t.Setenv("GIT_ASKPASS", askpass)
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	if _, err := Sync(context.Background(), options(a, "host-a")); err == nil {
+		t.Fatal("a sync with a remote that wants credentials it lacks succeeded")
+	}
+	if data, err := os.ReadFile(asked); err == nil {
+		t.Fatalf("git asked a person for credentials through GIT_ASKPASS: %q", data)
+	}
+}
+
+// What a sync deletes, such as a new file staged by hand, `git fsck --lost-found`
+// recovers until the gc a sync runs prunes it, which the docs say it may once the
+// content is two weeks old: a person's gc.pruneExpire=now does not prune it at
+// once. Not parallel: it sets packLimit.
+func TestPackingKeepsWhatASyncDeletedWhateverAPersonsGitSays(t *testing.T) {
+	saved := packLimit
+	t.Cleanup(func() { packLimit = saved })
+	packLimit = 12
+	_, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "gc.pruneExpire", "now")
+	write(t, filepath.Join(a, "notes.md"), "the person's own notes\n")
+	run(t, a, "add", "notes.md")
+	blob := run(t, a, "rev-parse", ":notes.md")
+	packed := false
+	for i := 0; i < 20 && !packed; i++ {
+		appendLines(t, filepath.Join(a, "host-a.jsonl"), fmt.Sprintf(`{"id":"hive:a%d"}`, i))
+		packed = mustSync(t, options(a, "host-a")).Packed
+	}
+	if !packed {
+		t.Fatal("machine a's clone was never packed")
+	}
+	if _, err := os.Stat(filepath.Join(a, "notes.md")); err == nil {
+		t.Fatal("the staged new file is still there; the test needs one the sync deleted")
+	}
+	cmd := exec.Command("git", "cat-file", "-e", blob)
+	cmd.Dir = a
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the gc a sync ran pruned the staged file's content at once (%v: %s)", err, strings.TrimSpace(string(out)))
 	}
 }
 
