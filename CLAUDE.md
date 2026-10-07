@@ -112,20 +112,33 @@ directly in `tests/test_mcp_server.py` without subprocess overhead. Available to
 | `hive_route` | Score candidate agents for a task (capability × reputation / cost) |
 
 **fleetd** (Go: `cmd/fleetd`, `internal/{cell,hostid,journal,gitsync}`) is a separate static binary
-that records which machine did the work. Its spec is the "fleetd — the native writer" section of
+that records which machine did the work. `fleetd init` sets a machine's journal up once. The fleet's
+salt lives in the journal's committed `fleetd.json`; a `--salt` that contradicts it is an error, a
+`FLEET_SALT` that does is overridden with a warning, and a sync files records written under another
+salt under the fleet's id. Neither init nor re-filing deletes a record: re-filing moves another identity's file into
+`.git/fleetd-pre-init/`, and only `fleetd init --reclaim` moves this machine's own file there, to put the remote's copy
+back in front of it. Its spec is the "fleetd — the native writer" section of
 `AGENTS.md` plus the `internal/gitsync` package comment. Sync rules (read `gitsync_test.go` before
 changing any of them):
 
-- Sync never writes this host's own journal file (`fleetd record` may be appending to it) and never
+- Sync never rewrites this host's own journal file (`fleetd record` may be appending to it) and never
   rebases, merges or stashes: it commits a snapshot cut at the last newline onto the remote tip with
-  plumbing, pushes that commit, and only then brings in the other hosts' files.
+  plumbing, pushes that commit, and only then brings in the other hosts' files. What runs under its
+  lock first (`Options.Prepare`: fleetd's re-filing) only appends to that file, or puts it back as the
+  remote has it when it is missing; only `fleetd init --reclaim` may move it aside, to put the published
+  copy back.
 - git removes and writes the other files, never Go's `os` package, so a remote symlink cannot lead a
   sync outside the clone. Removals go first. A file with unstaged changes, or an untracked or ignored
-  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path. The
+  file, is kept and reported in `Result.Kept`, and so is any update above or below a kept path; a
+  file holding only git's copy or its start, line endings aside, has nothing of its own and is
+  updated. The
   clone is fleetd's: sync resets anything staged with `git add` to the remote's version, and deletes a
-  staged new file, even one the remote never had. `git fsck --lost-found` recovers such content
+  staged new file, even one the remote never had. The one deletion sync does not bring in is of a
+  `fleetd.json` init can put back, while the work tree holds one (`Result.FleetFileGone`): it gives
+  the machine its id. `git fsck --lost-found` recovers such content
   until the gc a sync runs prunes it, which it may as soon as the content is two weeks old.
-- Nothing may wait for a person: prompts, hooks and signing are off, and ssh gets BatchMode unless the
+- Nothing may wait for a person: prompts and askpass dialogs, hooks (those a person's git configuration names
+  included) and signing (commits and pushes) are off, and ssh gets BatchMode unless the
   user set `GIT_SSH`, `GIT_SSH_COMMAND` or `core.sshCommand`. Only a push rejected by a concurrent push
   is retried, for `MaxAttempts` (3) attempts in all; every other failure surfaces. On Windows, running
   git outside a job object because Windows refused one is a fallback, not a failure, and is not reported.
@@ -133,9 +146,20 @@ changing any of them):
   `git rev-parse --local-env-vars` lists (a git hook exports `GIT_DIR`, which once sent the journal
   into the hook's repository) except `GIT_CONFIG_COUNT`, which git itself keeps and which carries
   configuration set on purpose. It also drops the hook's commit dates and sets a fixed author and
-  committer. Automatic gc and maintenance are off inside a sync; `pack` runs `git gc` at the end
-  once the clone holds `packLimit` loose objects. Git lock files older than `staleLock` are cleared,
-  because a killed git leaves them.
+  committer. Automatic gc and maintenance are off inside a sync, and a fetch writes no commit graph;
+  `pack` runs `git gc` at the end once the clone holds `packLimit` loose objects. Git lock files
+  older than `staleLock` are cleared, because a killed git leaves them.
+- A person's git configuration reaches every git command fleetd runs, and the tests run with none: an
+  empty global config and no system config, so not even Git for Windows' own `core.autocrlf=true`. A
+  setting that changes what a command of fleetd's does is overridden in `gitConfig` (signing, push
+  options, the commit graph, `core.ignoreStat`, configured hooks, `protocol.version`), on the command
+  (`--origin origin` on init's clone, `gc.pruneExpire` on pack's gc) or in `gitEnv` (`GIT_ASKPASS`,
+  the pathspec variables), and gets a test that sets it, as
+  `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf. Check each against the
+  oldest git that has it too: git 2.54 runs configured hooks but switches them off only by name, and
+  git 2.55 and later take `hook.<event>.enabled=false` for one hook's switch once a configuration
+  names `hook.<event>.command`. git splits `-c` at its first `=` and `--config-env` at its last, so a
+  key that can hold `=`, such as one with a hook's name in it, goes in `--config-env`.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:

@@ -6,12 +6,14 @@
 // signal separating one workstation from another, so "which PC did I do that on"
 // was never answerable after the fact. fleetd records it at the time.
 //
-// Four commands, deliberately, plus version:
+// Five commands, deliberately, plus version:
 //
+//	fleetd init URL        set up this machine's journal, once
 //	fleetd host            what this machine is, and how confident that is
 //	fleetd record ...      append one host-attributed record
 //	fleetd sync            publish this machine's records, receive the others'
-//	fleetd where           per machine, what it was last doing
+//	fleetd where           per machine, what it was last doing, and how fresh that is
+//	fleetd hook TOOL       record a Claude Code, Cursor, Codex or Grok event
 //	fleetd version         which build this is
 //
 // Every command takes --json, so the same surface serves a person at a terminal
@@ -33,6 +35,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,24 +49,39 @@ import (
 const usage = `fleetd — record and answer what happened on which machine
 
 usage:
-  fleetd host   [--json] [--salt S]
-  fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--include-user]
+  fleetd init   [--json] [--dir D] [--salt S] [--reclaim] [--branch B] [--timeout 2m] URL
+  fleetd host   [--json] [--dir D] [--salt S]
+  fleetd record [--json] [--dir D] [--salt S] --type T [--note N] [--repo R] [--branch B] [--agent A] [--at RFC3339] [--include-user]
   fleetd sync   [--json] [--dir D] [--salt S] [--timeout 60s]
   fleetd where  [--json] [--dir D] [--limit N]
+  fleetd hook   <claude|cursor|codex|grok> [--dir D] [--salt S] [--timeout 40s] [--no-sync] [--json] [event-json]
   fleetd version
 
 The journal directory is --dir, else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal.
 The where command reports an error, rather than "no records", when that
 directory does not exist -- usually the sign of a mistyped path.
 
-The salt is --salt, else $FLEET_SALT. It separates this fleet's host digests
-from any other and must be the same on every machine, or one machine will appear
-as several. It is not a credential.
+init makes the journal directory a clone of the journal repository URL, once per
+machine, without moving or deleting anything in it, and then syncs. An empty
+repository gets its first commit, holding fleetd.json with a salt for the fleet;
+one that already holds records needs the salt its machines use, from --salt or
+$FLEET_SALT. When this machine's journal directory was set up again, or restored
+from an older copy, its file no longer starts with the records the journal holds
+for it, and nothing is published until init --reclaim puts those records back in
+front of the newer ones.
+
+The salt is the one in the journal's fleetd.json, so every machine that clones the
+journal uses the same one. --salt may repeat it but not contradict it; $FLEET_SALT
+that contradicts it is overridden, with a warning. Without fleetd.json they supply
+it. It separates this fleet's host digests from any other and must be the same on
+every machine, or one machine will appear as several. It is not a credential.
+Records this machine wrote under another salt before it knew the fleet's are
+filed under the fleet's by the next sync.
 
 sync needs the journal directory to be the root of a clone of the journal
 repository, used for nothing else. It publishes only this machine's file, as of
 its last complete record, in a commit built on top of the remote; it never
-rebases and never writes this machine's file, so a record written during a sync
+rebases and never rewrites this machine's file, so a record written during a sync
 is never lost. Each machine writes only its own file, so machines never
 conflict. A file with changes the remote does not have is never overwritten;
 sync names it instead.
@@ -71,6 +89,19 @@ sync names it instead.
 The OS account name is recorded only with --include-user. These records are
 meant to be committed, and on a domain-joined host that name carries the domain
 with it.
+
+hook is what an AI tool's own hook configuration runs; AGENTS.md has a ready
+configuration for claude, cursor, codex and grok. It reads the event the way the
+tool documents it (JSON on stdin, or for codex's notify program the last
+argument) and appends one record through the same path as record: --agent is
+the tool, --type is session, turn or hook, and --repo and --branch come from the
+git repository at the event's working directory. A turn is recorded at most once
+every 30 minutes per session. A session end then syncs, bounded by --timeout,
+unless --no-sync is given; so does a turn codex's notify program records, since
+codex neither waits for nor limits it. A turn from a tool's own hooks does not
+sync, since the person is waiting. A hook never disturbs the tool that ran it: it
+prints nothing (--json is for trying it by hand), always exits 0, and appends any
+problem to fleetd-hook.log beside the journal directory.
 `
 
 // version is set by the release build (-ldflags "-X main.version=fleetd-v1.2.3").
@@ -124,6 +155,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return flag.ErrHelp
 	}
 	switch args[0] {
+	case "init":
+		return cmdInit(args[1:], stdout, stderr)
 	case "host":
 		return cmdHost(args[1:], stdout, stderr)
 	case "record":
@@ -132,6 +165,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdSync(args[1:], stdout, stderr)
 	case "where":
 		return cmdWhere(args[1:], stdout, stderr)
+	case "hook":
+		return cmdHook(args[1:], stdout, stderr)
 	case "version", "--version":
 		fmt.Fprintln(stdout, "fleetd", buildVersion(), runtime.GOOS+"/"+runtime.GOARCH)
 		return nil
@@ -144,18 +179,140 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 }
 
-// salt resolves the fleet salt. An empty salt still produces stable digests; it
+// resolveSalt finds the fleet salt. The journal's fleetd.json decides, since every
+// machine must derive host ids the same way: --salt may repeat it but not
+// contradict it, which is an error. $FLEET_SALT that contradicts it is overridden
+// with a warning instead: refusing would drop every record of a hook started with
+// a stale one. A journal without fleetd.json uses --salt, else $FLEET_SALT.
+//
+// A fleetd.json that is not valid is not trusted. The salt it last held, kept in
+// the clone's git directory, is used instead, with a warning, so that a sync can
+// still bring in a fixed file. An empty salt still produces stable digests; it
 // just does not separate this fleet from another using the same scheme, so the
 // caller is told rather than silently given a weaker identity.
-func resolveSalt(flagValue string, stderr io.Writer) string {
-	if flagValue != "" {
-		return flagValue
+func resolveSalt(flagValue, journalDir string, stderr io.Writer) (string, error) {
+	salt, _, err := resolveSaltFrom(flagValue, journalDir, stderr)
+	return salt, err
+}
+
+// resolveSaltFrom is resolveSalt, and also says whether the salt is the journal's:
+// read from its fleetd.json, or the one that file last held. A salt that is not
+// came from --salt or FLEET_SALT for want of a usable fleetd.json.
+func resolveSaltFrom(flagValue, journalDir string, stderr io.Writer) (salt string, journals bool, err error) {
+	fleet, ok, err := gitsync.ReadFleet(journalDir)
+	if err != nil {
+		if !errors.Is(err, gitsync.ErrBadFleetFile) {
+			return "", false, err
+		}
+		if cached := cachedSalt(journalDir); cached != "" {
+			fmt.Fprintf(stderr, "fleetd: warning: %v; the salt it last held is used until a sync brings in a fixed one\n", err)
+			fleet, ok = gitsync.Fleet{Salt: cached}, true
+		} else {
+			fmt.Fprintf(stderr, "fleetd: warning: %v; it is ignored until a sync brings in a fixed one\n", err)
+		}
 	}
-	if v := os.Getenv("FLEET_SALT"); v != "" {
-		return v
+	env := os.Getenv("FLEET_SALT")
+	switch {
+	case ok && flagValue != "" && flagValue != fleet.Salt:
+		return "", false, saltMismatch("--salt", journalDir)
+	case ok:
+		if flagValue == "" && env != "" && env != fleet.Salt {
+			fmt.Fprintf(stderr, "fleetd: warning: FLEET_SALT differs from the salt in %s's %s, which is used; unset FLEET_SALT\n",
+				journalDir, gitsync.FleetFile)
+		}
+		keepSalt(journalDir, fleet.Salt, stderr)
+		return fleet.Salt, true, nil
+	case flagValue != "":
+		return flagValue, false, nil
+	case env != "":
+		return env, false, nil
 	}
-	fmt.Fprintln(stderr, "fleetd: warning: no --salt and no FLEET_SALT; host digests are unseparated")
-	return ""
+	fmt.Fprintln(stderr, "fleetd: warning: no fleetd.json in the journal, no --salt and no FLEET_SALT; host digests are unseparated")
+	return "", false, nil
+}
+
+// keepSalt makes salt, the journal's, the one cachedSalt returns. A changed salt
+// leaves this machine's records under the old one unpublished: noting it lets a
+// sync file them under the new one. The salts note beside the journal serves when
+// the clone's git directory cannot take the note, since re-filing reads both.
+// Until one is written, the cache keeps the old salt, so the next run tries again.
+func keepSalt(journalDir, salt string, stderr io.Writer) {
+	if prev := cachedSalt(journalDir); prev != "" && prev != salt {
+		err := errors.New("the journal directory is not a clone")
+		if gitDir, ok := gitsync.GitDir(journalDir); ok {
+			err = gitsync.NotePastSalt(gitDir, prev)
+		}
+		if err != nil {
+			if note := saltsNote(journalDir); note == "" || gitsync.AppendSalt(note, prev) != nil {
+				fmt.Fprintf(stderr, "fleetd: warning: could not note the salt %s's %s held before (%v); "+
+					"this machine's records under it are filed once a later run can\n", journalDir, gitsync.FleetFile, err)
+				return
+			}
+		}
+	}
+	cacheSalt(journalDir, salt)
+}
+
+// saltCacheName is the file, in a clone's .git directory, that keeps the last
+// valid salt fleetd.json held.
+const saltCacheName = "fleetd-salt"
+
+func cachedSalt(journalDir string) string {
+	gitDir, ok := gitsync.GitDir(journalDir)
+	if !ok {
+		return ""
+	}
+	data, err := readNote(filepath.Join(gitDir, saltCacheName))
+	if err != nil {
+		return ""
+	}
+	// Only the newline cacheSalt ends it with: a salt is used exactly as given,
+	// spaces and all, or the same machine gets a second id.
+	return strings.TrimSuffix(string(data), "\n")
+}
+
+// maxNoteBytes bounds the notes fleetd keeps in a clone's git directory: the
+// salt cache, the sync's outcome, the sizes of the moved copies re-filed.
+const maxNoteBytes = 1 << 20
+
+// readNote reads one of fleetd's notes as fleetd reads every file it keeps: a
+// FIFO or a link planted there is refused, never waited on, past a sync's
+// --timeout and holding its lock, and one larger than maxNoteBytes is not read.
+func readNote(path string) ([]byte, error) {
+	f, err := journal.OpenRegular(path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxNoteBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxNoteBytes {
+		return nil, fmt.Errorf("refusing to read %s: it is larger than %d bytes", path, maxNoteBytes)
+	}
+	return data, nil
+}
+
+// cacheSalt keeps salt for cachedSalt, in a clone only, and only when it changed.
+// It is best effort: without it, an invalid fleetd.json is merely ignored.
+func cacheSalt(journalDir, salt string) {
+	gitDir, ok := gitsync.GitDir(journalDir)
+	if !ok || cachedSalt(journalDir) == salt {
+		return
+	}
+	_ = writeNote(filepath.Join(gitDir, saltCacheName), []byte(salt+"\n"))
+}
+
+// writeNote writes a note every command, or every sync, keeps, refusing at once
+// a directory where it goes: no rename replaces one, and gitsync.WriteNote's
+// retrying, for a file Windows holds open, would hold up every command for
+// seconds, a hook's included.
+func writeNote(path string, data []byte) error {
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	return gitsync.WriteNote(context.Background(), path, data)
 }
 
 // resolveDir finds the journal directory: --dir, else $COMMS_CHANNELS/journal,
@@ -184,23 +341,34 @@ type hostOut struct {
 	User   string `json:"user"`
 	Source string `json:"source"`
 	Stable bool   `json:"stable"`
+	// Salt is the salt the id was derived with.
+	Salt string `json:"-"`
 }
 
 func identity(salt string) hostOut {
 	id := hostid.Derive(hostid.Options{Salt: salt})
-	return hostOut{id.ID, id.Name, id.OS, id.Arch, id.User, id.Source, id.Stable}
+	return hostOut{id.ID, id.Name, id.OS, id.Arch, id.User, id.Source, id.Stable, salt}
 }
 
 func cmdHost(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("host", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	dir := fs.String("dir", "", "journal directory, whose fleetd.json holds the salt")
+	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	journalDir, err := resolveDir(*dir)
+	if err != nil {
+		return err
+	}
+	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
+	if err != nil {
+		return err
+	}
 
-	h := identity(resolveSalt(*salt, stderr))
+	h := identity(fleetSalt)
 	if *asJSON {
 		return writeJSON(stdout, h)
 	}
@@ -221,30 +389,71 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("record", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
-	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
-	typ := fs.String("type", "", "record type, e.g. observation, handoff, note (required)")
-	note := fs.String("note", "", "what happened, in your own words")
-	repo := fs.String("repo", "", "repository the work was in")
-	branch := fs.String("branch", "", "branch the work was on")
-	agent := fs.String("agent", "", "which tool produced this, as name/role")
-	at := fs.String("at", "", "RFC3339 timestamp (default: now)")
-	includeUser := fs.Bool("include-user", false,
+	var req recordRequest
+	fs.StringVar(&req.dir, "dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
+	fs.StringVar(&req.salt, "salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
+	fs.StringVar(&req.typ, "type", "", "record type, e.g. observation, handoff, note (required)")
+	fs.StringVar(&req.note, "note", "", "what happened, in your own words")
+	fs.StringVar(&req.repo, "repo", "", "repository the work was in")
+	fs.StringVar(&req.branch, "branch", "", "branch the work was on")
+	fs.StringVar(&req.agent, "agent", "", "which tool produced this, as name/role")
+	fs.StringVar(&req.at, "at", "", "RFC3339 timestamp (default: now)")
+	fs.BoolVar(&req.includeUser, "include-user", false,
 		"publish the OS account name in clear; off by default because these records are committed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*typ) == "" {
-		return errors.New("--type is required")
+	rec, err := appendRecord(req, stderr)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(stdout, map[string]any{"id": rec.id, "host": rec.host.ID, "file": rec.file})
+	}
+	fmt.Fprintf(stdout, "%s  recorded on %s\n", rec.id, rec.host.Name)
+	return nil
+}
+
+// recordRequest is one record to append. `fleetd record` fills it from its flags
+// and `fleetd hook` from a tool's event, and both go through appendRecord, so a
+// record a hook wrote has exactly the shape and host attribution of one a person
+// wrote.
+type recordRequest struct {
+	dir, salt, typ, note, repo, branch, agent, at string
+	// extra holds further data fields: the tool and session a hook recorded.
+	extra       map[string]string
+	includeUser bool
+}
+
+// recorded says what appendRecord wrote and where.
+type recorded struct {
+	id   string
+	host hostOut
+	file string
+}
+
+// appendRecord builds one host-attributed cell and appends it to this host's
+// journal file. Warnings, such as a missing salt, go to warn.
+func appendRecord(req recordRequest, warn io.Writer) (recorded, error) {
+	if strings.TrimSpace(req.typ) == "" {
+		return recorded{}, errors.New("--type is required")
+	}
+	journalDir, err := resolveDir(req.dir)
+	if err != nil {
+		return recorded{}, err
+	}
+	fleetSalt, journals, err := resolveSaltFrom(req.salt, journalDir, warn)
+	if err != nil {
+		return recorded{}, err
 	}
 
-	h := identity(resolveSalt(*salt, stderr))
-	from := *agent
+	h := identity(fleetSalt)
+	from := req.agent
 	if strings.TrimSpace(from) == "" {
 		from = "fleetd/" + h.Name
 	}
 
-	ts := *at
+	ts := req.at
 	if ts == "" {
 		// Nanosecond precision, not whole seconds. The cell id is derived from
 		// the content including this timestamp, so at second resolution two
@@ -256,7 +465,7 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		// problem; fleetd introduced it.
 		ts = time.Now().UTC().Format(time.RFC3339Nano)
 	} else if _, err := time.Parse(time.RFC3339, ts); err != nil {
-		return fmt.Errorf("--at %q is not an RFC3339 timestamp: %w", ts, err)
+		return recorded{}, fmt.Errorf("--at %q is not an RFC3339 timestamp: %w", ts, err)
 	}
 
 	// Host facts travel with every record. That is the entire point: the record is
@@ -270,7 +479,12 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 		"host.source": cell.S(h.Source),
 		"host.stable": cell.B(h.Stable),
 	}
-	for k, v := range map[string]string{"note": *note, "repo": *repo, "branch": *branch} {
+	for k, v := range req.extra {
+		if strings.TrimSpace(v) != "" {
+			data[k] = cell.S(v)
+		}
+	}
+	for k, v := range map[string]string{"note": req.note, "repo": req.repo, "branch": req.branch} {
 		if strings.TrimSpace(v) != "" {
 			data[k] = cell.S(v)
 		}
@@ -281,34 +495,28 @@ func cmdRecord(args []string, stdout, stderr io.Writer) error {
 	// user.Current().Username is of the form DOMAIN\account, so the default
 	// behaviour would have committed the AD domain and the operator's account
 	// name into a repository on every record.
-	if *includeUser && strings.TrimSpace(h.User) != "" {
+	if req.includeUser && strings.TrimSpace(h.User) != "" {
 		data["user"] = cell.S(h.User)
 	}
 
-	c, err := cell.New(*typ, from, ts, "journal", data, nil, nil, 0)
+	c, err := cell.New(req.typ, from, ts, "journal", data, nil, nil, 0)
 	if err != nil {
-		return err
+		return recorded{}, err
 	}
 
-	journalDir, err := resolveDir(*dir)
-	if err != nil {
-		return err
-	}
 	store, err := journal.Open(journalDir)
 	if err != nil {
-		return err
+		return recorded{}, err
 	}
 	if err := store.Append(h.ID, c); err != nil {
-		return err
+		return recorded{}, err
 	}
-
-	if *asJSON {
-		return writeJSON(stdout, map[string]any{
-			"id": c.ID, "host": h.ID, "file": filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
-		})
+	// A salt that is not the journal's is noted, so that once the journal has a
+	// fleetd.json, re-filing finds this record whatever the environment then.
+	if fleetSalt != "" && !journals {
+		noteSalt(journalDir, fleetSalt, warn)
 	}
-	fmt.Fprintf(stdout, "%s  recorded on %s\n", c.ID, h.Name)
-	return nil
+	return recorded{id: c.ID, host: h, file: filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl")}, nil
 }
 
 func cmdSync(args []string, stdout, stderr io.Writer) error {
@@ -316,7 +524,7 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit JSON")
 	dir := fs.String("dir", "", "journal directory (else $COMMS_CHANNELS/journal, else ~/.ai/channels/journal)")
-	salt := fs.String("salt", "", "fleet salt (else $FLEET_SALT)")
+	salt := fs.String("salt", "", "fleet salt (else the journal's fleetd.json, else $FLEET_SALT)")
 	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -324,22 +532,18 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 	if *timeout <= 0 {
 		return errors.New("--timeout must be positive")
 	}
-	h := identity(resolveSalt(*salt, stderr))
 	journalDir, err := resolveDir(*dir)
 	if err != nil {
 		return err
 	}
-	store, err := journal.Open(journalDir)
+	fleetSalt, err := resolveSalt(*salt, journalDir, stderr)
 	if err != nil {
+		// A sync that cannot start has still failed, and `where` says so.
+		noteSync(journalDir, gitsync.Result{}, err, time.Now(), stderr)
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	res, err := gitsync.Sync(ctx, gitsync.Options{
-		Dir:     store.Dir(),
-		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
-		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
-	})
+	h := identity(fleetSalt)
+	res, storeDir, err := syncJournal(journalDir, h, *timeout, false, stderr)
 	if err != nil {
 		// Lock files removed before the sync failed are still worth knowing
 		// about: the next sync would otherwise not mention them at all.
@@ -356,15 +560,124 @@ func cmdSync(args []string, stdout, stderr io.Writer) error {
 		plural(res.Published, "record"), h.Name, plural(res.Received, "commit"), res.Head)
 	if len(res.Kept) > 0 {
 		fmt.Fprintf(stdout, "kept this machine's copy of %s: it has changes the remote does not have.\n"+
-			"  Another identity's journal file is published by syncing with that identity's salt. For anything else,\n"+
-			"  git -C %s checkout '@{upstream}' -- <file>   takes the remote's copy.\n",
-			strings.Join(res.Kept, ", "), store.Dir())
+			"  To take the remote's copy:  git -C %s checkout '@{upstream}' -- <file>\n",
+			strings.Join(res.Kept, ", "), storeDir)
+	}
+	if res.FleetFileGone {
+		fmt.Fprintln(stdout, fleetFileGone(storeDir))
 	}
 	if len(res.Cleared) > 0 {
 		fmt.Fprintf(stdout, "removed %s older than ten minutes from the clone: %s\n",
 			plural(len(res.Cleared), "git lock file"), strings.Join(res.Cleared, ", "))
 	}
 	return nil
+}
+
+// syncJournal publishes host h's journal file in journalDir, brings in every
+// other host's, gives up after timeout, and notes the outcome for `where`.
+// `fleetd sync`, `fleetd hook` and `fleetd init` all sync through it. Holding
+// the sync's lock, it first files under h the records this machine wrote under
+// another identity (see refile), and with reclaim, which only `fleetd init
+// --reclaim` sets, puts h's published records back at the start of its own file
+// (see reconcileOwn).
+func syncJournal(journalDir string, h hostOut, timeout time.Duration, reclaim bool, stderr io.Writer) (gitsync.Result, string, error) {
+	store, err := journal.Open(journalDir)
+	if err != nil {
+		return gitsync.Result{}, "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var stale error
+	prepare := func(ctx context.Context, gitDir string) {
+		// h was derived before this sync took its lock: an init that has put the
+		// journal's fleetd.json in place since gives this machine another id, and
+		// files h's records under it. This sync publishes none of them.
+		fleet, ok, err := gitsync.ReadFleet(store.Dir())
+		if err == nil && ok && fleet.Salt != h.Salt {
+			stale = fmt.Errorf("the journal's %s now gives this machine another id than %s, which this command "+
+				"derived before the file was in place; nothing was published, and the next sync files this "+
+				"machine's records under the fleet's id", gitsync.FleetFile, h.ID)
+			cancel()
+			return
+		}
+		// A clone that has used the fleet's salt and holds no usable fleetd.json,
+		// as when the journal lost it with none to keep or put back, publishes
+		// nothing under another id: its records wait, as they do while the journal
+		// holds one, and the sync after init files them under the fleet's. With an
+		// unusable one every command derives the salt it last held, so only an id
+		// derived before one came in differs. A note there that cannot be read, a
+		// link or a FIFO planted in its place say, still says the clone used one:
+		// only a missing note means it never did.
+		last := cachedSalt(store.Dir())
+		note := filepath.Join(gitDir, saltCacheName)
+		if _, err := os.Lstat(note); !ok && err == nil && last == "" {
+			stale = fmt.Errorf("%w, and %s, which notes the salt this clone used, cannot be read or holds none: its "+
+				"records would go out under %s, which may be another id than the fleet's, so nothing was published. "+
+				"`fleetd init --dir \"%s\" --salt <salt> <journal URL>`, given the fleet's salt, which another "+
+				"machine's .git/fleetd-salt holds, puts the journal's %s in place, or one with that salt where the "+
+				"journal has none to put back, after which a sync files them under the fleet's id",
+				gitsync.ErrNoFleetFile, note, h.ID, store.Dir(), gitsync.FleetFile)
+			cancel()
+			return
+		}
+		if !ok && last != "" && last != h.Salt {
+			stale = fmt.Errorf("%w, whose salt this clone used before: its records would go out under %s, another id "+
+				"than the fleet's, so nothing was published. `fleetd init --dir \"%s\" --salt <salt> <journal URL>`, "+
+				"given the salt %s holds, puts the journal's %s in place, or one with that salt where the journal has "+
+				"none to put back, after which a sync files them under the fleet's id", gitsync.ErrNoFleetFile, h.ID,
+				store.Dir(), note, gitsync.FleetFile)
+			cancel()
+			return
+		}
+		if reclaim {
+			if err := reconcileOwn(ctx, store.Dir(), gitDir, h); err != nil {
+				fmt.Fprintf(stderr, "fleetd: warning: putting this machine's published records back in its journal file: %v\n", err)
+			}
+		}
+		if _, err := refile(ctx, store.Dir(), gitDir, h, stderr); err != nil {
+			fmt.Fprintf(stderr, "fleetd: warning: filing this machine's earlier records under its fleet identity: %v\n", err)
+		}
+	}
+	started := time.Now()
+	res, err := gitsync.Sync(ctx, gitsync.Options{
+		Dir:     store.Dir(),
+		File:    filepath.Join(store.Dir(), journal.FileName(h.ID)+".jsonl"),
+		Message: fmt.Sprintf("journal: %s (%s)", h.Name, h.ID),
+		Prepare: prepare,
+	})
+	if stale != nil {
+		err = stale
+	}
+	noteSync(store.Dir(), res, err, started, stderr)
+	return res, store.Dir(), err
+}
+
+// fleetFileGone says what a person does when the remote no longer holds the
+// journal's fleetd.json, which the clone in dir keeps.
+func fleetFileGone(dir string) string {
+	return fmt.Sprintf("the journal repository no longer holds %s, which gives every machine of the fleet its id: "+
+		"this machine keeps its copy in %s, so its records keep their id. `fleetd init --dir \"%s\" <journal URL>` "+
+		"puts it back as the repository last held it, as init on any machine does, unless another of its branches "+
+		"holds a journal while this one holds no records, which init then names", gitsync.FleetFile, dir, dir)
+}
+
+// printSyncStatus says how fresh the answer is: a clone holds the other machines'
+// records as of this machine's last successful sync.
+func printSyncStatus(stdout io.Writer, dir string) {
+	if _, ok := gitsync.GitDir(dir); !ok {
+		return
+	}
+	switch st, ok := readSyncStatus(dir); {
+	case !ok:
+		fmt.Fprintln(stdout, "no sync of this journal is noted on this machine yet; the other machines' records may be missing or out of date")
+	case st.LastAttempt != nil && st.LastAttempt.Error != "":
+		fmt.Fprintf(stdout, "this machine's last sync, %s, FAILED: %s\n", ago(st.LastAttempt.At), st.LastAttempt.Error)
+		if st.LastSuccess != nil {
+			fmt.Fprintf(stdout, "the records below are as of its last successful sync, %s\n", ago(st.LastSuccess.At))
+		}
+	case st.LastSuccess != nil:
+		fmt.Fprintf(stdout, "the records below are as of this machine's last sync, %s\n", ago(st.LastSuccess.At))
+	}
 }
 
 type whereEntry struct {
@@ -377,6 +690,14 @@ type whereEntry struct {
 	LastType string `json:"last_type,omitempty"`
 	LastRepo string `json:"last_repo,omitempty"`
 	LastNote string `json:"last_note,omitempty"`
+	// LastPublished is the timestamp of the newest record the remote has for this
+	// host, records re-filed after it aside (see newestTS), as of this clone's last
+	// sync. Absent when the remote has no file for it, when the journal is not a
+	// clone, or when git could not say.
+	LastPublished string `json:"last_published,omitempty"`
+	// Unpublished counts this host's records here that the remote lacks: this
+	// machine's work not yet synced. Absent when it is none, or unknown.
+	Unpublished int `json:"unpublished,omitempty"`
 	// Recent is the entries before the last one, newest first, bounded by
 	// --limit. It is emitted in JSON as well as to a terminal, so a program and a
 	// person see the same history.
@@ -392,6 +713,8 @@ type whereEntry struct {
 	// does not appear in the JSON: the timestamp is already there as last_ts, and
 	// a second rendering of the same fact could only disagree with it.
 	lastAt time.Time
+	// publicationKnown is set when git said what the remote has for this host.
+	publicationKnown bool
 }
 
 type recentEntry struct {
@@ -425,6 +748,15 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	records, readErr := store.ReadAll()
+	// A hook's problems and a failed sync go nowhere a person looks, so they
+	// surface here, before anything else: most of all when there is nothing else
+	// to show.
+	if !*asJSON {
+		if path, last, ok := hookProblem(store.Dir()); ok {
+			fmt.Fprintf(stdout, "a hook logged a problem in %s; the last one:\n  %s\n", path, last)
+		}
+		printSyncStatus(stdout, store.Dir())
+	}
 	// A store that does not exist is a different answer from a store with nothing
 	// in it, and the difference matters: the first usually means a mistyped path.
 	if errors.Is(readErr, journal.ErrNoStore) {
@@ -457,17 +789,26 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 	}
 
 	var out []whereEntry
-	for host, recs := range byHost {
+	for host, all := range byHost {
 		// Within a host the records already arrive in file order -- the order the
 		// appends actually committed -- because readFile numbers them as it reads
 		// and ReadAll keeps each host's slice contiguous. That is the ordering
 		// primitive here, and unlike a timestamp it cannot be wrong because a
-		// writer's clock was.
+		// writer's clock was. A record re-filed from another identity this
+		// machine wrote under earlier is the exception: it was appended late, so
+		// its place says nothing about when it happened, and it is left out of
+		// what was last.
+		recs := all
+		if live := slices.DeleteFunc(slices.Clone(all), func(r journal.Record) bool {
+			return fieldsOf(r.Raw)[refiledFrom] != ""
+		}); len(live) > 0 {
+			recs = live
+		}
 		last := recs[len(recs)-1]
 		f := fieldsOf(last.Raw)
 		e := whereEntry{
 			Host: host, HostName: f["host.name"], OS: f["host.os"],
-			Stable: f["host.stable"] == "true", Records: len(recs),
+			Stable: f["host.stable"] == "true", Records: len(all),
 			LastTS: last.TS, LastType: last.Type, LastRepo: f["repo"], LastNote: f["note"],
 			lastAt: parseTS(last.TS),
 		}
@@ -487,6 +828,23 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 			}
 		}
 		out = append(out, e)
+	}
+	stems := make([]string, 0, len(out))
+	for _, e := range out {
+		stems = append(stems, e.Host)
+	}
+	pubs, cloned := publications(store.Dir(), stems)
+	unknown := 0
+	for i := range out {
+		p := pubs[out[i].Host]
+		if cloned && !p.Known {
+			unknown++
+		}
+		out[i].LastPublished, out[i].Unpublished, out[i].publicationKnown = p.At, p.Unpublished, p.Known
+	}
+	if unknown > 0 {
+		fmt.Fprintf(stderr, "fleetd: warning: git could not say what the remote has for %s; their publication is left out\n",
+			plural(unknown, "machine"))
 	}
 	// Compared as instants, not as strings. Lexical comparison of RFC3339 is only
 	// correct when every timestamp is in UTC "Z" form, and it is not: --at accepts
@@ -526,6 +884,16 @@ func cmdWhere(args []string, stdout, stderr io.Writer) error {
 		}
 		if e.LastNote != "" {
 			fmt.Fprintf(stdout, "  note  %s\n", e.LastNote)
+		}
+		if e.publicationKnown {
+			if e.LastPublished != "" {
+				fmt.Fprintf(stdout, "  published up to  %s\n", ago(e.LastPublished))
+			} else {
+				fmt.Fprintln(stdout, "  published  none: the remote has no file for this machine")
+			}
+			if e.Unpublished > 0 {
+				fmt.Fprintf(stdout, "  NOT PUBLISHED: %s here that the remote does not have\n", plural(e.Unpublished, "record"))
+			}
 		}
 		if len(e.Recent) > 0 {
 			fmt.Fprintln(stdout, "  before that:")
