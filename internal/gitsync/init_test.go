@@ -259,6 +259,29 @@ func TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged(t *testing.T) {
 	}
 }
 
+// A clone whose git converts no line endings holds the journal's fleetd.json with
+// CRLF endings, saved by a Windows editor: git takes it for changed, so init
+// itself checks the journal's copy out over it, before the sync that follows
+// init: one that fails leaves no file git takes for changed.
+func TestInitChecksOutAFleetdJsonGitSeesAsChangedBeforeAnySync(t *testing.T) {
+	t.Parallel()
+	remote := emptyRemote(t)
+	mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "first"), Salt: "s"})
+	root := t.TempDir()
+	dir := filepath.Join(root, "journal")
+	run(t, root, "-c", "core.autocrlf=false", "clone", "--quiet", "--config", "core.autocrlf=false", remote, dir)
+	path := filepath.Join(dir, FleetFile)
+	data := readFile(t, path)
+	write(t, path, strings.ReplaceAll(data, "\n", "\r\n"))
+	mustInit(t, InitOptions{URL: remote, Dir: dir})
+	if got := readFile(t, path); got != data {
+		t.Fatalf("after init fleetd.json holds %q, want git's copy %q", got, data)
+	}
+	if status := run(t, dir, "status", "--porcelain"); status != "" {
+		t.Fatalf("git status after init:\n%s", status)
+	}
+}
+
 func TestInitRefusesARepositoryThatIsNotAJournal(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
