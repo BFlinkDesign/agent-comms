@@ -1917,6 +1917,23 @@ func TestAnEditMadeByHandUnderIgnoreStatIsKept(t *testing.T) {
 	}
 }
 
+// A sync keeps this host's index entry equal to the remote's copy, so that `git
+// status` shows exactly the records not yet published. Under a person's
+// core.ignoreStat=true, git would mark the entry unchanged as it writes it, and
+// `git status` would show none.
+func TestGitStatusShowsTheRecordsNotYetPublishedUnderIgnoreStat(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "core.ignoreStat", "true")
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:2"}`)
+	if status := run(t, a, "status", "--porcelain"); status != "M host-a.jsonl" {
+		t.Fatalf("git status with a record not yet published is %q, want host-a.jsonl modified", status)
+	}
+}
+
 // git asks a person for credentials through GIT_ASKPASS, else core.askPass, else
 // SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says, and an editor's terminal sets
 // GIT_ASKPASS to a dialog of its own: a sync, a hook's included, would wait for a
@@ -1979,6 +1996,109 @@ func TestPackingKeepsWhatASyncDeletedWhateverAPersonsGitSays(t *testing.T) {
 	cmd.Dir = a
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("the gc a sync ran pruned the staged file's content at once (%v: %s)", err, strings.TrimSpace(string(out)))
+	}
+}
+
+// git 2.54 runs hooks a configuration names but has no switch for a whole event,
+// which git 2.55 added; a version that cannot be read is taken for git 2.54's.
+func TestOnlyGit254NeedsEachNamedHookSwitchedOff(t *testing.T) {
+	t.Parallel()
+	for version, want := range map[string]bool{
+		"git version 2.54.0\n":                  true,
+		"git version 2.54.0.windows.3\n":        true,
+		"git version 2.55.0\n":                  false,
+		"git version 2.56.0.windows.1\n":        false,
+		"git version 2.43.0\n":                  false,
+		"git version 2.39.5 (Apple Git-154)\n":  false,
+		"git version 3.0.0\n":                   false,
+		"":                                      true,
+		"git: 'version' is not a git command\n": true,
+	} {
+		if got := needsNamedHooksOff(version); got != want {
+			t.Errorf("needsNamedHooksOff(%q) = %v, want %v", version, got, want)
+		}
+	}
+}
+
+// On git 2.54, whose switch for a whole hook event does not exist, every git
+// command a sync runs switches off by name each hook a person's configuration
+// names. Not parallel: it puts a git that logs its arguments first on PATH and
+// says the git there is 2.54.
+func TestEverySyncCommandSwitchesOffEachHookAPersonsGitNames(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	requireGit(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := gitRunsNamedHooksUnswitched
+	gitRunsNamedHooksUnswitched = func() bool { return true }
+	t.Cleanup(func() { gitRunsNamedHooksUnswitched = saved })
+	_, m := newFleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "hook.audit.event", "post-index-change")
+	run(t, a, "config", "hook.audit.command", "true")
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "args")
+	write(t, filepath.Join(bin, "git"), "#!/bin/sh\necho \"$*\" >> '"+log+"'\nexec '"+real+"' \"$@\"\n")
+	if err := os.Chmod(filepath.Join(bin, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	mustSync(t, options(a, "host-a"))
+	ran := 0
+	for _, line := range strings.Split(strings.TrimSpace(readFile(t, log)), "\n") {
+		if strings.Contains(line, " update-index ") {
+			ran++
+			if !strings.Contains(line, "hook.audit.enabled=false") {
+				t.Fatalf("a sync ran git without switching off the hook the person's git names: git %s", line)
+			}
+		}
+	}
+	if ran == 0 {
+		t.Fatal("the sync ran no update-index; the test needs a command that changes the index")
+	}
+}
+
+// Under a person's core.ignoreStat=true, the person's own git marks a file it
+// checks out unchanged again after init, as `git checkout -- <file>`, which
+// AGENTS.md advises for a rewritten file, does: an edit made by hand then is still
+// kept, and named, when the remote changes the file.
+func TestAnEditMadeByHandAfterThePersonsGitMarkedTheFileIsKept(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 2)
+	a, admin := m[0], m[1]
+	run(t, a, "config", "core.ignoreStat", "true")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v2\n") })
+	mustSync(t, options(a, "host-a"))
+	write(t, filepath.Join(a, "README.md"), "scratch\n")
+	run(t, a, "checkout", "--", "README.md")
+	write(t, filepath.Join(a, "README.md"), "v2\nedited on this machine\n")
+	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v3\n") })
+	res := mustSync(t, options(a, "host-a"))
+	if got := readFile(t, filepath.Join(a, "README.md")); got != "v2\nedited on this machine\n" || !slices.Contains(res.Kept, "README.md") {
+		t.Fatalf("README.md edited by hand is %q after the sync, kept %v; want the edit kept and named", got, res.Kept)
+	}
+}
+
+// git refuses GIT_ICASE_PATHSPECS or GIT_GLOB_PATHSPECS, which a person may
+// export, beside fleetd's own GIT_LITERAL_PATHSPECS. Not parallel: it sets the
+// environment.
+func TestASyncPublishesWhateverPathspecVariablesAPersonsEnvironmentSets(t *testing.T) {
+	requireGit(t)
+	for _, v := range []string{"GIT_ICASE_PATHSPECS", "GIT_GLOB_PATHSPECS"} {
+		t.Run(v, func(t *testing.T) {
+			_, m := newFleet(t, 1)
+			a := m[0]
+			t.Setenv(v, "1")
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+			if res, err := Sync(context.Background(), options(a, "host-a")); err != nil || res.Published != 1 {
+				t.Fatalf("sync with %s=1 = %+v, %v; want the record published", v, res, err)
+			}
+		})
 	}
 }
 

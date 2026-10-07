@@ -185,10 +185,11 @@ func TestInitRefusesJSONLinesDataAndDirectories(t *testing.T) {
 // neither may use its own git's default: the remote's, else main.
 func TestInitStartsAnEmptyJournalOnTheRemotesBranchNotThisMachinesDefault(t *testing.T) {
 	remote := emptyRemote(t)
+	// A server that does not advertise an empty repository's unborn HEAD, as some
+	// do not, leaves the clone to fall back to this machine's default.
+	run(t, t.TempDir(), "--git-dir", remote, "config", "lsrefs.unborn", "ignore")
 	config := filepath.Join(t.TempDir(), "gitconfig")
-	// Protocol v0 does not advertise an empty repository's unborn HEAD, as some
-	// servers do not, so the clone falls back to this machine's default.
-	write(t, config, "[init]\n\tdefaultBranch = master\n[protocol]\n\tversion = 0\n")
+	write(t, config, "[init]\n\tdefaultBranch = master\n")
 	t.Setenv("GIT_CONFIG_GLOBAL", config)
 	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal"), Salt: "s"})
 	if res.Branch != "main" {
@@ -306,6 +307,23 @@ func TestInitClearsWhatAnOlderGitMarkedUnchanged(t *testing.T) {
 	res := mustSync(t, options(c, "host-c"))
 	if got := readFile(t, filepath.Join(c, "README.md")); got != "v1\nedited on this machine\n" || !slices.Contains(res.Kept, "README.md") {
 		t.Fatalf("README.md edited by hand is %q after the sync, kept %v; want the edit kept and named", got, res.Kept)
+	}
+}
+
+// A person's protocol.version=0 hides an empty repository's named default from
+// git: init still starts the journal there. Not parallel: it sets the
+// environment, as the person's global configuration would.
+func TestInitStartsAnEmptyJournalOnTheNamedDefaultWhateverProtocolAPersonsGitSpeaks(t *testing.T) {
+	requireGit(t)
+	root := t.TempDir()
+	remote := filepath.Join(root, "journal.git")
+	run(t, root, "init", "--quiet", "--bare", "--initial-branch=trunk", remote)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.version")
+	t.Setenv("GIT_CONFIG_VALUE_0", "0")
+	res := mustInit(t, InitOptions{URL: remote, Dir: filepath.Join(t.TempDir(), "journal"), Salt: "s"})
+	if res.Branch != "trunk" {
+		t.Fatalf("started branch %q under protocol.version=0, want trunk, the repository's named default", res.Branch)
 	}
 }
 

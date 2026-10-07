@@ -152,9 +152,11 @@ changing any of them):
 - A person's git configuration reaches every git command fleetd runs, and the tests run with none: an
   empty global config and no system config, so not even Git for Windows' own `core.autocrlf=true`. A
   setting that changes what a command of fleetd's does is overridden in `gitConfig` (signing, push
-  options, the commit graph, `core.ignoreStat`, configured hooks), on the command (`--origin origin` on
-  init's clone, `gc.pruneExpire` on pack's gc) or in `gitEnv` (`GIT_ASKPASS`), and gets a test that
-  sets it, as `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf.
+  options, the commit graph, `core.ignoreStat`, configured hooks, `protocol.version`), on the command
+  (`--origin origin` on init's clone, `gc.pruneExpire` on pack's gc) or in `gitEnv` (`GIT_ASKPASS`,
+  the pathspec variables), and gets a test that sets it, as
+  `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf. Check each against the
+  oldest git that has it too: git 2.54 runs configured hooks but switches them off only by name.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:

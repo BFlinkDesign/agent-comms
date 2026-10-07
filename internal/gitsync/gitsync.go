@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BFlinkDesign/agent-comms/internal/journal"
@@ -98,13 +99,18 @@ var (
 // core.ignoreStat is off: on, git marks every entry it checks out or adds as
 // unchanged, this host's file at the end of every sync included, and `git status`
 // and `git diff` then miss every later change to the file, an edit made by hand or
-// another identity's records. Hooks a person's configuration names (hook.<name>
-// with an event and a command, which git 2.54 runs whatever core.hooksPath says)
-// are off for every event git has: hookEvents.
+// another identity's records. protocol.version is git's default, 2, whatever a
+// person's configuration says: an older protocol does not tell init the branch
+// an empty repository names as its default, and git falls back to it by itself
+// with a server that speaks no other. Hooks a person's configuration names
+// (hook.<name> with an event and a command, which git 2.54 and later run whatever
+// core.hooksPath says) are off for every event git has: hookEvents, and on git
+// 2.54, which has no switch for a whole event, namedHooksOff.
 var gitConfig = append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
 	"-c", "diff.autoRefreshIndex=true", "-c", "fetch.writeCommitGraph=false",
-	"-c", "push.gpgSign=false", "-c", "push.pushOption=", "-c", "core.ignoreStat=false"}, hooksOff()...)
+	"-c", "push.gpgSign=false", "-c", "push.pushOption=", "-c", "core.ignoreStat=false",
+	"-c", "protocol.version=2"}, hooksOff()...)
 
 // hookEvents are the hook events githooks(5) lists, as of git 2.56. These settings
 // reach only this side of a push: the receiving side runs the remote's hooks, as
@@ -116,12 +122,75 @@ var hookEvents = []string{"applypatch-msg", "commit-msg", "fsmonitor-watchman", 
 	"pre-receive", "prepare-commit-msg", "proc-receive", "push-to-checkout", "reference-transaction",
 	"sendemail-validate", "update"}
 
-// hooksOff switches each of hookEvents off; git before 2.54 ignores the settings.
+// hooksOff switches each of hookEvents off. git 2.55 added the switch; an older
+// git ignores it.
 func hooksOff() []string {
 	var off []string
 	for _, event := range hookEvents {
 		off = append(off, "-c", "hook."+event+".enabled=false")
 	}
+	return off
+}
+
+// gitRunsNamedHooksUnswitched reports whether the git on PATH runs hooks a
+// configuration names but has no switch for a whole event: git 2.54, the first
+// to run such hooks. It is a variable so that a test can say yes for any git.
+var gitRunsNamedHooksUnswitched = sync.OnceValue(func() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "version")
+	cmd.Env = gitEnv()
+	cmd.WaitDelay = waitDelay
+	out, err := cmd.Output()
+	return err != nil || needsNamedHooksOff(string(out))
+})
+
+// needsNamedHooksOff reports whether git, by what `git version` printed, runs
+// hooks a configuration names but has no switch for a whole event. A version it
+// cannot read is taken for one that does.
+func needsNamedHooksOff(version string) bool {
+	v, ok := strings.CutPrefix(strings.TrimSpace(version), "git version ")
+	parts := strings.SplitN(v, ".", 3)
+	if !ok || len(parts) < 2 {
+		return true
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return true
+	}
+	minor, err := strconv.Atoi(parts[1])
+	return err != nil || (major == 2 && minor == 54)
+}
+
+// namedHooks caches namedHooksOff by directory.
+var namedHooks sync.Map
+
+// namedHooksOff switches off, by name, each hook the configuration of git run in
+// dir names, for a git that cannot switch off a whole event. A configuration git
+// cannot list leaves none to switch off; the command it runs fails as it would.
+func namedHooksOff(ctx context.Context, dir string) []string {
+	if v, ok := namedHooks.Load(dir); ok {
+		return v.([]string)
+	}
+	cmd := exec.CommandContext(ctx, "git", "config", "--name-only", "--get-regexp", `^hook\..*\.(command|event)$`)
+	cmd.Dir = dir
+	cmd.Env = gitEnv()
+	cmd.WaitDelay = waitDelay
+	out, err := cmd.Output()
+	if err != nil && !exitedWith(err, 1) {
+		return nil
+	}
+	var off []string
+	seen := map[string]bool{}
+	for _, key := range strings.Split(string(out), "\n") {
+		// "hook.<name>.<key>"; a name may hold dots of its own.
+		rest, ok := strings.CutPrefix(strings.TrimRight(key, "\r"), "hook.")
+		if i := strings.LastIndexByte(rest, '.'); ok && i > 0 && !seen[rest[:i]] {
+			seen[rest[:i]] = true
+			off = append(off, "-c", "hook."+rest[:i]+".enabled=false")
+		}
+	}
+	namedHooks.Store(dir, off)
 	return off
 }
 
@@ -146,6 +215,10 @@ var repositoryVariables = []string{
 // hook would otherwise date its journal commit years back.
 var commitDates = []string{"GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"}
 
+// pathspecVariables are dropped as well: git refuses either beside fleetd's own
+// GIT_LITERAL_PATHSPECS=1, and fails every command that takes a path.
+var pathspecVariables = []string{"GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"}
+
 // identity is who fleetd's journal commits are by. It is not the person's: a
 // PC's git identity may be missing, which fails commit-tree, or a private
 // address GitHub refuses to publish (push declined, GH007), and it does not
@@ -164,6 +237,7 @@ func gitEnv() []string {
 		name, _, _ := strings.Cut(kv, "=")
 		if slices.ContainsFunc(repositoryVariables, func(v string) bool { return strings.EqualFold(v, name) }) ||
 			slices.ContainsFunc(commitDates, func(v string) bool { return strings.EqualFold(v, name) }) ||
+			slices.ContainsFunc(pathspecVariables, func(v string) bool { return strings.EqualFold(v, name) }) ||
 			slices.ContainsFunc(identity, func(v string) bool { return strings.EqualFold(v[:strings.IndexByte(v, '=')], name) }) {
 			continue
 		}
@@ -193,7 +267,11 @@ var runGitTree = runTree
 // Windows. A child that still holds git's output open is cut off after a short
 // delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-	full := append(slices.Clone(gitConfig), args...)
+	full := slices.Clone(gitConfig)
+	if gitRunsNamedHooksUnswitched() {
+		full = append(full, namedHooksOff(ctx, dir)...)
+	}
+	full = append(full, args...)
 	var stdout, stderr bytes.Buffer
 	// A fresh command each time runTree asks, with fresh input and empty output:
 	// on Windows git may have to be started a second time.
@@ -764,6 +842,12 @@ func bringIn(g git, localRef, local, tip, own string) (kept []string, gone bool,
 		}
 	}
 	if len(paths) > 0 {
+		// A person's own git marks a file unchanged under core.ignoreStat when it
+		// checks the file out, as `git checkout -- <file>` does: `git status` would
+		// miss an edit made since, and the checkout below would overwrite it.
+		if err := forgetAssumedUnchanged(g); err != nil {
+			return nil, false, err
+		}
 		changed, err := locallyChanged(g, paths)
 		if err != nil {
 			return nil, false, err
