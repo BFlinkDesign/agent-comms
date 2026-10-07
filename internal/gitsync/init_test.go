@@ -303,6 +303,11 @@ func TestInitClearsWhatAnOlderGitMarkedUnchanged(t *testing.T) {
 	run(t, c, "update-index", "--assume-unchanged", "README.md")
 	mustInit(t, InitOptions{URL: remote, Dir: c})
 	write(t, filepath.Join(c, "README.md"), "v1\nedited on this machine\n")
+	// Before any sync, `git status` shows the edit, as `fleetd where` and a person
+	// would look.
+	if status := run(t, c, "status", "--porcelain", "--", "README.md"); status != "M README.md" {
+		t.Fatalf("git status after init with README.md edited by hand is %q, want it modified", status)
+	}
 	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "v2\n") })
 	res := mustSync(t, options(c, "host-c"))
 	if got := readFile(t, filepath.Join(c, "README.md")); got != "v1\nedited on this machine\n" || !slices.Contains(res.Kept, "README.md") {

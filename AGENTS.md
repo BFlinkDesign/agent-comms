@@ -327,8 +327,8 @@ the same way: the clone is fleetd's. If Windows will
 not give git a job, or will not let fleetd resume git inside one, git runs outside
 any job, git alone is killed on timeout, and the sync still returns within two
 seconds of the deadline. Prompts and askpass dialogs, hooks (those a person's git
-configuration names included: on git 2.54, which has no switch for a whole hook
-event, each by its name), commit and push signing, push options and
+configuration names included, each switched off by its name as well as by its
+event), commit and push signing, push options and
 core.fsmonitor are all disabled, so a sync never waits for input, starts no
 daemon, and sends the remote nothing it may refuse. `core.ignoreStat` is off for
 fleetd's commands, so they mark no file unchanged; init clears the marks an older

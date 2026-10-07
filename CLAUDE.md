@@ -156,7 +156,10 @@ changing any of them):
   (`--origin origin` on init's clone, `gc.pruneExpire` on pack's gc) or in `gitEnv` (`GIT_ASKPASS`,
   the pathspec variables), and gets a test that sets it, as
   `TestInitPutsBackAFleetdJsonGitCheckedOutWithCRLFAsUnchanged` sets autocrlf. Check each against the
-  oldest git that has it too: git 2.54 runs configured hooks but switches them off only by name.
+  oldest git that has it too: git 2.54 runs configured hooks but switches them off only by name, and
+  git 2.55 and later take `hook.<event>.enabled=false` for one hook's switch once a configuration
+  names `hook.<event>.command`. git splits `-c` at its first `=` and `--config-env` at its last, so a
+  key that can hold `=`, such as one with a hook's name in it, goes in `--config-env`.
 - Releases come only from `.github/workflows/release.yml` (Run workflow on `main`); never tag by hand.
 
 **Windows PowerShell 5.1 traps** that the `install-script` job caught and Linux CI cannot see:

@@ -640,7 +640,7 @@ func repoAndBranch(cwd string, wait time.Duration) (repo, branch string, err err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
-	out, err := gitsync.Git(ctx, "", nil, "-C", cwd, "rev-parse", "--show-toplevel")
+	out, err := gitsync.Query(ctx, "", "-C", cwd, "rev-parse", "--show-toplevel")
 	if err != nil {
 		switch {
 		case errors.Is(err, osexec.ErrNotFound):
@@ -665,7 +665,7 @@ func repoAndBranch(cwd string, wait time.Duration) (repo, branch string, err err
 		repo = ""
 	}
 	// Empty on a detached HEAD, which is then recorded without a branch.
-	out, err = gitsync.Git(ctx, "", nil, "-C", cwd, "branch", "--show-current")
+	out, err = gitsync.Query(ctx, "", "-C", cwd, "branch", "--show-current")
 	if err != nil {
 		if ctx.Err() != nil {
 			return repo, "", fmt.Errorf("git did not name the branch at %s within %s", cwd, wait)

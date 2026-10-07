@@ -102,7 +102,7 @@ type publication struct {
 func publications(dir string, stems []string) (map[string]publication, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	top, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--show-toplevel")
+	top, err := gitsync.Query(ctx, dir, "rev-parse", "--show-toplevel")
 	if err != nil || !gitsync.SameDir(strings.TrimRight(top, "\r\n"), dir) {
 		return nil, false
 	}
@@ -114,12 +114,12 @@ func publications(dir string, stems []string) (map[string]publication, bool) {
 			want = "refs/remotes/origin/" + recorded
 		}
 	}
-	up, err := gitsync.Git(ctx, dir, nil, "rev-parse", "--verify", "--quiet", want)
+	up, err := gitsync.Query(ctx, dir, "rev-parse", "--verify", "--quiet", want)
 	if up = strings.TrimSpace(up); err != nil || up == "" {
 		return nil, false
 	}
 	out := map[string]publication{}
-	listing, err := gitsync.Git(ctx, dir, nil, "ls-tree", "-z", up)
+	listing, err := gitsync.Query(ctx, dir, "ls-tree", "-z", up)
 	if err != nil {
 		return out, true
 	}
@@ -134,7 +134,7 @@ func publications(dir string, stems []string) (map[string]publication, bool) {
 		name := stem + ".jsonl"
 		var remote []byte
 		if oid, ok := blobs[name]; ok {
-			blob, err := gitsync.Git(ctx, dir, nil, "cat-file", "blob", oid)
+			blob, err := gitsync.Query(ctx, dir, "cat-file", "blob", oid)
 			if err != nil {
 				continue
 			}

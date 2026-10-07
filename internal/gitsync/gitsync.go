@@ -104,8 +104,8 @@ var (
 // an empty repository names as its default, and git falls back to it by itself
 // with a server that speaks no other. Hooks a person's configuration names
 // (hook.<name> with an event and a command, which git 2.54 and later run whatever
-// core.hooksPath says) are off for every event git has: hookEvents, and on git
-// 2.54, which has no switch for a whole event, namedHooksOff.
+// core.hooksPath says) are off for every event git has, hookEvents, and each by
+// its name, namedHooksOff.
 var gitConfig = append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull,
 	"-c", "core.fsmonitor=", "-c", "gc.auto=0", "-c", "maintenance.auto=false",
 	"-c", "diff.autoRefreshIndex=true", "-c", "fetch.writeCommitGraph=false",
@@ -132,62 +132,42 @@ func hooksOff() []string {
 	return off
 }
 
-// gitRunsNamedHooksUnswitched reports whether the git on PATH runs hooks a
-// configuration names but has no switch for a whole event: git 2.54, the first
-// to run such hooks. It is a variable so that a test can say yes for any git.
-var gitRunsNamedHooksUnswitched = sync.OnceValue(func() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "version")
-	cmd.Env = gitEnv()
-	cmd.WaitDelay = waitDelay
-	out, err := cmd.Output()
-	return err != nil || needsNamedHooksOff(string(out))
-})
-
-// needsNamedHooksOff reports whether git, by what `git version` printed, runs
-// hooks a configuration names but has no switch for a whole event. A version it
-// cannot read is taken for one that does.
-func needsNamedHooksOff(version string) bool {
-	v, ok := strings.CutPrefix(strings.TrimSpace(version), "git version ")
-	parts := strings.SplitN(v, ".", 3)
-	if !ok || len(parts) < 2 {
-		return true
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return true
-	}
-	minor, err := strconv.Atoi(parts[1])
-	return err != nil || (major == 2 && minor == 54)
-}
+// hookOffVariable holds false, for the --config-env namedHooksOff switches each
+// hook off with: git splits -c at its first '=', which a hook's name may hold,
+// and --config-env at its last.
+const hookOffVariable = "FLEETD_HOOK_ENABLED"
 
 // namedHooks caches namedHooksOff by directory.
 var namedHooks sync.Map
 
 // namedHooksOff switches off, by name, each hook the configuration of git run in
-// dir names, for a git that cannot switch off a whole event. A configuration git
-// cannot list leaves none to switch off; the command it runs fails as it would.
+// dir names. hookEvents' switches are not enough: git 2.54 has none for a whole
+// event, and git 2.55 and later take hook.<event>.enabled=false for one hook's
+// switch once a configuration names a command under the event's own name. The
+// lookup switches a hook off the same way itself, which git before 2.31, knowing
+// no --config-env, refuses: such a git runs no hook a configuration names, and
+// would refuse every command these switches went with. The lookup ends with ctx,
+// as the command it is for does. An answer git gave in time is kept for the
+// commands after it; without one, none is switched off and the next command asks
+// again. A configuration git cannot list leaves none to switch off, the command
+// failing as it would.
 func namedHooksOff(ctx context.Context, dir string) []string {
 	if v, ok := namedHooks.Load(dir); ok {
 		return v.([]string)
 	}
-	cmd := exec.CommandContext(ctx, "git", "config", "--name-only", "--get-regexp", `^hook\..*\.(command|event)$`)
-	cmd.Dir = dir
-	cmd.Env = gitEnv()
-	cmd.WaitDelay = waitDelay
-	out, err := cmd.Output()
-	if err != nil && !exitedWith(err, 1) {
+	out, err := gitWith(ctx, dir, nil, []string{"--config-env=hook.fleetd.enabled=" + hookOffVariable},
+		[]string{"config", "--name-only", "--get-regexp", `^hook\..*\.(command|event)$`})
+	if ctx.Err() != nil || (err != nil && !isExit(err)) {
 		return nil
 	}
 	var off []string
 	seen := map[string]bool{}
-	for _, key := range strings.Split(string(out), "\n") {
+	for _, key := range strings.Split(out, "\n") {
 		// "hook.<name>.<key>"; a name may hold dots of its own.
 		rest, ok := strings.CutPrefix(strings.TrimRight(key, "\r"), "hook.")
 		if i := strings.LastIndexByte(rest, '.'); ok && i > 0 && !seen[rest[:i]] {
 			seen[rest[:i]] = true
-			off = append(off, "-c", "hook."+rest[:i]+".enabled=false")
+			off = append(off, "--config-env=hook."+rest[:i]+".enabled="+hookOffVariable)
 		}
 	}
 	namedHooks.Store(dir, off)
@@ -247,7 +227,8 @@ func gitEnv() []string {
 	// else core.askPass, else SSH_ASKPASS, whatever GIT_TERMINAL_PROMPT says, and
 	// Git Bash sets SSH_ASKPASS to a dialog, as an editor's terminal sets
 	// GIT_ASKPASS to one of its own. An empty value names none of the three.
-	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1", "GIT_ASKPASS=")
+	env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_LITERAL_PATHSPECS=1", "GIT_ASKPASS=",
+		hookOffVariable+"=false")
 	return append(env, identity...)
 }
 
@@ -267,11 +248,20 @@ var runGitTree = runTree
 // Windows. A child that still holds git's output open is cut off after a short
 // delay rather than holding the sync open.
 func Git(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
-	full := slices.Clone(gitConfig)
-	if gitRunsNamedHooksUnswitched() {
-		full = append(full, namedHooksOff(ctx, dir)...)
-	}
-	full = append(full, args...)
+	return gitWith(ctx, dir, stdin, namedHooksOff(ctx, dir), args)
+}
+
+// Query runs, as Git does, a git command that writes nothing and so runs no hook,
+// such as rev-parse, ls-tree, cat-file or branch --show-current, without first
+// asking git which hooks the configuration names: one process fewer, for a hook
+// that gives git half a second.
+func Query(ctx context.Context, dir string, args ...string) (string, error) {
+	return gitWith(ctx, dir, nil, nil, args)
+}
+
+// gitWith runs git in dir with gitConfig's settings, then extra, then args.
+func gitWith(ctx context.Context, dir string, stdin []byte, extra, args []string) (string, error) {
+	full := slices.Concat(gitConfig, extra, args)
 	var stdout, stderr bytes.Buffer
 	// A fresh command each time runTree asks, with fresh input and empty output:
 	// on Windows git may have to be started a second time.
@@ -501,7 +491,9 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		return res, noUpstream(g, recorded)
 	}
 	ssh := batchSSH(g)
-	var tip string
+	// tip is where the sync leaves the branch; fetched, the remote tip it last
+	// fetched, which this host's commit, when there is one, goes on top of.
+	var tip, fetched string
 	for res.Attempts = 1; ; res.Attempts++ {
 		if err := fetchOrigin(g); err != nil {
 			return res, err
@@ -513,6 +505,7 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 			}
 			return res, goneError(g, localRef, branch)
 		}
+		fetched = remoteTip
 		// Nor while the journal directory lacks the journal's FleetFile: deleted,
 		// not yet written by an init stopped short, or never there, as in a clone
 		// set up before the journal had one. This machine's records then go under
@@ -531,13 +524,16 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 					"a sync files them under the fleet's", ErrNoFleetFile, branch, g.dir)
 			}
 		}
-		if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
-			if ctx.Err() != nil {
-				return res, err
+		// A remote that has not moved since the last sync holds every commit here.
+		if local != remoteTip {
+			if _, err := g.line("merge-base", "--is-ancestor", local, remoteTip); err != nil {
+				if ctx.Err() != nil {
+					return res, err
+				}
+				return res, fmt.Errorf("%w: %s. If they are not wanted, or the remote was rewritten, "+
+					"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
+					"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
 			}
-			return res, fmt.Errorf("%w: %s. If they are not wanted, or the remote was rewritten, "+
-				"`git -C %s reset --soft '@{upstream}'` makes the clone follow the remote again and keeps "+
-				"this machine's unpublished records for the next sync", ErrLocalCommits, o.Dir, o.Dir)
 		}
 		commit, published, err := snapshotCommit(g, remoteTip, branch, own, o.File, o.Message)
 		if err != nil {
@@ -566,13 +562,14 @@ func Sync(ctx context.Context, o Options) (Result, error) {
 		}
 	}
 
-	received, err := g.line("rev-list", "--count", local+".."+tip)
-	if err != nil {
-		return res, err
-	}
-	res.Received, _ = strconv.Atoi(received)
-	if res.Published > 0 {
-		res.Received-- // this host's own commit
+	// The commits other machines published since this clone's last sync: none
+	// when the remote had not moved.
+	if fetched != local {
+		received, err := g.line("rev-list", "--count", local+".."+fetched)
+		if err != nil {
+			return res, err
+		}
+		res.Received, _ = strconv.Atoi(received)
 	}
 	if res.Kept, res.FleetFileGone, err = bringIn(g, localRef, local, tip, own); err != nil {
 		return res, err

@@ -7,6 +7,7 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -129,5 +130,94 @@ func TestHookAsAProcessExitsZeroAndPrintsNothing(t *testing.T) {
 				t.Errorf("the log gained %q, want %q", added, c.wantLog)
 			}
 		})
+	}
+}
+
+// slowGit puts first on PATH a git that takes five seconds to start, as one on a
+// loaded machine, or one a scanner holds up, can.
+func slowGit(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed")
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nsleep 5\nexec '"+real+"' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// Codex kills its SessionEnd hook after a second unless configured otherwise, and
+// the hook gives git half a second to name the repository and branch, so that a
+// slow git costs the record its repo and branch, not the record. Not parallel: it
+// puts a slow git first on PATH.
+func TestACodexSessionEndHookRecordsWithinItsBoundWhateverGitTakesToStart(t *testing.T) {
+	hookEnv(t)
+	journal := filepath.Join(t.TempDir(), "journal")
+	cwd := workRepo(t, "widget-shop", "main")
+	slowGit(t)
+	start := time.Now()
+	_, stderr, code := runFleetd(t, event(t, docCodexSessionEnd, map[string]any{"cwd": cwd}), nil,
+		"hook", "codex", "--dir", journal, "--salt", "s")
+	took := time.Since(start)
+	if records := len(hookRecords(t, journal)); code != 0 || records != 1 || took >= 3*time.Second {
+		t.Fatalf("Codex's SessionEnd hook with a git slow to start exited %d after %s with %d records; want one "+
+			"record within the half second it gives git, far short of the 5 s git takes to start\nstderr: %s",
+			code, took.Round(10*time.Millisecond), records, stderr)
+	}
+}
+
+// Every git command a sync runs ends at its --timeout, a git slow to start
+// included, and so does the sync. Not parallel: it puts a slow git first on PATH.
+func TestASyncWithAGitSlowToStartEndsAtItsTimeout(t *testing.T) {
+	remote := emptyJournalRemote(t)
+	dir := filepath.Join(t.TempDir(), "journal")
+	if _, _, err := exec(t, "init", "--dir", dir, "--salt", "s", remote); err != nil {
+		t.Fatal(err)
+	}
+	slowGit(t)
+	start := time.Now()
+	_, stderr, code := runFleetd(t, "", nil, "sync", "--dir", dir, "--timeout", "1s")
+	if took := time.Since(start); code == 0 || took >= 3*time.Second {
+		t.Fatalf("fleetd sync --timeout 1s with a git slow to start exited %d after %s; want it to fail at its "+
+			"timeout, far short of the 5 s git takes to start\nstderr: %s", code, took.Round(10*time.Millisecond), stderr)
+	}
+}
+
+// A hook that records a turn asks git twice, for the repository and for the
+// branch, and nothing more: it gives git half a second. Not parallel: it puts a
+// git that logs its arguments first on PATH.
+func TestAHookAsksGitOnlyForTheRepositoryAndBranch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	hookEnv(t)
+	journal := filepath.Join(t.TempDir(), "journal")
+	cwd := workRepo(t, "widget-shop", "main")
+	real, err := osexec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "args")
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\necho \"$*\" >> '"+log+"'\nexec '"+real+"' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, stderr, code := runFleetd(t, event(t, docClaudeStop, map[string]any{"cwd": cwd}), nil,
+		"hook", "claude", "--dir", journal, "--salt", "s"); code != 0 || len(hookRecords(t, journal)) != 1 {
+		t.Fatalf("the hook exited %d with %d records\nstderr: %s", code, len(hookRecords(t, journal)), stderr)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(got) != 2 || !strings.HasSuffix(got[0], " rev-parse --show-toplevel") || !strings.HasSuffix(got[1], " branch --show-current") {
+		t.Fatalf("the hook ran git %d times: %q; want once for the repository and once for the branch", len(got), got)
 	}
 }

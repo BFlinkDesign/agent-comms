@@ -39,6 +39,12 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("GIT_CONFIG_GLOBAL", cfg)
 	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	if _, err := exec.LookPath("git"); err == nil {
+		fleetTemplate = filepath.Join(dir, "fleet")
+		if err := buildFleetTemplate(fleetTemplate); err != nil {
+			panic(err)
+		}
+	}
 	code := m.Run()
 	// Tests running in parallel share that configuration: one that wrote it
 	// would change what git does in every other.
@@ -76,26 +82,94 @@ func fleet(t *testing.T, n int) (remote string, machines []string) {
 	return newFleet(t, n)
 }
 
-// newFleet is fleet for a subtest, whose parent has called requireGit.
+// newFleet is fleet for a subtest, whose parent has called requireGit. Each
+// fleet is a copy of fleetTemplate, each clone's origin pointed at the copy:
+// building one takes a score of git processes, which on a slow Windows runner
+// cost a tenth of a second each.
 func newFleet(t *testing.T, n int) (remote string, machines []string) {
 	t.Helper()
 	root := t.TempDir()
 	remote = filepath.Join(root, "remote.git")
-	run(t, root, "init", "--quiet", "--bare", "--initial-branch=main", remote)
-	seed := filepath.Join(root, "seed")
-	run(t, root, "clone", "--quiet", remote, seed)
-	identify(t, seed)
-	write(t, filepath.Join(seed, "README.md"), "one file per machine\n")
-	run(t, seed, "add", ".")
-	run(t, seed, "commit", "--quiet", "-m", "start the journal")
-	run(t, seed, "push", "--quiet", "-u", "origin", "main")
+	copyTree(t, filepath.Join(fleetTemplate, "remote.git"), remote)
 	for i := range n {
 		dir := filepath.Join(root, fmt.Sprintf("machine-%c", 'a'+i))
-		run(t, root, "clone", "--quiet", remote, dir)
-		identify(t, dir)
+		copyTree(t, filepath.Join(fleetTemplate, "machine"), dir)
+		run(t, dir, "config", "remote.origin.url", remote)
 		machines = append(machines, dir)
 	}
 	return remote, machines
+}
+
+// fleetTemplate holds a remote with the journal's first commit and a machine's
+// clone of it, identified, as a fleet starts. TestMain builds it before any test
+// runs, so that no test's environment can change it.
+var fleetTemplate string
+
+func buildFleetTemplate(root string) error {
+	remote, seed, machine := filepath.Join(root, "remote.git"), filepath.Join(root, "seed"), filepath.Join(root, "machine")
+	git := func(dir string, args ...string) func() error {
+		return func() error {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
+			}
+			return nil
+		}
+	}
+	for _, step := range []func() error{
+		func() error { return os.MkdirAll(root, 0o755) },
+		git(root, "init", "--quiet", "--bare", "--initial-branch=main", remote),
+		git(root, "clone", "--quiet", remote, seed),
+		git(seed, "config", "user.name", "fleet test"),
+		git(seed, "config", "user.email", "fleet@example.invalid"),
+		func() error {
+			return os.WriteFile(filepath.Join(seed, "README.md"), []byte("one file per machine\n"), 0o644)
+		},
+		git(seed, "add", "."),
+		git(seed, "commit", "--quiet", "-m", "start the journal"),
+		git(seed, "push", "--quiet", "-u", "origin", "main"),
+		git(root, "clone", "--quiet", remote, machine),
+		git(machine, "config", "user.name", "fleet test"),
+		git(machine, "config", "user.email", "fleet@example.invalid"),
+	} {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyTree copies the directory from to to, which must not exist, file modes
+// and all, but for git's sample hooks, which never run: on Windows every file
+// copied costs a create.
+func copyTree(t *testing.T, from, to string) {
+	t.Helper()
+	err := filepath.WalkDir(from, func(path string, d os.DirEntry, err error) error {
+		if err != nil || strings.HasSuffix(path, ".sample") {
+			return err
+		}
+		rel, err := filepath.Rel(from, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(to, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dest, info.Mode().Perm()|0o700)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, data, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func identify(t *testing.T, dir string) {
@@ -976,7 +1050,7 @@ func TestAPruningFetchLeavesTheClonesTagsAlone(t *testing.T) {
 func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 	t.Parallel()
 	requireGit(t)
-	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "merge-base", "prepare",
+	for _, at := range []string{"--show-toplevel", "@{u}", "symbolic-ref", "refs/remotes/origin/main", "moved merge-base", "prepare",
 		"detached symbolic-ref", "by hand for-each-ref", "gone symbolic-ref", "gone for-each-ref",
 		"gone refs/remotes/origin/main", "gone fetch", "other symbolic-ref"} {
 		t.Run(at, func(t *testing.T) {
@@ -1002,6 +1076,14 @@ func TestASyncThatRunsOutOfTimeSaysSoWhereverItStops(t *testing.T) {
 			case "by":
 				run(t, m[0], "switch", "--quiet", "-c", "local-only")
 				at = strings.TrimPrefix(call, "hand ")
+			case "moved":
+				// Only a remote that moved since the last sync is asked whether it holds
+				// the clone's commit.
+				tree := run(t, remote, "rev-parse", "main^{tree}")
+				commit := run(t, remote, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", tree,
+					"-p", "main", "-m", "published elsewhere")
+				run(t, remote, "update-ref", "refs/heads/main", commit)
+				at = call
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -1869,33 +1951,55 @@ func TestASyncPublishesWhateverAPersonsGitSaysToPushWith(t *testing.T) {
 	}
 }
 
-// git 2.54 runs a hook a person's configuration names, hook.<name> with an event
-// and a command, whatever core.hooksPath says. One the person's git names, which
-// would fail every sync, runs inside none. On an older git no such hook runs, and
-// this passes as it is.
+// git 2.54 and later run a hook a person's configuration names, hook.<name> with
+// an event and a command, whatever core.hooksPath says. One the person's git
+// names, which would fail every sync, runs inside none, whatever its name: one
+// holding '=', which git splits -c at; one holding a dot; or one beside a command
+// named under an event's own name, which makes git 2.55 and later take
+// hook.<event>.enabled=false for that command's switch alone. On an older git no
+// such hook runs, and this passes as it is.
 func TestASyncRunsNoHookAPersonsGitConfigurationNames(t *testing.T) {
-	t.Parallel()
-	_, m := fleet(t, 2)
-	a, admin := m[0], m[1]
-	ran := filepath.Join(t.TempDir(), "ran")
-	hook := filepath.Join(t.TempDir(), "hook")
-	write(t, hook, "#!/bin/sh\necho \"$1\" >> '"+filepath.ToSlash(ran)+"'\nexit 1\n")
-	if err := os.Chmod(hook, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The person's settings, in the clone's own config, as global ones would be.
-	for _, event := range []string{"reference-transaction", "post-checkout", "post-index-change"} {
-		run(t, a, "config", "hook.audit-"+event+".event", event)
-		run(t, a, "config", "hook.audit-"+event+".command", filepath.ToSlash(hook))
-	}
-	commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "changed by hand\n") })
-	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
-	res, err := Sync(context.Background(), options(a, "host-a"))
-	if err != nil || res.Published != 1 || res.Received != 1 {
-		t.Fatalf("sync beside hooks the person's git names = %+v, %v; want the record out and the change in", res, err)
-	}
-	if data, err := os.ReadFile(ran); err == nil {
-		t.Fatalf("hooks the person's git names ran inside the sync: %q", data)
+	requireGit(t)
+	events := []string{"reference-transaction", "post-checkout", "post-index-change"}
+	for _, tc := range []struct {
+		name string
+		hook func(event string) string
+		also func(a, event string)
+	}{
+		{"plain names", func(event string) string { return "audit-" + event }, nil},
+		{"a name holding =", func(event string) string { return "audit=" + event }, nil},
+		{"a name holding a dot", func(event string) string { return "team.audit-" + event }, nil},
+		{"a command named under the event's own name", func(event string) string { return "audit-" + event },
+			func(a, event string) { run(t, a, "config", "hook."+event+".command", "true") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, m := newFleet(t, 2)
+			a, admin := m[0], m[1]
+			ran := filepath.Join(t.TempDir(), "ran")
+			hook := filepath.Join(t.TempDir(), "hook")
+			write(t, hook, "#!/bin/sh\necho \"$1\" >> '"+filepath.ToSlash(ran)+"'\nexit 1\n")
+			if err := os.Chmod(hook, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// The person's settings, in the clone's own config, as global ones would be.
+			for _, event := range events {
+				run(t, a, "config", "hook."+tc.hook(event)+".event", event)
+				run(t, a, "config", "hook."+tc.hook(event)+".command", filepath.ToSlash(hook))
+				if tc.also != nil {
+					tc.also(a, event)
+				}
+			}
+			commitByHand(t, admin, func(dir string) { write(t, filepath.Join(dir, "README.md"), "changed by hand\n") })
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+			res, err := Sync(context.Background(), options(a, "host-a"))
+			if err != nil || res.Published != 1 || res.Received != 1 {
+				t.Fatalf("sync beside hooks the person's git names = %+v, %v; want the record out and the change in", res, err)
+			}
+			if data, err := os.ReadFile(ran); err == nil {
+				t.Fatalf("hooks the person's git names ran inside the sync: %q", data)
+			}
+		})
 	}
 }
 
@@ -1999,31 +2103,10 @@ func TestPackingKeepsWhatASyncDeletedWhateverAPersonsGitSays(t *testing.T) {
 	}
 }
 
-// git 2.54 runs hooks a configuration names but has no switch for a whole event,
-// which git 2.55 added; a version that cannot be read is taken for git 2.54's.
-func TestOnlyGit254NeedsEachNamedHookSwitchedOff(t *testing.T) {
-	t.Parallel()
-	for version, want := range map[string]bool{
-		"git version 2.54.0\n":                  true,
-		"git version 2.54.0.windows.3\n":        true,
-		"git version 2.55.0\n":                  false,
-		"git version 2.56.0.windows.1\n":        false,
-		"git version 2.43.0\n":                  false,
-		"git version 2.39.5 (Apple Git-154)\n":  false,
-		"git version 3.0.0\n":                   false,
-		"":                                      true,
-		"git: 'version' is not a git command\n": true,
-	} {
-		if got := needsNamedHooksOff(version); got != want {
-			t.Errorf("needsNamedHooksOff(%q) = %v, want %v", version, got, want)
-		}
-	}
-}
-
-// On git 2.54, whose switch for a whole hook event does not exist, every git
-// command a sync runs switches off by name each hook a person's configuration
-// names. Not parallel: it puts a git that logs its arguments first on PATH and
-// says the git there is 2.54.
+// Every git command a sync runs, other than the lookup of the names, switches off
+// by name each hook a person's configuration names, whatever git's version: git
+// 2.54 has no switch for a whole hook event. Not parallel: it puts a git that logs
+// its arguments first on PATH.
 func TestEverySyncCommandSwitchesOffEachHookAPersonsGitNames(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the git stand-in is a shell script")
@@ -2033,9 +2116,6 @@ func TestEverySyncCommandSwitchesOffEachHookAPersonsGitNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	saved := gitRunsNamedHooksUnswitched
-	gitRunsNamedHooksUnswitched = func() bool { return true }
-	t.Cleanup(func() { gitRunsNamedHooksUnswitched = saved })
 	_, m := newFleet(t, 1)
 	a := m[0]
 	run(t, a, "config", "hook.audit.event", "post-index-change")
@@ -2051,15 +2131,180 @@ func TestEverySyncCommandSwitchesOffEachHookAPersonsGitNames(t *testing.T) {
 	mustSync(t, options(a, "host-a"))
 	ran := 0
 	for _, line := range strings.Split(strings.TrimSpace(readFile(t, log)), "\n") {
-		if strings.Contains(line, " update-index ") {
-			ran++
-			if !strings.Contains(line, "hook.audit.enabled=false") {
-				t.Fatalf("a sync ran git without switching off the hook the person's git names: git %s", line)
-			}
+		if strings.Contains(line, " config --name-only --get-regexp ") {
+			continue
+		}
+		ran++
+		if !strings.Contains(line, " --config-env=hook.audit.enabled="+hookOffVariable+" ") {
+			t.Fatalf("a sync ran git without switching off the hook the person's git names: git %s", line)
 		}
 	}
-	if ran == 0 {
-		t.Fatal("the sync ran no update-index; the test needs a command that changes the index")
+	if ran < 10 {
+		t.Fatalf("the sync ran %d git commands besides the lookup; the test needs the whole sync", ran)
+	}
+}
+
+// A git before 2.31 knows no --config-env, and refuses every command that
+// carries one: a sync beside hooks a person's configuration names still
+// publishes there, such a git running none of them, and asks for the names once.
+// Not parallel: it puts such a git first on PATH.
+func TestAGitThatKnowsNoConfigEnvSyncsBesideHooksAPersonsGitNames(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	requireGit(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, m := newFleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "hook.audit.event", "post-index-change")
+	run(t, a, "config", "hook.audit.command", "true")
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "args")
+	write(t, filepath.Join(bin, "git"), "#!/bin/sh\necho \"$*\" >> '"+log+"'\nfor arg; do\n\tcase \"$arg\" in\n"+
+		"\t--config-env=*) echo \"unknown option: $arg\" >&2; exit 129;;\n\tesac\ndone\nexec '"+real+"' \"$@\"\n")
+	if err := os.Chmod(filepath.Join(bin, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+	if res, err := Sync(context.Background(), options(a, "host-a")); err != nil || res.Published != 1 {
+		t.Fatalf("sync on a git that knows no --config-env = %+v, %v; want the record published", res, err)
+	}
+	if n := strings.Count(readFile(t, log), " --get-regexp "); n != 1 {
+		t.Fatalf("the sync looked the hooks' names up %d times, want once", n)
+	}
+}
+
+// A lookup of the hooks' names that the deadline cut short is no answer: the next
+// command asks again, and switches them off. Not parallel: it puts a git that is
+// slow while the environment says so first on PATH.
+func TestALookupOfHookNamesTheDeadlineCutShortIsAskedAgain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	requireGit(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, m := newFleet(t, 1)
+	a := m[0]
+	run(t, a, "config", "hook.audit.event", "post-index-change")
+	run(t, a, "config", "hook.audit.command", "true")
+	bin := t.TempDir()
+	write(t, filepath.Join(bin, "git"), "#!/bin/sh\n[ -n \"$FLEETD_TEST_SLOW_GIT\" ] && sleep 5\nexec '"+real+"' \"$@\"\n")
+	if err := os.Chmod(filepath.Join(bin, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FLEETD_TEST_SLOW_GIT", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if off := namedHooksOff(ctx, a); off != nil {
+		t.Fatalf("a lookup the deadline cut short switched off %q", off)
+	}
+	t.Setenv("FLEETD_TEST_SLOW_GIT", "")
+	want := []string{"--config-env=hook.audit.enabled=" + hookOffVariable}
+	if off := namedHooksOff(context.Background(), a); !slices.Equal(off, want) {
+		t.Fatalf("the lookup after one the deadline cut short switched off %q, want %q", off, want)
+	}
+}
+
+// On git 2.55 and later each event's own switch keeps every hook a person's
+// configuration names for it from running, whatever the lookup of their names
+// saw: a configuration it could not see, such as one an include adds only on the
+// branch init moves HEAD to, or a key a later git reads. Query, which switches no
+// hook off by name, stands in for a command run past what the lookup saw. git 2.54
+// has no such switch, and an older git runs no such hook.
+func TestEachHookEventsOwnSwitchKeepsItsHooksOff(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 1)
+	a := m[0]
+	if strings.HasPrefix(run(t, a, "version"), "git version 2.54.") {
+		t.Skip("git 2.54 has no switch for a whole hook event")
+	}
+	ran := filepath.Join(t.TempDir(), "ran")
+	hook := filepath.Join(t.TempDir(), "hook")
+	write(t, hook, "#!/bin/sh\necho \"$1\" >> '"+filepath.ToSlash(ran)+"'\nexit 1\n")
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []string{"reference-transaction", "post-checkout", "post-index-change"} {
+		run(t, a, "config", "hook.audit-"+event+".event", event)
+		run(t, a, "config", "hook.audit-"+event+".command", filepath.ToSlash(hook))
+	}
+	// A ref moved, a file checked out, the index written.
+	for _, args := range [][]string{{"update-ref", "refs/heads/elsewhere", "HEAD"},
+		{"checkout", "--quiet", "HEAD", "--", "README.md"}, {"read-tree", "HEAD"}} {
+		if _, err := Query(context.Background(), a, args...); err != nil {
+			t.Fatalf("git %s beside hooks the person's git names: %v", strings.Join(args, " "), err)
+		}
+	}
+	if data, err := os.ReadFile(ran); err == nil {
+		t.Fatalf("hooks the person's git names ran past their events' switches: %q", data)
+	}
+}
+
+// A query asks git for its command and nothing more: the hook gives git half a
+// second, and the lookup of the names a hook could go by would take a share of
+// it for a command that runs no hook. Not parallel: it puts a git that logs its
+// arguments first on PATH.
+func TestAQueryRunsGitOnceForItsCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the git stand-in is a shell script")
+	}
+	requireGit(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, m := newFleet(t, 1)
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "args")
+	write(t, filepath.Join(bin, "git"), "#!/bin/sh\necho \"$*\" >> '"+log+"'\nexec '"+real+"' \"$@\"\n")
+	if err := os.Chmod(filepath.Join(bin, "git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if top, err := Query(context.Background(), m[0], "rev-parse", "--show-toplevel"); err != nil || !SameDir(strings.TrimSpace(top), m[0]) {
+		t.Fatalf("query = %q, %v; want the clone's top", top, err)
+	}
+	if got := strings.Split(strings.TrimSpace(readFile(t, log)), "\n"); len(got) != 1 || !strings.HasSuffix(got[0], " rev-parse --show-toplevel") {
+		t.Fatalf("the query ran git %d times: %q; want once, for its command", len(got), got)
+	}
+}
+
+// A sync onto a remote that has not moved since the last one neither asks whether
+// the clone's commit is the remote's, nor counts what came in: the answers are
+// known. The common case, a session's end publishing onto a remote no other
+// machine has pushed to since, saves both processes.
+func TestASyncOntoARemoteThatHasNotMovedNeitherWalksNorCountsHistory(t *testing.T) {
+	t.Parallel()
+	_, m := fleet(t, 1)
+	a := m[0]
+	o := options(a, "host-a")
+	var asked []string
+	o.Run = func(ctx context.Context, dir string, stdin []byte, args ...string) (string, error) {
+		asked = append(asked, strings.Join(args, " "))
+		return Git(ctx, dir, stdin, args...)
+	}
+	for _, records := range []int{1, 0} {
+		asked = nil
+		if records > 0 {
+			appendLines(t, filepath.Join(a, "host-a.jsonl"), `{"id":"hive:1"}`)
+		}
+		res, err := Sync(context.Background(), o)
+		if err != nil || res.Published != records || res.Received != 0 {
+			t.Fatalf("sync publishing %d records onto a remote that had not moved = %+v, %v", records, res, err)
+		}
+		for _, command := range asked {
+			if strings.HasPrefix(command, "merge-base ") || strings.HasPrefix(command, "rev-list ") {
+				t.Fatalf("sync publishing %d records onto a remote that had not moved ran git %s", records, command)
+			}
+		}
 	}
 }
 
