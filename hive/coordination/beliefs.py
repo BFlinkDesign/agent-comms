@@ -121,7 +121,7 @@ def get_refuted_beliefs(
     board: HiveBoard,
     *,
     channel: str | None = None,
-    limit: int = 50,
+    limit: int | None = 50,
 ) -> list[dict[str, Any]]:
     """Return refuted beliefs with their corrections.
 
@@ -150,7 +150,7 @@ def get_refuted_beliefs(
 
 def belief_audit(board: HiveBoard, *, channel: str | None = None) -> dict[str, Any]:
     """Summary audit: how many beliefs active vs. confirmed vs. refuted."""
-    kwargs: dict[str, Any] = {"type": "belief", "limit": 200}
+    kwargs: dict[str, Any] = {"type": "belief", "limit": None}
     if channel:
         kwargs["channel"] = channel
     beliefs = board.query(**kwargs)

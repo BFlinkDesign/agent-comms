@@ -76,7 +76,7 @@ def evolve(board: HiveBoard) -> list[dict[str, Any]]:
     # Check for refuted beliefs -- wrong priors that need correction
     try:
         from hive.coordination.beliefs import get_refuted_beliefs
-        refuted = get_refuted_beliefs(board, limit=20)
+        refuted = get_refuted_beliefs(board, limit=None)
         if refuted:
             signal_data = {
                 "event": "refuted_beliefs",

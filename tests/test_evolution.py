@@ -73,6 +73,29 @@ class TestEvolution:
         roster_signals = board.query(type="signal", channel="roster", limit=None)
         assert len(roster_signals) == 1
 
+    def test_evolve_reports_all_refuted_beliefs_beyond_20(self):
+        """Regression: evolve() must detect all refuted beliefs, not just first 20."""
+        from hive.coordination.beliefs import assert_belief, refute_belief
+
+        board = _make_board()
+
+        # 21 refuted beliefs — one past the old hardcoded limit=20 in evolve()
+        for i in range(21):
+            bid = assert_belief(
+                board, from_agent="claude/1", channel="general",
+                claim=f"claim {i}", confidence=0.8,
+            )
+            refute_belief(
+                board, belief_id=bid, from_agent="claude/critic", channel="general",
+                reason=f"reason {i}", correction=f"fix {i}",
+            )
+
+        signals = evolve(board)
+        refuted_signals = [s for s in signals if s["event"] == "refuted_beliefs"]
+        assert len(refuted_signals) == 1
+        # Before the fix, evolve() called get_refuted_beliefs(limit=20) so count=20.
+        assert refuted_signals[0]["payload"]["count"] == 21
+
     def test_changed_failure_rate_emits_new_signal(self):
         board = _make_board()
         for i in range(5):
